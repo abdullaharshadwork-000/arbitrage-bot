@@ -1,0 +1,8 @@
+# Pinned to the versions this project is verified against.
+# Update deliberately: an exchange-API change in ccxt can alter live order behaviour.
+ccxt==4.5.47
+Flask==3.1.3
+
+# Optional: websocket market data (Stage 3). Install only if you enable the
+# streaming feed — the REST feed works without it.
+# ccxt[pro]==4.5.47
