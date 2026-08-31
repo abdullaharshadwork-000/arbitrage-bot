@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Safe launcher for live trading configuration.
 
-This file loads the local live_config.py file if it exists, validates it,
-then starts the Flask backend in live mode.
+Loads the local live_config.py, refuses to continue unless the real-trading
+configuration validates, then hands over to server.serve() — the same code path
+as `python server.py`, so the port fallback and the session-token banner apply
+here too.
 """
 
-import os
 import sys
 
 import arbitrage_bot
@@ -32,7 +33,8 @@ def main():
     print(f"  Exchanges: {', '.join(arbitrage_bot.EXCHANGES)}")
     print("=" * 64)
 
-    server.app.run(host="127.0.0.1", port=5000, debug=False)
+    server.bootstrap()
+    server.serve()
 
 
 if __name__ == "__main__":

@@ -413,6 +413,9 @@
       .blot-row.miss {
         opacity: 0.7;
       }
+      .blot-row.blocked {
+        border-left: 2px solid var(--yellow);
+      }
       .blot-time {
         font-family: "JetBrains Mono", monospace;
         color: var(--muted);
@@ -716,6 +719,48 @@
             Close Unhedged Position
           </button>
 
+          <div class="config-group" id="riskPanel">
+            <div class="group-title">Risk Limits</div>
+            <div
+              id="riskBody"
+              style="font-size: 11px; color: var(--muted-2); line-height: 1.7"
+            >
+              Waiting for the first scan...
+            </div>
+            <button
+              class="btn btn-danger"
+              id="btnResume"
+              style="display: none; margin-top: 8px"
+            >
+              Resume After Halt
+            </button>
+            <button
+              class="btn btn-danger"
+              id="btnClearStranded"
+              style="display: none; margin-top: 8px"
+            >
+              Mark Stranded Position Unwound
+            </button>
+          </div>
+
+          <div class="config-group" id="startupPanel" style="display: none">
+            <div class="group-title">Startup Check</div>
+            <div
+              id="startupBody"
+              style="font-size: 11px; color: var(--muted-2); line-height: 1.7"
+            ></div>
+          </div>
+
+          <div class="config-group" id="alertPanel" style="display: none">
+            <div class="group-title">
+              Alerts <span id="alertSummary" style="color: var(--muted-2)"></span>
+            </div>
+            <div
+              id="alertBody"
+              style="font-size: 11px; color: var(--muted-2); line-height: 1.7"
+            ></div>
+          </div>
+
           <div class="config-group" id="balancePanel" style="display: none">
             <div class="group-title">Live Account Balances</div>
             <div
@@ -913,18 +958,34 @@
         return res.json();
       }
 
-      function showNotice(message) {
+      // How long a message the operator caused stays on screen. The state poll
+      // runs every second and writes the same notice bar, so without a hold a
+      // refusal lived for one frame: the setting snapped back to its old value
+      // with nothing to say why, which looks exactly like a setting that was
+      // accepted and then ignored.
+      const NOTICE_HOLD_MS = 8000;
+      let noticeHoldUntil = 0;
+
+      function showNotice(message, { hold = false } = {}) {
         const notice = $("stateNotice");
+        if (!hold && noticeHoldUntil > Date.now()) return;
+        noticeHoldUntil = hold && message ? Date.now() + NOTICE_HOLD_MS : 0;
         notice.textContent = message || "";
         notice.classList.toggle("visible", Boolean(message));
+      }
+
+      function clearNotice() {
+        // An action that worked answers the previous complaint about it.
+        noticeHoldUntil = 0;
+        showNotice("");
       }
 
       async function runAction(action) {
         try {
           await action();
-          showNotice("");
+          clearNotice();
         } catch (e) {
-          showNotice(e.message || "Request failed.");
+          showNotice(e.message || "Request failed.", { hold: true });
         }
       }
 
@@ -943,9 +1004,10 @@
                       `${item.exchange}: ${item.latency_ms}ms, fee ${item.fee ?? "unknown"}`,
                   )
                   .join(" | "),
+            { hold: true },
           );
         } catch (e) {
-          showNotice(e.message || "Connection test failed.");
+          showNotice(e.message || "Connection test failed.", { hold: true });
         }
       }
 
@@ -1024,6 +1086,31 @@
                 <div class="blot-time">${fmtTime(e.time)}</div>
                 <div class="blot-msg">scan #${e.scan_num} — no profitable gap</div>
                 <div></div>
+              </div>
+            `;
+            }
+            if (e.type === "blocked") {
+              // A risk veto is not a miss: the gap was there and the bot chose
+              // not to take it. Saying which limit stopped it is the whole
+              // point of showing the row at all. Repeats of one reason are
+              // collapsed by the server, so a count here means "this kept
+              // happening" rather than sixty copies of one sentence.
+              const pairs = (e.symbols && e.symbols.length ? e.symbols : [e.symbol])
+                .map(esc)
+                .join(", ");
+              const repeats = e.count > 1
+                ? ` <span style="color:var(--muted);">×${Number(e.count)}</span>`
+                : "";
+              return `
+              <div class="blot-row blocked">
+                <div class="blot-time">${fmtTime(e.time)}</div>
+                <div class="blot-msg">
+                  <span style="font-weight:700; color:var(--text);">${pairs}</span>
+                  blocked — ${esc(e.reason)}${repeats}
+                </div>
+                <div class="blot-side">
+                  <div class="c-yellow" style="font-weight:700;">${esc(e.limit)}</div>
+                </div>
               </div>
             `;
             }
@@ -1114,6 +1201,160 @@
           : "No non-zero balances reported.";
       }
 
+      // Exchange error text and alert bodies end up inside innerHTML below, and
+      // they are strings an exchange chose, not ones this file wrote.
+      function esc(value) {
+        return String(value ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      }
+
+      function row(label, value, colour) {
+        const tone = colour ? ` class="${colour}"` : "";
+        return `<div style="display:flex; justify-content:space-between; gap:8px">
+          <span>${esc(label)}</span><strong${tone}>${esc(value)}</strong>
+        </div>`;
+      }
+
+      function renderRisk(s) {
+        const risk = s.risk || {};
+        const body = $("riskBody");
+        const stranded = risk.stranded || [];
+        if (!Object.keys(risk).length) {
+          body.innerHTML = "Waiting for the first scan...";
+          $("btnResume").style.display = "none";
+          $("btnClearStranded").style.display = "none";
+          return;
+        }
+
+        const pnl = Number(risk.realized_today || 0);
+        const used = Number(risk.daily_loss_used_pct || 0);
+        const rows = [];
+        if (risk.halted) {
+          rows.push(
+            `<div class="c-red" style="margin-bottom:6px"><strong>HALTED</strong> —
+             ${esc(risk.halt_limit || "risk limit")}: ${esc(risk.halt_reason || "")}</div>`,
+          );
+        }
+        if (risk.killed) {
+          rows.push(
+            `<div class="c-red" style="margin-bottom:6px"><strong>KILL SWITCH ENGAGED</strong>
+             — restart the server to clear it.</div>`,
+          );
+        }
+        rows.push(
+          row(
+            "Realized today",
+            `${pnl.toFixed(2)} USDT`,
+            pnl < 0 ? "c-red" : "c-green",
+          ),
+        );
+        rows.push(
+          row(
+            "Daily loss budget",
+            `${used.toFixed(0)}% of ${Number(risk.daily_loss_limit || 0).toFixed(2)} used`,
+            used >= 80 ? "c-yellow" : null,
+          ),
+        );
+        rows.push(
+          row(
+            "Trades today",
+            `${risk.trades_today || 0} (${risk.wins_today || 0}W / ${risk.losses_today || 0}L)`,
+          ),
+        );
+        rows.push(
+          row(
+            "Failures in a row",
+            `${risk.consecutive_failures || 0} of ${risk.max_consecutive_failures || 0}`,
+            (risk.consecutive_failures || 0) > 0 ? "c-yellow" : null,
+          ),
+        );
+        rows.push(
+          row(
+            "Orders last minute",
+            `${risk.orders_last_minute || 0} of ${risk.order_rate_limit || 0}`,
+          ),
+        );
+        if (Number(risk.peak_equity || 0) > 0) {
+          rows.push(
+            row("Drawdown from peak", `${Number(risk.drawdown || 0).toFixed(2)} USDT`),
+          );
+        }
+        stranded.forEach((item) => {
+          rows.push(
+            `<div class="c-red" style="margin-top:6px">Stranded: ${esc(item.quantity)}
+             ${esc(item.currency)} on ${esc(item.exchange)} — ${esc(item.detail || "")}</div>`,
+          );
+        });
+        const limits = risk.recent_limits || [];
+        if (limits.length) {
+          const last = limits[limits.length - 1];
+          rows.push(
+            `<div style="margin-top:6px">Last limit hit: ${esc(last.limit)} —
+             ${esc(last.reason)}</div>`,
+          );
+        }
+        body.innerHTML = rows.join("");
+        $("btnResume").style.display =
+          risk.halted && !risk.killed ? "block" : "none";
+        $("btnClearStranded").style.display = stranded.length ? "block" : "none";
+      }
+
+      function renderStartupCheck(s) {
+        const panel = $("startupPanel");
+        const check = s.startup_check;
+        if (!check) {
+          panel.style.display = "none";
+          return;
+        }
+        panel.style.display = "block";
+        const rows = [
+          `<div class="${check.blocking ? "c-red" : check.clean ? "c-green" : "c-yellow"}">
+            ${esc(check.summary || "")}
+          </div>`,
+        ];
+        (check.discrepancies || []).forEach((item) => {
+          rows.push(
+            `<div style="margin-top:5px">${item.blocking ? "[BLOCKING] " : ""}${esc(item.detail)}</div>`,
+          );
+        });
+        (check.errors || []).forEach((error) => {
+          rows.push(`<div class="c-yellow" style="margin-top:5px">${esc(error)}</div>`);
+        });
+        $("startupBody").innerHTML = rows.join("");
+      }
+
+      function renderAlerts(s) {
+        const alerts = s.alerts || {};
+        const recent = alerts.recent || [];
+        const panel = $("alertPanel");
+        if (!recent.length) {
+          panel.style.display = "none";
+          return;
+        }
+        panel.style.display = "block";
+        $("alertSummary").textContent = alerts.configured
+          ? `(${alerts.sent} sent, ${alerts.suppressed} deduped)`
+          : "(local only — no webhook configured)";
+        $("alertBody").innerHTML = recent
+          .slice()
+          .reverse()
+          .map(
+            (item) =>
+              `<div style="margin-bottom:5px"><strong>${esc(item.severity || "")}</strong>
+               ${esc(item.title || "")}${item.body ? " — " + esc(item.body) : ""}</div>`,
+          )
+          .join("");
+      }
+
       function syncConfigInputs(s) {
         const cfg = s.config || {};
         const setWhenIdle = (id, value) => {
@@ -1192,6 +1433,9 @@
 
         syncConfigInputs(s);
         renderBalances(s);
+        renderRisk(s);
+        renderStartupCheck(s);
+        renderAlerts(s);
         renderMatrix(s.quotes);
         renderBlotter(s.recent);
         renderLog(s.trades);
@@ -1241,6 +1485,45 @@
               body: JSON.stringify({
                 confirmation: "CLOSE_UNHEDGED_POSITION",
                 buy_order_id: latestRecovery.buy_order_id,
+              }),
+            }),
+          );
+        };
+
+        $("btnResume").onclick = () => {
+          if (
+            !window.confirm(
+              "Resume after a risk halt?\n\nThis says the condition that " +
+                "stopped the bot is understood and dealt with. The counters " +
+                "for today are kept, so the same limit can halt it again.",
+            )
+          )
+            return;
+          runAction(() =>
+            api("/api/risk/resume", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ confirmation: "RESUME_AFTER_HALT" }),
+            }),
+          );
+        };
+
+        $("btnClearStranded").onclick = () => {
+          if (
+            !window.confirm(
+              "Confirm the stranded position is actually closed?\n\nThis " +
+                "sells nothing. It only clears the record, and clearing it " +
+                "while the coin is still there is how the next run trades " +
+                "around inventory it does not know it holds.",
+            )
+          )
+            return;
+          runAction(() =>
+            api("/api/risk/stranded/clear", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                confirmation: "STRANDED_POSITION_UNWOUND",
               }),
             }),
           );

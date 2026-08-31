@@ -26,10 +26,19 @@ HOW TO RUN (see README.md for full instructions):
 
 import csv
 import importlib.util
+import os
 import random
 import time
+from concurrent import futures
 from datetime import datetime
 from pathlib import Path
+
+# arbicore holds the parts that decide whether real money moves: order-book
+# walking, fill reconciliation and exact decimal money maths. They live in a
+# package with their own tests because a rounding error here is a loss, not a
+# cosmetic bug.
+from arbicore import books, config as arbiconfig, feed, orders
+from arbicore.money import D, HUNDRED, ONE, ZERO, net_spread_pct
 
 # ==================================================================
 #  CONFIGURATION  —  everything you might want to change is here
@@ -41,6 +50,11 @@ TRADING_STRATEGY = "cross_exchange"  # or "triangular"
 
 # IMPORTANT: real trading is disabled by default to stop accidental orders.
 REAL_TRADING_ENABLED = False
+# The second half of that gate. A boolean in a config file is one character away
+# from True, and files get copied between machines with their flags intact - so
+# real orders also need this typed out exactly, either here, in live_config.py,
+# or as ARBI_REAL_TRADING_ACK in the environment. See arbicore.config.
+REAL_TRADING_ACK = ""
 EXCHANGE_CREDENTIALS = {
     "binance": {"apiKey": "", "secret": ""},
     "kucoin": {"apiKey": "", "secret": ""},
@@ -68,6 +82,33 @@ MIN_PROFIT_PCT = 0.15     # only "trade" if expected profit AFTER fees
 
 MAX_SLIPPAGE_PCT = 0.25   # reject live orders if the book moves beyond this
 
+ORDER_BOOK_DEPTH = 20     # levels to walk when pricing an order. The check is
+                          # a size-weighted average over these levels, not the
+                          # best price, so it needs real depth to be honest.
+
+MAX_QUOTE_AGE_MS = 10000  # discard prices the exchange stamped older than
+                          # this. A stale spread has already closed, so acting
+                          # on one is a loss rather than a missed gain.
+
+MAX_TRIANGULAR_ROUTES = 60  # routes kept after ranking by their thinnest leg's
+                            # volume. Full discovery finds thousands, and
+                            # pricing them all takes minutes per scan.
+
+# ---- risk limits -------------------------------------------------------
+# These latch: once a limit trips, the loop stops and a human has to look at
+# it. That is the point. An arbitrage bot that keeps trading through a losing
+# streak is not arbitraging, it is paying fees to discover that its prices are
+# wrong.
+MIN_NOTIONAL_USDT = 10.0          # below this most venues reject the order
+MAX_DAILY_LOSS_USDT = 50.0        # realized loss that stops trading for the day
+MAX_POSITION_NOTIONAL_USDT = 400.0  # largest single trade allowed
+MAX_CONSECUTIVE_FAILURES = 3      # failures in a row that mean "stop guessing"
+MAX_ORDERS_PER_MINUTE = 20        # rate cap, so a feed bug cannot machine-gun
+MAX_CLOCK_SKEW_MS = 2000          # past this, signed requests get rejected and
+                                  # "freshness" checks stop meaning anything
+ALERT_WEBHOOK = ""                # Slack/Discord/generic URL, or empty for
+                                  # console-only alerts
+
 CHECK_INTERVAL = 5        # seconds between scans
 
 LOG_FILE = "trades.csv"   # every simulated trade is saved here
@@ -75,6 +116,12 @@ LOG_FILE = "trades.csv"   # every simulated trade is saved here
 # Demo mode only: how jumpy the fake market is
 DEMO_GAP_CHANCE = 0.25    # chance per scan that a price gap opens
                           # (real markets gap far less often!)
+
+
+def resolve_real_trading_ack(environ=None):
+    """The acknowledgement as configured: environment first, then this module."""
+    env = environ if environ is not None else os.environ
+    return (env.get("ARBI_REAL_TRADING_ACK") or REAL_TRADING_ACK or "").strip()
 
 
 def validate_real_trading_config():
@@ -95,6 +142,18 @@ def validate_real_trading_config():
             "ok": False,
             "message": "EXECUTION_MODE must be 'real' when real trading is enabled.",
         }
+    if resolve_real_trading_ack() != arbiconfig.REAL_TRADING_ACK:
+        return {
+            "ok": False,
+            "message": (
+                "Real trading needs the written acknowledgement as well as the "
+                f"flag: set REAL_TRADING_ACK = {arbiconfig.REAL_TRADING_ACK!r} "
+                "in live_config.py, or ARBI_REAL_TRADING_ACK in the "
+                "environment. Two independent gates exist so that a config file "
+                "copied from another machine cannot start placing orders on "
+                "this one."
+            ),
+        }
 
     if TRADE_SIZE_USDT <= 0:
         return {"ok": False, "message": "TRADE_SIZE_USDT must be greater than zero."}
@@ -112,12 +171,10 @@ def validate_real_trading_config():
 
     configured = []
     for exchange in EXCHANGES:
-        creds = EXCHANGE_CREDENTIALS.get(exchange, {})
-        key = creds.get("apiKey")
-        secret = creds.get("secret")
-        if key and secret:
+        creds = resolve_credentials(exchange)
+        if creds.complete:
             configured.append(exchange)
-        elif key or secret:
+        elif creds.api_key or creds.api_secret:
             return {
                 "ok": False,
                 "message": f"Exchange '{exchange}' is missing a full API credential pair.",
@@ -162,22 +219,31 @@ def load_live_config_if_present():
             # Stay in demo mode unless the file explicitly opts in to live/real trading.
             return False
 
-        for key in ("REAL_TRADING_ENABLED", "MODE", "EXECUTION_MODE", "TRADING_STRATEGY", "EXCHANGES", "EXCHANGE_CREDENTIALS"):
+        for key in ("REAL_TRADING_ENABLED", "REAL_TRADING_ACK", "MODE",
+                    "EXECUTION_MODE", "TRADING_STRATEGY", "EXCHANGES",
+                    "SYMBOLS", "EXCHANGE_CREDENTIALS"):
             if hasattr(module, key):
                 globals()[key] = getattr(module, key)
 
-        for key in ("TRADE_SIZE_USDT", "TAKER_FEE", "MIN_PROFIT_PCT", "CHECK_INTERVAL", "MAX_SLIPPAGE_PCT"):
+        for key in ("TRADE_SIZE_USDT", "TAKER_FEE", "MIN_PROFIT_PCT", "CHECK_INTERVAL",
+                    "MAX_SLIPPAGE_PCT", "ORDER_BOOK_DEPTH", "MAX_QUOTE_AGE_MS",
+                    "MAX_TRIANGULAR_ROUTES", "MIN_NOTIONAL_USDT",
+                    "MAX_DAILY_LOSS_USDT", "MAX_POSITION_NOTIONAL_USDT",
+                    "MAX_CONSECUTIVE_FAILURES", "MAX_ORDERS_PER_MINUTE",
+                    "ALERT_WEBHOOK"):
             if hasattr(module, key):
                 globals()[key] = getattr(module, key)
 
-        EXCHANGES_MASTER = list(EXCHANGES)
-        SYMBOLS_MASTER = list(SYMBOLS)
+        # These are the whitelists the web API validates operator input
+        # against. Assigning them as locals (the original bug) left the API
+        # unable to select any exchange the live config had just added.
+        globals()["EXCHANGES_MASTER"] = list(EXCHANGES)
+        globals()["SYMBOLS_MASTER"] = list(SYMBOLS)
 
-        # Keep demo defaults if the live config leaves placeholders empty.
-        if isinstance(EXCHANGE_CREDENTIALS, dict):
-            for exchange, creds in list(EXCHANGE_CREDENTIALS.items()):
-                if isinstance(creds, dict) and "apiKey" in creds and creds["apiKey"] == "PASTE_":
-                    EXCHANGE_CREDENTIALS[exchange] = {"apiKey": "", "secret": ""}
+        # Placeholder credentials are filtered where they are read, by
+        # resolve_credentials(), rather than by rewriting EXCHANGE_CREDENTIALS
+        # here - the old rewrite only matched a key equal to "PASTE_" and so
+        # never fired for the example file's PASTE_YOUR_..._API_KEY values.
 
         return True
     except Exception as exc:
@@ -185,18 +251,58 @@ def load_live_config_if_present():
         return False
 
 
+CREDENTIAL_PLACEHOLDER_PREFIX = "PASTE_"
+
+
+def _filled_in(value):
+    """The credential as the operator meant it, or "" if they never set it."""
+    text = str(value or "").strip()
+    if not text or text.startswith(CREDENTIAL_PLACEHOLDER_PREFIX):
+        return ""
+    return text
+
+
+def resolve_credentials(exchange_name, environ=None):
+    """Keys for one exchange: environment first, then live_config.py.
+
+    The environment wins because a key there is not sitting in a plaintext file
+    on disk, not in an editor backup, and not in something that can be
+    committed by accident. `arbicore.config.Credentials` owns the variable
+    naming (ARBI_BINANCE_API_KEY, ARBI_BINANCE_API_SECRET,
+    ARBI_BINANCE_PASSWORD) and the redacted repr, so there is one
+    implementation rather than two that can drift apart.
+
+    Placeholders from live_config.example.py count as absent. The previous check
+    compared a key against the literal string "PASTE_", which never equals
+    "PASTE_YOUR_BINANCE_API_KEY" - so a copied example passed the startup
+    validation as fully configured, and the refusal arrived from the exchange in
+    the middle of a trade rather than before the loop started.
+    """
+    from arbicore.config import Credentials
+
+    from_env = Credentials.from_env(exchange_name, environ)
+    if from_env.complete:
+        return from_env
+
+    supplied = EXCHANGE_CREDENTIALS.get(exchange_name) or {}
+    return Credentials.from_mapping(exchange_name, {
+        "apiKey": _filled_in(supplied.get("apiKey") or supplied.get("api_key")),
+        "secret": _filled_in(supplied.get("secret") or supplied.get("api_secret")),
+        "password": _filled_in(supplied.get("password")
+                               or supplied.get("passphrase")),
+    }, source="live_config")
+
+
 def create_exchange_client(exchange_name):
     """Build a CCXT client using configured API credentials."""
     import ccxt
 
-    creds = EXCHANGE_CREDENTIALS.get(exchange_name, {})
+    creds = resolve_credentials(exchange_name)
     config = {"enableRateLimit": True}
-    api_key = creds.get("apiKey")
-    secret = creds.get("secret")
-    if api_key:
-        config["apiKey"] = api_key
-    if secret:
-        config["secret"] = secret
+    # Blank values are left out rather than passed as empty strings: some venues
+    # treat a present-but-empty apiKey as a broken key instead of no key.
+    config.update({name: value
+                   for name, value in creds.ccxt_params().items() if value})
 
     exchange_class = getattr(ccxt, exchange_name, None)
     if exchange_class is None:
@@ -205,10 +311,17 @@ def create_exchange_client(exchange_name):
 
 
 class UnhedgedPositionError(RuntimeError):
-    """Raised when a filled buy cannot be paired with its sell order."""
+    """Raised when a filled buy cannot be paired with its sell order.
+
+    `quantity_confirmed` is False when the exchange never told us how much
+    filled. The quantity is then an upper bound taken from the request, and no
+    automated unwind may use it - a market sell of a size that was never
+    bought either fails or dumps unrelated inventory.
+    """
 
     def __init__(self, buy_exchange, sell_exchange, symbol, quantity,
-                 buy_order, cause, recovery_exchange=None):
+                 buy_order, cause, recovery_exchange=None,
+                 quantity_confirmed=True):
         self.buy_exchange = buy_exchange
         self.sell_exchange = sell_exchange
         self.symbol = symbol
@@ -216,9 +329,14 @@ class UnhedgedPositionError(RuntimeError):
         self.buy_order = buy_order
         self.cause = cause
         self.recovery_exchange = recovery_exchange or buy_exchange
+        self.quantity_confirmed = bool(quantity_confirmed)
         order_id = buy_order.get("id") or "unknown"
+        qualifier = "" if self.quantity_confirmed else (
+            " Fill size is UNCONFIRMED, so the quantity is an upper bound only."
+        )
         super().__init__(
-            f"Sell failed after buy order {order_id} filled: {cause}. Manual recovery required."
+            f"Sell failed after buy order {order_id} filled: {cause}. "
+            f"Manual recovery required.{qualifier}"
         )
 
 
@@ -366,18 +484,30 @@ class RealExecutionEngine:
         return {"free_usdt": total_free, "used_usdt": total_used,
                 "total_usdt": total_free + total_used}
 
+    def plan_buy_quantity(self, exchange_name, symbol, amount_usdt, price, fee=None):
+        """Size a market buy from a price we already have, with fee headroom.
+
+        Sizing off a price the caller just measured avoids a second ticker
+        call, and avoids sizing against a price that differs from the book the
+        slippage check just approved.
+        """
+        fee = self.taker_fee(exchange_name, symbol) if fee is None else fee
+        minimum_cost = self.market_constraints(exchange_name, symbol)["min_cost"]
+        if amount_usdt < minimum_cost:
+            raise RuntimeError(f"Order cost is below {symbol} minimum.")
+        if price <= 0:
+            raise RuntimeError(f"No usable {symbol} price on {exchange_name}.")
+        return self.normalize_amount(
+            exchange_name, symbol, (amount_usdt / price) * (1.0 - fee))
+
     def place_market_buy(self, exchange_name, symbol, amount_usdt, fee=None):
         if not REAL_TRADING_ENABLED:
             raise RuntimeError("Real trading is disabled.")
         client = self.clients[exchange_name]
         ticker = client.fetch_ticker(symbol)
         ask = float(ticker["ask"])
-        fee = self.taker_fee(exchange_name, symbol) if fee is None else fee
-        quantity = self.normalize_amount(
-            exchange_name, symbol, (amount_usdt / ask) * (1.0 - fee))
-        minimum_cost = self.market_constraints(exchange_name, symbol)["min_cost"]
-        if amount_usdt < minimum_cost:
-            raise RuntimeError(f"Order cost is below {symbol} minimum.")
+        quantity = self.plan_buy_quantity(
+            exchange_name, symbol, amount_usdt, ask, fee)
         return client.create_market_buy_order(symbol, quantity)
 
     def place_market_buy_quantity(self, exchange_name, symbol, quantity):
@@ -394,23 +524,86 @@ class RealExecutionEngine:
         return client.create_market_sell_order(symbol, quantity)
 
     def check_order_book(self, exchange_name, symbol, side, quantity, reference_price):
-        """Reject thin books or prices that moved too far since scanning."""
-        book = self.clients[exchange_name].fetch_order_book(symbol, limit=10)
+        """Reject thin books or prices that moved too far since scanning.
+
+        Returns the price this specific size would average, not the best price.
+        The old check compared `levels[0][0]` against the reference and summed
+        the top ten sizes to prove depth: both pass on a book with dust on top
+        and the real liquidity 2% away, which is the shape that turns a
+        projected profit into a realized loss.
+        """
+        book = self.clients[exchange_name].fetch_order_book(
+            symbol, limit=ORDER_BOOK_DEPTH)
         levels = book.get("asks" if side == "buy" else "bids", [])
         if not levels:
             raise RuntimeError(f"No {side} liquidity available on {exchange_name}.")
 
-        best_price = float(levels[0][0])
-        slippage = MAX_SLIPPAGE_PCT / 100
-        if side == "buy" and best_price > reference_price * (1 + slippage):
-            raise RuntimeError(f"Buy price moved beyond {MAX_SLIPPAGE_PCT:.2f}% on {exchange_name}.")
-        if side == "sell" and best_price < reference_price * (1 - slippage):
-            raise RuntimeError(f"Sell price moved beyond {MAX_SLIPPAGE_PCT:.2f}% on {exchange_name}.")
+        estimate = books.fill_for_quantity(levels, quantity)
+        if estimate.quantity <= ZERO:
+            raise RuntimeError(f"No {side} liquidity available on {exchange_name}.")
 
-        available = sum(float(level[1]) for level in levels)
-        if available < quantity:
-            raise RuntimeError(f"Insufficient {side} liquidity on {exchange_name}.")
-        return best_price
+        average = estimate.average_price
+        reference = D(reference_price)
+        if reference <= ZERO:
+            raise RuntimeError(f"No reference price for {symbol} on {exchange_name}.")
+        tolerance = D(MAX_SLIPPAGE_PCT) / HUNDRED
+        drift = abs((average - reference) / reference * HUNDRED)
+        if side == "buy" and average > reference * (ONE + tolerance):
+            raise RuntimeError(
+                f"Buy price moved beyond {MAX_SLIPPAGE_PCT:.2f}% on {exchange_name}: "
+                f"{float(quantity):.8f} {symbol} would average "
+                f"{float(average):.8f}, {float(drift):.3f}% above the quote.")
+        if side == "sell" and average < reference * (ONE - tolerance):
+            raise RuntimeError(
+                f"Sell price moved beyond {MAX_SLIPPAGE_PCT:.2f}% on {exchange_name}: "
+                f"{float(quantity):.8f} {symbol} would average "
+                f"{float(average):.8f}, {float(drift):.3f}% below the quote.")
+
+        if not estimate.complete:
+            raise RuntimeError(
+                f"Insufficient {side} liquidity on {exchange_name}: the visible "
+                f"book covers {float(estimate.quantity):.8f} of "
+                f"{float(quantity):.8f} {symbol}.")
+        return float(average)
+
+    def _confirm_fill(self, exchange_name, symbol, side, requested_quantity, order):
+        """Ask the exchange what actually filled, and take no other answer.
+
+        The original engine read `filled` off the create-order response and
+        fell back to `amount` - the size it had *asked* for - when the exchange
+        left `filled` empty, which many do until the order is fetched again. It
+        then sold coin it had never bought. `orders.reconcile_order` polls until
+        the exchange states a size, or raises; it never guesses one.
+        """
+        return orders.reconcile_order(
+            self.clients[exchange_name], exchange_name, symbol, side,
+            requested_quantity, order,
+            poll_timeout=getattr(self, "poll_timeout", orders.DEFAULT_POLL_TIMEOUT),
+            poll_interval=getattr(self, "poll_interval", orders.DEFAULT_POLL_INTERVAL))
+
+    def _net_received(self, fill, currency, gross):
+        """Gross fill minus a fee that was charged in the coin we received.
+
+        Exchanges deduct the taker fee from the base coin on a buy unless the
+        account pays fees in a discount token. Sizing the next leg off the
+        gross figure asks to trade coin that is not there.
+        """
+        if (fill.fee_currency or "").upper() == (currency or "").upper():
+            return max(0.0, float(gross) - float(fill.fee_cost))
+        return float(gross)
+
+    def _dust_tolerance(self, exchange_name, symbol, quantity):
+        """Largest unsold remainder worth ignoring rather than halting over.
+
+        Step-size flooring leaves a fraction of the base coin behind on almost
+        every real fill. Treating that as an unhedged position would stop the
+        bot after its first successful trade; treating a real shortfall as dust
+        would hide a loss. The line is the exchange's own minimum order size,
+        or 0.1% of the trade, whichever is larger - below it nothing can be
+        traded anyway.
+        """
+        minimum = float(self.market_constraints(exchange_name, symbol)["min_amount"] or 0.0)
+        return max(minimum, abs(float(quantity)) * 0.001)
 
     def execute_arbitrage(self, buy_exchange, sell_exchange, symbol,
                           amount_usdt, buy_price, sell_price):
@@ -421,6 +614,7 @@ class RealExecutionEngine:
         buy_fee = self.taker_fee(buy_exchange, symbol)
         sell_fee = self.taker_fee(sell_exchange, symbol)
         base = base_coin(symbol)
+        quote = quote_coin(symbol)
         estimated_quantity = (amount_usdt / buy_price) * (1.0 - buy_fee)
         if self.get_balance_usdt(buy_exchange) < amount_usdt:
             raise RuntimeError(f"Insufficient USDT balance on {buy_exchange}.")
@@ -430,17 +624,30 @@ class RealExecutionEngine:
             buy_exchange, symbol, "buy", estimated_quantity, buy_price)
         live_sell_price = self.check_order_book(
             sell_exchange, symbol, "sell", estimated_quantity, sell_price)
-        conservative_profit_pct = (
-            (live_sell_price / live_buy_price) * (1 - buy_fee) * (1 - sell_fee) - 1
-        ) * 100
+        # Fees compound rather than add: the sell fee lands on the grossed-up
+        # proceeds, so subtracting 2*fee overstates the edge every time.
+        conservative_profit_pct = float(net_spread_pct(
+            live_buy_price, live_sell_price, buy_fee, sell_fee))
         if conservative_profit_pct < MIN_PROFIT_PCT:
             raise RuntimeError(
                 f"Live profit dropped to {conservative_profit_pct:.3f}%, "
                 f"below the {MIN_PROFIT_PCT:.3f}% minimum."
             )
 
-        buy_order = self.place_market_buy(buy_exchange, symbol, amount_usdt, buy_fee)
-        filled_quantity = float(buy_order.get("filled") or buy_order.get("amount") or 0.0)
+        requested_buy = self.plan_buy_quantity(
+            buy_exchange, symbol, amount_usdt, live_buy_price, buy_fee)
+        buy_order = self.place_market_buy_quantity(
+            buy_exchange, symbol, requested_buy)
+        try:
+            buy_fill = self._confirm_fill(
+                buy_exchange, symbol, "buy", requested_buy, buy_order)
+        except orders.OrderReconciliationError as exc:
+            # The order exists and its size is unknown. That is a position.
+            raise UnhedgedPositionError(
+                buy_exchange, sell_exchange, symbol, requested_buy, buy_order,
+                exc, recovery_exchange=buy_exchange,
+                quantity_confirmed=False) from exc
+        filled_quantity = float(buy_fill.filled_quantity)
         if filled_quantity <= 0:
             raise RuntimeError("Buy order returned no filled quantity.")
 
@@ -451,22 +658,39 @@ class RealExecutionEngine:
                 buy_exchange, sell_exchange, symbol, filled_quantity,
                 buy_order, exc, recovery_exchange=buy_exchange,
             ) from exc
-        filled_sell = float(
-            sell_order.get("filled") or sell_order.get("amount") or 0.0)
-        if filled_sell < filled_quantity:
+        try:
+            sell_fill = self._confirm_fill(
+                sell_exchange, symbol, "sell", filled_quantity, sell_order)
+        except orders.OrderReconciliationError as exc:
             raise UnhedgedPositionError(
-                buy_exchange, sell_exchange, symbol,
-                max(0.0, filled_quantity - filled_sell), buy_order,
-                RuntimeError("Sell leg was partially filled."),
+                buy_exchange, sell_exchange, symbol, filled_quantity,
+                buy_order, exc, recovery_exchange=sell_exchange,
+                quantity_confirmed=False) from exc
+        filled_sell = float(sell_fill.filled_quantity)
+        shortfall = filled_quantity - filled_sell
+        if shortfall > self._dust_tolerance(sell_exchange, symbol, filled_quantity):
+            raise UnhedgedPositionError(
+                buy_exchange, sell_exchange, symbol, max(0.0, shortfall),
+                buy_order, RuntimeError("Sell leg was partially filled."),
                 recovery_exchange=sell_exchange,
             )
-        buy_cost = float(buy_order.get("cost") or amount_usdt)
-        sell_proceeds = float(sell_order.get("cost") or (filled_quantity * sell_price))
+
+        buy_cost = float(buy_fill.cost) or float(buy_order.get("cost") or amount_usdt)
+        sell_proceeds = float(sell_fill.cost) or float(
+            sell_order.get("cost") or (filled_sell * live_sell_price))
+        # Quote-currency fees are a cash cost the `cost` fields do not include.
+        # A fee charged in the base coin already shows up as a smaller sell.
+        quote_fees = sum(
+            float(fill.fee_cost) for fill in (buy_fill, sell_fill)
+            if (fill.fee_currency or "").upper() == quote.upper())
         return {
             "buy_order": buy_order,
             "sell_order": sell_order,
+            "buy_fill": buy_fill.as_dict(),
+            "sell_fill": sell_fill.as_dict(),
             "filled_quantity": filled_quantity,
-            "profit_usdt": sell_proceeds - buy_cost,
+            "unsold_dust": max(0.0, shortfall),
+            "profit_usdt": sell_proceeds - buy_cost - quote_fees,
         }
 
     def execute_triangular(self, exchange_name, start_usdt, prices, symbols=None):
@@ -503,64 +727,94 @@ class RealExecutionEngine:
                 f"below the {MIN_PROFIT_PCT:.3f}% minimum."
             )
 
-        btc_order = self.place_market_buy(exchange_name, first_symbol, start_usdt, fee)
-        filled_btc = float(btc_order.get("filled") or btc_order.get("amount") or 0.0)
+        # From here the capital is committed. A leg that cannot fill leaves a
+        # real position in an intermediate coin, so every failure below is an
+        # UnhedgedPositionError - the only error the server records for
+        # recovery - and never a bare RuntimeError.
+        requested_btc = self.plan_buy_quantity(
+            exchange_name, first_symbol, start_usdt, live_btc_price, fee)
+        btc_order = self.place_market_buy_quantity(
+            exchange_name, first_symbol, requested_btc)
+        try:
+            btc_fill = self._confirm_fill(
+                exchange_name, first_symbol, "buy", requested_btc, btc_order)
+        except orders.OrderReconciliationError as exc:
+            raise UnhedgedPositionError(
+                exchange_name, exchange_name, first_symbol, requested_btc,
+                btc_order, exc, quantity_confirmed=False) from exc
+        filled_btc = float(btc_fill.filled_quantity)
         if filled_btc <= 0:
             raise RuntimeError(f"{first_symbol} buy order returned no filled quantity.")
-        requested_btc = self.normalize_amount(
-            exchange_name, first_symbol, btc_quantity)
-        if filled_btc < requested_btc:
-            raise UnhedgedPositionError(
-                exchange_name, exchange_name, first_symbol, filled_btc, btc_order,
-                RuntimeError("First triangular leg was partially filled."),
-            )
+        # A partial first leg is not a reason to strand the position: the route
+        # is simply run at the size we really hold. Deducting a fee charged in
+        # the base coin matters, or the next leg asks for coin we do not have.
+        held_btc = self._net_received(btc_fill, base_coin(first_symbol), filled_btc)
 
         try:
-            requested_eth = self.normalize_amount(
-                exchange_name, middle_symbol, filled_btc / middle_price * (1 - fee))
+            requested_eth = self.plan_buy_quantity(
+                exchange_name, middle_symbol, held_btc, live_eth_btc_price, fee)
             eth_order = self.place_market_buy_quantity(
                 exchange_name, middle_symbol, requested_eth)
         except Exception as exc:
             raise UnhedgedPositionError(
-                exchange_name, exchange_name, first_symbol, filled_btc, btc_order, exc
+                exchange_name, exchange_name, first_symbol, held_btc, btc_order, exc
             ) from exc
-        filled_eth = float(eth_order.get("filled") or eth_order.get("amount") or 0.0)
+        try:
+            eth_fill = self._confirm_fill(
+                exchange_name, middle_symbol, "buy", requested_eth, eth_order)
+        except orders.OrderReconciliationError as exc:
+            raise UnhedgedPositionError(
+                exchange_name, exchange_name, middle_symbol, requested_eth,
+                eth_order, exc, quantity_confirmed=False) from exc
+        filled_eth = float(eth_fill.filled_quantity)
         if filled_eth <= 0:
             raise UnhedgedPositionError(
-                exchange_name, exchange_name, first_symbol, filled_btc, btc_order,
+                exchange_name, exchange_name, first_symbol, held_btc, btc_order,
                 RuntimeError(f"{middle_symbol} buy order returned no filled quantity."),
             )
-        if filled_eth < requested_eth:
-            residual_first = max(
-                0.0, filled_btc - (filled_eth * middle_price / (1 - fee)))
-            raise UnhedgedPositionError(
-                exchange_name, exchange_name, first_symbol, residual_first, btc_order,
-                RuntimeError("Middle triangular leg was partially filled."),
-            )
+        # Whatever BTC the middle leg did not spend is still sitting there. It
+        # is reported rather than silently forgotten, but it is dust-sized and
+        # does not stop the loop from closing.
+        residual_btc = max(0.0, held_btc - float(eth_fill.cost))
+        held_eth = self._net_received(eth_fill, base_coin(middle_symbol), filled_eth)
 
         try:
             eth_sell_order = self.place_market_sell(
-                exchange_name, final_symbol, filled_eth)
+                exchange_name, final_symbol, held_eth)
         except Exception as exc:
             raise UnhedgedPositionError(
-                exchange_name, exchange_name, final_symbol, filled_eth, eth_order, exc
+                exchange_name, exchange_name, final_symbol, held_eth, eth_order, exc
             ) from exc
-        filled_sell = float(
-            eth_sell_order.get("filled") or eth_sell_order.get("amount") or 0.0)
-        if filled_sell < filled_eth:
+        try:
+            sell_fill = self._confirm_fill(
+                exchange_name, final_symbol, "sell", held_eth, eth_sell_order)
+        except orders.OrderReconciliationError as exc:
             raise UnhedgedPositionError(
-                exchange_name, exchange_name, final_symbol,
-                max(0.0, filled_eth - filled_sell), eth_order,
-                RuntimeError("Final triangular leg was partially filled."),
+                exchange_name, exchange_name, final_symbol, held_eth,
+                eth_sell_order, exc, quantity_confirmed=False) from exc
+        filled_sell = float(sell_fill.filled_quantity)
+        shortfall = held_eth - filled_sell
+        if shortfall > self._dust_tolerance(exchange_name, final_symbol, held_eth):
+            raise UnhedgedPositionError(
+                exchange_name, exchange_name, final_symbol, max(0.0, shortfall),
+                eth_order, RuntimeError("Final triangular leg was partially filled."),
             )
 
-        start_cost = float(btc_order.get("cost") or start_usdt)
-        proceeds = float(eth_sell_order.get("cost") or (filled_eth * final_price))
+        quote = quote_coin(final_symbol)
+        start_cost = float(btc_fill.cost) or float(btc_order.get("cost") or start_usdt)
+        proceeds = float(sell_fill.cost) or float(
+            eth_sell_order.get("cost") or (filled_sell * live_eth_usdt_price))
+        quote_fees = sum(
+            float(leg.fee_cost) for leg in (btc_fill, sell_fill)
+            if (leg.fee_currency or "").upper() == quote.upper())
         return {
             "buy_order": btc_order,
             "middle_order": eth_order,
             "sell_order": eth_sell_order,
-            "profit_usdt": proceeds - start_cost,
+            "legs": [btc_fill.as_dict(), eth_fill.as_dict(), sell_fill.as_dict()],
+            "residual_base": residual_btc,
+            "unsold_dust": max(0.0, shortfall),
+            "profit_usdt": proceeds - start_cost - quote_fees,
         }
 
 
@@ -571,6 +825,12 @@ class RealExecutionEngine:
 def base_coin(symbol):
     """'BTC/USDT' -> 'BTC'"""
     return symbol.split("/")[0]
+
+
+def quote_coin(symbol):
+    """'BTC/USDT' -> 'USDT' - the currency fees and profit are measured in."""
+    parts = symbol.split("/")
+    return parts[1] if len(parts) > 1 else ""
 
 
 class PaperWallet:
@@ -713,25 +973,76 @@ class LiveFeed:
                 f"Need at least {required_clients} working exchange(s) for {TRADING_STRATEGY}."
             )
         self.routes = []
+        self.route_candidates = 0
         if TRADING_STRATEGY == "triangular":
-            self.routes = discover_triangular_routes(self.markets[next(iter(self.markets))])
-        route_symbols = [symbol for route in self.routes for symbol in route["symbols"]]
+            first_client = next(iter(self.clients))
+            discovered = discover_triangular_routes(self.markets[first_client])
+            # Every discovered route is arithmetically valid; almost none are
+            # tradeable. Ranking by the thinnest leg's volume and keeping the
+            # top slice is what turns a multi-minute scan into a fast one, and
+            # it drops exactly the routes whose tickers lie about their depth.
+            self.route_candidates = len(discovered)
+            self.routes = feed.rank_routes(
+                discovered, self._volume_snapshot(first_client),
+                limit=MAX_TRIANGULAR_ROUTES)
+        route_symbols = feed.symbols_for_routes(self.routes)
         self.symbols = list(dict.fromkeys(route_symbols or (symbols or SYMBOLS)))
+        self.rejected_quotes = {}
+        self.last_fetch_seconds = 0.0
+
+    def _volume_snapshot(self, exchange_name):
+        """24h volumes for route ranking, empty if the venue will not say.
+
+        Ranking is a startup nicety, not a safety check, so a venue that
+        cannot answer simply leaves the discovery order in place.
+        """
+        client = self.clients[exchange_name]
+        if not feed.supports_bulk_tickers(client):
+            return {}
+        try:
+            return client.fetch_tickers() or {}
+        except Exception:
+            return {}
 
     def get_quotes(self):
-        quotes = {}
-        for name, client in self.clients.items():
-            for sym in self.symbols:
-                try:
-                    t = client.fetch_ticker(sym)
-                    if t["bid"] and t["ask"]:
-                        quotes.setdefault(sym, {})[name] = {
-                            "bid": t["bid"],
-                            "ask": t["ask"],
-                        }
-                except Exception:
-                    pass  # symbol not on this exchange / hiccup -> skip
-        return quotes
+        """One bulk request per venue, in parallel, stale prices discarded.
+
+        The venues are independent, so waiting for each in turn adds their
+        latencies together for no reason. Threads are the right tool: this is
+        pure network wait, and ccxt clients are not shared across them.
+        """
+        started = time.perf_counter()
+        now_ms = time.time() * 1000.0
+        collected = {}
+        rejected = {}
+
+        def pull(item):
+            name, client = item
+            fetcher = (feed.fetch_bulk_quotes if feed.supports_bulk_tickers(client)
+                       else feed.fetch_quotes_one_by_one)
+            try:
+                return name, fetcher(client, self.symbols, now_ms=now_ms,
+                                     max_age_ms=MAX_QUOTE_AGE_MS)
+            except Exception as exc:
+                return name, ({}, {"*": f"feed error ({exc})"})
+
+        clients = list(self.clients.items())
+        if len(clients) == 1:
+            results = [pull(clients[0])]
+        else:
+            with futures.ThreadPoolExecutor(max_workers=len(clients)) as pool:
+                results = list(pool.map(pull, clients))
+
+        for name, (venue_quotes, venue_rejected) in results:
+            for symbol, quote in venue_quotes.items():
+                collected.setdefault(symbol, {})[name] = {
+                    "bid": quote["bid"], "ask": quote["ask"]}
+            if venue_rejected:
+                rejected[name] = venue_rejected
+
+        self.rejected_quotes = rejected
+        self.last_fetch_seconds = time.perf_counter() - started
+        return collected
 
 
 # ==================================================================
@@ -756,9 +1067,14 @@ def find_opportunity(quotes_for_symbol):
     if bid <= ask:
         return None  # no gap
 
-    # Profit math: buy 1 coin costs `ask` (+fee), selling gives `bid` (-fee)
-    gross_pct = (bid - ask) / ask * 100
-    net_pct = gross_pct - (2 * TAKER_FEE * 100)  # fee on both sides
+    # Profit math: buy 1 coin costs `ask` (+fee), selling gives `bid` (-fee).
+    # The fees compound - the sell fee applies to the grossed-up proceeds - so
+    # subtracting 2*fee from the gross spread overstates the edge, always in
+    # the direction that loses money.
+    gross_pct = (bid - ask) / ask * 100          # before fees, for reporting
+    net_pct = float(net_spread_pct(ask, bid, TAKER_FEE, TAKER_FEE))
+    if gross_pct <= 0:
+        return None
 
     if net_pct >= MIN_PROFIT_PCT:
         return best_ask_ex, best_bid_ex, ask, bid, net_pct
@@ -861,14 +1177,26 @@ def find_best_triangular_opportunity(quotes, exchange, start_usdt, fee, routes):
 #  LOGGING
 # ==================================================================
 
+CSV_HEADER = [
+    "time", "symbol", "buy_exchange", "sell_exchange",
+    "buy_price", "sell_price", "trade_size_usdt",
+    "profit_usdt", "net_profit_pct", "buy_order_id",
+    "sell_order_id", "status", "middle_order_id",
+]
+
+
 def init_csv():
-    with open(LOG_FILE, "w", newline="") as f:
-        csv.writer(f).writerow([
-            "time", "symbol", "buy_exchange", "sell_exchange",
-            "buy_price", "sell_price", "trade_size_usdt",
-            "profit_usdt", "net_profit_pct", "buy_order_id",
-            "sell_order_id", "status", "middle_order_id",
-        ])
+    """Make sure the log exists and has a header, without destroying history.
+
+    This used to open the file in "w" mode, so every restart of the CLI or the
+    web server silently erased the entire trade log - including the record of
+    real orders, which is the one file an operator cannot reconstruct.
+    """
+    path = Path(LOG_FILE)
+    if path.exists() and path.stat().st_size > 0:
+        return
+    with open(LOG_FILE, "a", newline="") as f:
+        csv.writer(f).writerow(CSV_HEADER)
 
 
 def log_trade(row):

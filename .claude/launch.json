@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-sandbox",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "C:/Users/HP/AppData/Local/Temp/arb_ui/run_sandbox.py"
+      ],
+      "port": 5050
+    }
+  ]
+}

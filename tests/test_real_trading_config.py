@@ -1,8 +1,22 @@
+import os
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
 import arbitrage_bot
 import server
+from arbicore import config as arbiconfig
+
+
+def api_client():
+    """A test client carrying the session token the access guard requires.
+
+    In a browser the dashboard picks the token up as a SameSite cookie on its
+    first GET; a script has to send the header, and so does a test.
+    """
+    client = server.app.test_client()
+    client.environ_base["HTTP_X_ARBICORE_TOKEN"] = server.API_TOKEN
+    return client
 
 
 class RealTradingConfigTests(unittest.TestCase):
@@ -179,9 +193,11 @@ class RealTradingConfigTests(unittest.TestCase):
             arbitrage_bot.TRADING_STRATEGY,
             arbitrage_bot.EXCHANGES,
             arbitrage_bot.EXCHANGE_CREDENTIALS,
+            arbitrage_bot.REAL_TRADING_ACK,
         )
         try:
             arbitrage_bot.REAL_TRADING_ENABLED = True
+            arbitrage_bot.REAL_TRADING_ACK = arbiconfig.REAL_TRADING_ACK
             arbitrage_bot.MODE = "live"
             arbitrage_bot.EXECUTION_MODE = "real"
             arbitrage_bot.TRADING_STRATEGY = "triangular"
@@ -197,7 +213,8 @@ class RealTradingConfigTests(unittest.TestCase):
              arbitrage_bot.EXECUTION_MODE,
              arbitrage_bot.TRADING_STRATEGY,
              arbitrage_bot.EXCHANGES,
-             arbitrage_bot.EXCHANGE_CREDENTIALS) = originals
+             arbitrage_bot.EXCHANGE_CREDENTIALS,
+             arbitrage_bot.REAL_TRADING_ACK) = originals
 
     def test_atomic_arbitrage_does_not_buy_when_sell_balance_is_missing(self):
         wallet = arbitrage_bot.PaperWallet(
@@ -218,21 +235,21 @@ class RealTradingConfigTests(unittest.TestCase):
         self.assertEqual(wallet.coin["binance"]["BTC/USDT"], starting_coin)
 
     def test_api_config_rejects_invalid_numeric_values(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.post("/api/config", json={"fee": -0.1})
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["ok"])
 
     def test_api_config_rejects_invalid_execution_mode(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.post("/api/config", json={"execution_mode": "live-orders"})
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["ok"])
 
     def test_readiness_reports_paper_mode(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.get("/api/readiness")
 
         self.assertEqual(response.status_code, 200)
@@ -240,7 +257,7 @@ class RealTradingConfigTests(unittest.TestCase):
         self.assertIn("paper", response.get_json()["message"].lower())
 
     def test_history_endpoint_returns_persisted_collections(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.get("/api/history")
 
         self.assertEqual(response.status_code, 200)
@@ -296,14 +313,14 @@ class RealTradingConfigTests(unittest.TestCase):
         self.assertAlmostEqual(result["total_usdt"], 160.0)
 
     def test_recovery_close_requires_explicit_confirmation(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.post("/api/recovery/close", json={})
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["ok"])
 
     def test_recovery_close_requires_real_execution_mode(self):
-        client = server.app.test_client()
+        client = api_client()
         response = client.post(
             "/api/recovery/close",
             json={"confirmation": "CLOSE_UNHEDGED_POSITION", "buy_order_id": "missing"},
@@ -313,7 +330,7 @@ class RealTradingConfigTests(unittest.TestCase):
         self.assertFalse(response.get_json()["ok"])
 
     def test_emergency_stop_blocks_restart_until_reset(self):
-        client = server.app.test_client()
+        client = api_client()
         stopped = client.post("/api/emergency-stop")
         blocked = client.post("/api/start")
         reset = client.post("/api/reset")
@@ -410,12 +427,19 @@ class RealTradingConfigTests(unittest.TestCase):
                 "asks": [[10000 if symbol == "BTC/USDT" else 0.05, 10]],
                 "bids": [[510 if symbol == "ETH/USDT" else 0.05, 10]],
             }
+            # `status` matters now that every leg is reconciled against the
+            # exchange: a triangular middle leg fills slightly under the
+            # requested size, so without a terminal status the reconciler
+            # correctly refuses to assume it is done and polls until it times
+            # out. A real venue reports the status; the mock has to as well.
             client.create_market_buy_order.side_effect = [
-                {"id": "btc-buy", "filled": 0.001998, "cost": 20},
-                {"id": "eth-buy", "filled": 0.03992004, "cost": 0.001996},
+                {"id": "btc-buy", "status": "closed", "filled": 0.001998, "cost": 20},
+                {"id": "eth-buy", "status": "closed", "filled": 0.03992004,
+                 "cost": 0.001996},
             ]
             client.create_market_sell_order.return_value = {
-                "id": "eth-sell", "filled": 0.03992004, "cost": 20.5,
+                "id": "eth-sell", "status": "closed", "filled": 0.03992004,
+                "cost": 20.5,
             }
 
             engine = arbitrage_bot.RealExecutionEngine.__new__(
@@ -501,22 +525,49 @@ class RealTradingConfigTests(unittest.TestCase):
             arbitrage_bot.MIN_PROFIT_PCT = original_min_profit
 
     def test_api_config_updates_engine_state(self):
-        client = server.app.test_client()
-        response = client.post(
-            "/api/config",
-            json={
-                "mode": "live",
-                "trade_size": 333,
-                "fee": 0.002,
-                "min_profit": 0.5,
-                "interval": 4,
-                "exchanges": ["binance", "okx"],
-                "symbols": ["BTC/USDT", "ETH/USDT"],
-            },
-        )
-        self.assertEqual(response.status_code, 200)
+        """The settings reach the module and the published state.
 
-        state = client.get("/api/state").get_json()
+        No engine is rebuilt: doing so would make this test depend on four
+        exchanges being reachable. It also has to put the configuration back
+        afterwards - leaving mode="live" behind made every later test that
+        resets the engine dial out to the network, which is where 40 of this
+        file's 48 seconds used to go.
+        """
+        before = dict(server.state["config"])
+        before_exchanges = list(server.state["active_exchanges"])
+        before_symbols = list(server.state["active_symbols"])
+        originals = {name: getattr(arbitrage_bot, name)
+                     for name in ("MODE", "TRADE_SIZE_USDT", "TAKER_FEE",
+                                  "MIN_PROFIT_PCT", "CHECK_INTERVAL",
+                                  "EXCHANGES", "SYMBOLS")}
+
+        def restore():
+            with server.state_lock:
+                server.state["config"].update(before)
+                server.state["active_exchanges"] = before_exchanges
+                server.state["active_symbols"] = before_symbols
+            for name, value in originals.items():
+                setattr(arbitrage_bot, name, value)
+
+        self.addCleanup(restore)
+
+        client = api_client()
+        with mock.patch.object(server, "init_engine"):
+            response = client.post(
+                "/api/config",
+                json={
+                    "mode": "live",
+                    "trade_size": 333,
+                    "fee": 0.002,
+                    "min_profit": 0.5,
+                    "interval": 4,
+                    "exchanges": ["binance", "okx"],
+                    "symbols": ["BTC/USDT", "ETH/USDT"],
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+            state = client.get("/api/state").get_json()
         self.assertEqual(state["config"]["mode"], "live")
         self.assertEqual(state["config"]["trade_size"], 333)
         self.assertEqual(state["config"]["fee"], 0.002)
@@ -528,6 +579,153 @@ class RealTradingConfigTests(unittest.TestCase):
         self.assertEqual(arbitrage_bot.TAKER_FEE, 0.002)
         self.assertEqual(arbitrage_bot.MIN_PROFIT_PCT, 0.5)
         self.assertEqual(arbitrage_bot.CHECK_INTERVAL, 4)
+
+
+class CredentialResolutionTests(unittest.TestCase):
+    """Where the keys come from, and what counts as not having any."""
+
+    def setUp(self):
+        self.original = dict(arbitrage_bot.EXCHANGE_CREDENTIALS)
+        self.addCleanup(setattr, arbitrage_bot, "EXCHANGE_CREDENTIALS",
+                        self.original)
+
+    def test_the_environment_beats_the_config_file(self):
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "binance": {"apiKey": "from-file", "secret": "file-secret"},
+        }
+        with mock.patch.dict(os.environ, {
+                "ARBI_BINANCE_API_KEY": "from-env",
+                "ARBI_BINANCE_API_SECRET": "env-secret"}, clear=False):
+            creds = arbitrage_bot.resolve_credentials("binance")
+
+        self.assertEqual(creds.api_key, "from-env")
+        self.assertEqual(creds.source, "env")
+
+    def test_the_config_file_is_the_fallback(self):
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "kucoin": {"apiKey": "k", "secret": "s", "password": "p"},
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            creds = arbitrage_bot.resolve_credentials("kucoin")
+
+        self.assertTrue(creds.complete)
+        self.assertEqual(creds.password, "p")
+        self.assertEqual(creds.source, "live_config")
+
+    def test_a_secret_never_appears_in_a_repr(self):
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "binance": {"apiKey": "AKIAsecretkey", "secret": "topsecret"},
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            rendered = repr(arbitrage_bot.resolve_credentials("binance"))
+
+        self.assertNotIn("topsecret", rendered)
+        self.assertNotIn("AKIAsecretkey", rendered)
+
+    def test_example_placeholders_count_as_no_credentials(self):
+        """A copied live_config.example.py used to validate as fully configured,
+        so the refusal came from the exchange mid-trade instead of at startup."""
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "binance": {"apiKey": "PASTE_YOUR_BINANCE_API_KEY",
+                        "secret": "PASTE_YOUR_BINANCE_SECRET"},
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            creds = arbitrage_bot.resolve_credentials("binance")
+
+        self.assertFalse(creds.complete)
+        self.assertEqual(creds.missing(), ["api_key", "api_secret"])
+
+    def test_placeholder_keys_do_not_pass_the_live_startup_check(self):
+        saved = {name: getattr(arbitrage_bot, name) for name in
+                 ("REAL_TRADING_ENABLED", "REAL_TRADING_ACK", "MODE",
+                  "EXECUTION_MODE", "TRADING_STRATEGY", "EXCHANGES")}
+        for name, value in saved.items():
+            self.addCleanup(setattr, arbitrage_bot, name, value)
+
+        arbitrage_bot.REAL_TRADING_ENABLED = True
+        arbitrage_bot.REAL_TRADING_ACK = arbiconfig.REAL_TRADING_ACK
+        arbitrage_bot.MODE = "live"
+        arbitrage_bot.EXECUTION_MODE = "real"
+        arbitrage_bot.TRADING_STRATEGY = "cross_exchange"
+        arbitrage_bot.EXCHANGES = ["binance", "kucoin"]
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "binance": {"apiKey": "PASTE_YOUR_BINANCE_API_KEY",
+                        "secret": "PASTE_YOUR_BINANCE_SECRET"},
+            "kucoin": {"apiKey": "PASTE_YOUR_KUCOIN_API_KEY",
+                       "secret": "PASTE_YOUR_KUCOIN_SECRET"},
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = arbitrage_bot.validate_real_trading_config()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("API keys", result["message"])
+
+
+class RealTradingAcknowledgementTests(unittest.TestCase):
+    """The flag alone must not be enough to place an order."""
+
+    def setUp(self):
+        for name in ("REAL_TRADING_ENABLED", "REAL_TRADING_ACK", "MODE",
+                     "EXECUTION_MODE", "TRADING_STRATEGY", "EXCHANGES",
+                     "EXCHANGE_CREDENTIALS"):
+            self.addCleanup(setattr, arbitrage_bot, name,
+                            getattr(arbitrage_bot, name))
+        arbitrage_bot.REAL_TRADING_ENABLED = True
+        arbitrage_bot.MODE = "live"
+        arbitrage_bot.EXECUTION_MODE = "real"
+        arbitrage_bot.TRADING_STRATEGY = "cross_exchange"
+        arbitrage_bot.EXCHANGES = ["binance", "kucoin"]
+        arbitrage_bot.EXCHANGE_CREDENTIALS = {
+            "binance": {"apiKey": "abc", "secret": "def"},
+            "kucoin": {"apiKey": "ghi", "secret": "jkl"},
+        }
+
+    def test_the_flag_without_the_acknowledgement_is_refused(self):
+        arbitrage_bot.REAL_TRADING_ACK = ""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = arbitrage_bot.validate_real_trading_config()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("REAL_TRADING_ACK", result["message"])
+
+    def test_a_near_miss_acknowledgement_is_refused(self):
+        arbitrage_bot.REAL_TRADING_ACK = "i accept real losses"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                arbitrage_bot.validate_real_trading_config()["ok"])
+
+    def test_the_exact_acknowledgement_passes(self):
+        arbitrage_bot.REAL_TRADING_ACK = arbiconfig.REAL_TRADING_ACK
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = arbitrage_bot.validate_real_trading_config()
+
+        self.assertTrue(result["ok"], result["message"])
+
+    def test_the_environment_can_supply_the_acknowledgement(self):
+        arbitrage_bot.REAL_TRADING_ACK = ""
+        with mock.patch.dict(
+                os.environ,
+                {"ARBI_REAL_TRADING_ACK": arbiconfig.REAL_TRADING_ACK},
+                clear=True):
+            result = arbitrage_bot.validate_real_trading_config()
+
+        self.assertTrue(result["ok"], result["message"])
+
+    def test_the_server_refuses_to_build_a_real_engine_without_it(self):
+        """init_engine is the chokepoint: no acknowledgement, no engine."""
+        arbitrage_bot.REAL_TRADING_ACK = ""
+        before = dict(server.state["config"])
+        self.addCleanup(server.state["config"].update, before)
+        server.state["config"].update({
+            "mode": "live", "execution_mode": "real",
+            "real_trading_enabled": True,
+        })
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as caught:
+                with server.state_lock:
+                    server.init_engine()
+
+        self.assertIn("REAL_TRADING_ACK", str(caught.exception))
 
 
 if __name__ == "__main__":

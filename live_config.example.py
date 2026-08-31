@@ -1,7 +1,17 @@
 # Copy this file to live_config.py and fill in your real credentials.
 # Never commit your secret API keys to version control.
+#
+# Better still, leave EXCHANGE_CREDENTIALS empty and export the keys instead:
+#   ARBI_BINANCE_API_KEY / ARBI_BINANCE_API_SECRET   (and _PASSWORD for
+#   KuCoin/OKX, whose API also needs the passphrase)
+# The environment wins over this file, and a key that is never written to disk
+# cannot be committed, backed up by an editor, or read out of a stale copy.
 
 REAL_TRADING_ENABLED = False
+# Real orders need this typed out exactly as well - see arbicore.config's
+# REAL_TRADING_ACK. Leaving it blank is what keeps a copied config file from
+# trading on a machine it was never meant to run on.
+REAL_TRADING_ACK = ""
 MODE = "live"
 EXECUTION_MODE = "paper"  # change to "real" only after paper validation
 TRADING_STRATEGY = "cross_exchange"  # use "triangular" with one exchange
