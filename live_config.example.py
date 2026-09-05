@@ -8,10 +8,11 @@
 # cannot be committed, backed up by an editor, or read out of a stale copy.
 
 REAL_TRADING_ENABLED = False
+SANDBOX_MODE = True  # Binance Spot Testnet; set False only for production
 # Real orders need this typed out exactly as well - see arbicore.config's
 # REAL_TRADING_ACK. Leaving it blank is what keeps a copied config file from
 # trading on a machine it was never meant to run on.
-REAL_TRADING_ACK = ""
+REAL_TRADING_ACK = ""  # required only when SANDBOX_MODE is False
 MODE = "live"
 EXECUTION_MODE = "paper"  # change to "real" only after paper validation
 TRADING_STRATEGY = "cross_exchange"  # use "triangular" with one exchange

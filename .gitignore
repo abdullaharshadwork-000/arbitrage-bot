@@ -1,13 +1,19 @@
 live_config.py
 .env
 __pycache__/
+.pytest_cache/
 *.pyc
 trades.csv
 
 # Runtime databases and simulation output — recreated on demand.
 arbicore.db
+*.db
+*.db-*
+*.backup
+*.bak
 arbicore.db-journal
 *.sqlite
 sim_results/
 .venv/
 venv/
+node_modules/

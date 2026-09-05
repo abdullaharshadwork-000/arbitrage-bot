@@ -288,6 +288,8 @@ def find_by_client_id(client, symbol, client_order_id):
             orders = getattr(client, method)(symbol) or []
         except Exception:
             continue
+        if not isinstance(orders, (list, tuple)):
+            continue
         for order in orders:
             if str(order.get("clientOrderId") or "") == client_order_id:
                 return dict(order)

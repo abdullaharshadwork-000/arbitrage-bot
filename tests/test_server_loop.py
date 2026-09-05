@@ -701,9 +701,12 @@ class TestAccessGuard(ServerTestCase):
 
     def test_reading_state_does_not_need_the_token(self):
         plain = server.app.test_client()
-        for path in ("/api/state", "/api/readiness", "/api/risk", "/api/recovery"):
+        for path in ("/api/state", "/api/readiness"):
             with self.subTest(path=path):
                 self.assertEqual(plain.get(path).status_code, 200)
+        for path in ("/api/risk", "/api/recovery"):
+            with self.subTest(path=path):
+                self.assertEqual(plain.get(path).status_code, 403)
 
     def test_another_local_port_cannot_ride_the_cookie(self):
         # SameSite treats every port on localhost as the same site, so a second
@@ -746,10 +749,11 @@ class TestAccessGuard(ServerTestCase):
         self.assertIn(server.API_TOKEN, cookie)
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
-        # And the same client can now act, without ever seeing the token in JS.
+        # The CSRF cookie is necessary but no longer sufficient: a browser must
+        # also establish its own signed login session.
         self.assertEqual(
             plain.post("/api/config", json={"min_profit": 0.22},
-                       headers={"Origin": self.OWN_ORIGIN}).status_code, 200)
+                       headers={"Origin": self.OWN_ORIGIN}).status_code, 401)
 
 
 if __name__ == "__main__":

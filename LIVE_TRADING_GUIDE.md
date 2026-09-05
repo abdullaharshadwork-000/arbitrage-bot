@@ -14,6 +14,7 @@ start with a sentence telling you which:
 | `MODE` | `"live"` | `live_config.py` |
 | `EXECUTION_MODE` | `"real"` | `live_config.py` |
 | `REAL_TRADING_ENABLED` | `True` | `live_config.py` |
+| `SANDBOX_MODE` | `True` for testnet, `False` for production | dashboard, environment, or `live_config.py` |
 | `REAL_TRADING_ACK` | `"I ACCEPT REAL LOSSES"` | `live_config.py` or `ARBI_REAL_TRADING_ACK` |
 | API key + secret | per exchange | environment (preferred) or `live_config.py` |
 
@@ -24,6 +25,18 @@ copies by accident.
 Cross-exchange arbitrage needs credentials on at least **two** exchanges;
 triangular needs **one**.
 
+The professional dashboard exposes **Paper**, **Binance Spot Testnet**, and
+**Real funds** as separate targets. Testnet exercises authenticated order code
+without production funds. Production additionally requires an administrator to
+type the exact loss acknowledgement. Start is blocked until the authenticated
+connection test passes.
+
+For Binance, that connection test sends a signed request to Binance's
+non-executing test-order endpoint. It verifies account access, `TRADE`
+permission, and order filters without placing an order. The approval is bound
+to the selected target, exchanges, and strategy, and expires after five
+minutes. A testnet approval therefore cannot arm production trading.
+
 ## 2. Where the keys go
 
 Export them rather than typing them into a file:
@@ -31,6 +44,7 @@ Export them rather than typing them into a file:
 ```bash
 export ARBI_BINANCE_API_KEY=...
 export ARBI_BINANCE_API_SECRET=...
+export ARBI_SANDBOX_MODE=true          # remove/set false only for production
 export ARBI_KUCOIN_API_KEY=...
 export ARBI_KUCOIN_API_SECRET=...
 export ARBI_KUCOIN_PASSWORD=...      # KuCoin and OKX also need the passphrase
@@ -42,6 +56,10 @@ committed, backed up by an editor, or read out of a stale copy of the folder.
 
 `live_config.py` is gitignored, which protects the repository and nothing else —
 the keys in it are still plaintext on your disk.
+
+The browser never accepts or stores API secrets. Configure them in the server
+environment and restart; the dashboard only reports whether each credential
+pair is present and whether authenticated access passed.
 
 ## 3. How the API keys must be configured
 
@@ -77,11 +95,13 @@ the gap lasts seconds. So before real mode is worth trying:
    it running for days, not minutes.
 3. Compare the paper results against what the spreads actually were. If paper is
    barely profitable, real will not be — real adds partial fills and rejections.
-4. Only then set the two real-trading gates, with a **tiny** trade size (10–20
+4. Create Binance Spot Testnet credentials, choose **Binance Spot Testnet** and
+   the one-exchange triangular strategy, then verify complete fills and recovery.
+5. Only then set the production gates, with a **tiny** trade size (10–20
    USDT) and `MIN_PROFIT_PCT` well above the round-trip fee.
-5. Watch the first fills one at a time. Check the exchange's own order history
+6. Watch the first fills one at a time. Check the exchange's own order history
    against the bot's blotter.
-6. Increase size slowly, and only after a stretch with no failed legs.
+7. Increase size slowly, and only after a stretch with no failed legs.
 
 ## 6. What stops the bot on its own
 

@@ -2,14 +2,15 @@
 
 `server.py` is a small Flask app that drives the engine in `arbitrage_bot.py`
 and the `arbicore` package, and serves the dashboard in
-`arbitrage-bot-terminal.html`. It is the normal way to run the bot: the CLI
+`dashboard-pro.html`. It is the normal way to run the bot: the CLI
 script still works, but only the dashboard shows the risk limits, the startup
 check, the alert log and the recovery actions.
 
 | File | Purpose |
 |---|---|
 | `server.py` | Flask backend — owns the scan thread, exposes it over HTTP |
-| `arbitrage-bot-terminal.html` | Dashboard frontend, served by `server.py` |
+| `dashboard-pro.html` | Role-aware dashboard frontend served at `/` |
+| `arbitrage-bot-terminal.html` | Legacy operations terminal using the same APIs |
 | `start_live.py` | Launcher that validates `live_config.py` before serving |
 
 ## Run
@@ -28,9 +29,19 @@ do not assume 5000.
 
 ## Access control
 
+On a new or migrated database, startup idempotently creates the administrator
+configured privately with `ARBICORE_ADMIN_USERNAME`,
+`ARBICORE_ADMIN_PASSWORD`, and `ARBICORE_ADMIN_EMAIL`. Never publish those
+values in the UI, documentation distributed to traders, or client-side code.
+Passwords are stored as
+Werkzeug hashes, never plaintext. Re-running database initialization preserves
+the existing account and does not reset its password. Trader registrations are
+stored in the same SQLite `users` table, and roles are read from the database;
+the browser cannot promote itself by submitting a role.
+
 The server binds to `127.0.0.1` only, so nothing off this machine can reach it.
 That is not enough on its own: any page open in your browser can also POST to
-`http://localhost:5000`, and `POST /api/config` is a route that can turn on real
+a loopback service, and `POST /api/config` is a route that can turn on real
 execution. So every mutating request must satisfy two checks:
 
 - **Same origin.** The `Origin` header, when present, must equal the server's own
@@ -53,11 +64,13 @@ ARBICORE_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))") py
 ```
 
 ```bash
-curl -X POST http://localhost:5000/api/pause -H "X-Arbicore-Token: $ARBICORE_TOKEN"
+curl -X POST http://127.0.0.1:PORT/api/pause -H "X-Arbicore-Token: $ARBICORE_TOKEN"
 ```
 
-This is still a single-user local tool. It has no user accounts, no TLS and no
-rate limiting; do not expose it to a network.
+Production hardening, encrypted credential persistence, testnet qualification,
+health monitoring, recovery, and deployment requirements are documented in
+[`PRODUCTION.md`](PRODUCTION.md). Keep the service on loopback unless it is behind
+a maintained HTTPS reverse proxy.
 
 ## API
 

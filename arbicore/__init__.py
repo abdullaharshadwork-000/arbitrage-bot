@@ -20,6 +20,7 @@ touch real money live here, in small testable units:
 
 __all__ = [
     "alerts",
+    "auth",
     "books",
     "config",
     "feed",
@@ -28,6 +29,8 @@ __all__ = [
     "orders",
     "rebalance",
     "reconcile",
+    "safety",
     "risk",
     "simulator",
+    "streaming",
 ]

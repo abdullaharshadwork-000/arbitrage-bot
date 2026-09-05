@@ -26,6 +26,7 @@ HOW TO RUN (see README.md for full instructions):
 
 import csv
 import importlib.util
+import inspect
 import os
 import random
 import time
@@ -37,7 +38,7 @@ from pathlib import Path
 # walking, fill reconciliation and exact decimal money maths. They live in a
 # package with their own tests because a rounding error here is a loss, not a
 # cosmetic bug.
-from arbicore import books, config as arbiconfig, feed, orders
+from arbicore import books, config as arbiconfig, feed, orders, streaming
 from arbicore.money import D, HUNDRED, ONE, ZERO, net_spread_pct
 
 # ==================================================================
@@ -55,12 +56,18 @@ REAL_TRADING_ENABLED = False
 # real orders also need this typed out exactly, either here, in live_config.py,
 # or as ARBI_REAL_TRADING_ACK in the environment. See arbicore.config.
 REAL_TRADING_ACK = ""
+# Route authenticated exchange calls to the venue's sandbox/testnet.  This is
+# intentionally process configuration (not a dashboard-only flag): the client
+# must be pointed at the sandbox before markets or balances are loaded.
+SANDBOX_MODE = False
 EXCHANGE_CREDENTIALS = {
     "binance": {"apiKey": "", "secret": ""},
     "kucoin": {"apiKey": "", "secret": ""},
     "okx": {"apiKey": "", "secret": ""},
     "bybit": {"apiKey": "", "secret": ""},
 }
+ORDER_INTENT_HOOK = None
+ORDER_RESULT_HOOK = None
 
 EXCHANGES = ["binance", "kucoin", "okx", "bybit"]   # live mode only
 EXCHANGES_MASTER = list(EXCHANGES)
@@ -124,6 +131,13 @@ def resolve_real_trading_ack(environ=None):
     return (env.get("ARBI_REAL_TRADING_ACK") or REAL_TRADING_ACK or "").strip()
 
 
+def resolve_sandbox_mode(environ=None):
+    """Whether authenticated clients target exchange test infrastructure."""
+    env = environ if environ is not None else os.environ
+    value = env.get("ARBI_SANDBOX_MODE", SANDBOX_MODE)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def validate_real_trading_config():
     """Returns a dict describing whether it is safe to start live trading."""
     if not REAL_TRADING_ENABLED:
@@ -142,7 +156,7 @@ def validate_real_trading_config():
             "ok": False,
             "message": "EXECUTION_MODE must be 'real' when real trading is enabled.",
         }
-    if resolve_real_trading_ack() != arbiconfig.REAL_TRADING_ACK:
+    if not resolve_sandbox_mode() and resolve_real_trading_ack() != arbiconfig.REAL_TRADING_ACK:
         return {
             "ok": False,
             "message": (
@@ -219,7 +233,7 @@ def load_live_config_if_present():
             # Stay in demo mode unless the file explicitly opts in to live/real trading.
             return False
 
-        for key in ("REAL_TRADING_ENABLED", "REAL_TRADING_ACK", "MODE",
+        for key in ("REAL_TRADING_ENABLED", "REAL_TRADING_ACK", "SANDBOX_MODE", "MODE",
                     "EXECUTION_MODE", "TRADING_STRATEGY", "EXCHANGES",
                     "SYMBOLS", "EXCHANGE_CREDENTIALS"):
             if hasattr(module, key):
@@ -299,6 +313,12 @@ def create_exchange_client(exchange_name):
 
     creds = resolve_credentials(exchange_name)
     config = {"enableRateLimit": True}
+    if exchange_name == "binance":
+        # Binance currency metadata is an authenticated SAPI request in CCXT.
+        # Market discovery must remain public so an auth/IP rejection can be
+        # reported at the correct diagnostic stage instead of masquerading as
+        # "could not load markets".
+        config["options"] = {"fetchCurrencies": False}
     # Blank values are left out rather than passed as empty strings: some venues
     # treat a present-but-empty apiKey as a broken key instead of no key.
     config.update({name: value
@@ -307,7 +327,18 @@ def create_exchange_client(exchange_name):
     exchange_class = getattr(ccxt, exchange_name, None)
     if exchange_class is None:
         raise ValueError(f"Unsupported exchange: {exchange_name}")
-    return exchange_class(config)
+    client = exchange_class(config)
+    sandbox_enabled = resolve_sandbox_mode()
+    if sandbox_enabled:
+        if not hasattr(client, "set_sandbox_mode"):
+            raise ValueError(f"{exchange_name} does not expose sandbox mode through CCXT.")
+        try:
+            # CCXT requires this to be the first call after construction.
+            client.set_sandbox_mode(True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not enable sandbox mode for {exchange_name}: {exc}") from exc
+    return client
 
 
 class UnhedgedPositionError(RuntimeError):
@@ -348,6 +379,10 @@ class RealExecutionEngine:
         self.clients = {name: create_exchange_client(name) for name in exchanges}
         self.markets = {}
         self.fee_rates = {}
+        # Production orders are bounded limit-FOK orders.  A market order can
+        # run beyond the depth/slippage price approved moments earlier.
+        self.bounded_orders = True
+        self._approved_limit_prices = {}
         for name, client in self.clients.items():
             try:
                 self.markets[name] = client.load_markets()
@@ -377,7 +412,7 @@ class RealExecutionEngine:
         return fee_rates[exchange_name]
 
     def connection_status(self, exchange_name):
-        """Check public markets and private balance access without placing orders."""
+        """Check public data, account auth, and trade permission in distinct stages."""
         client = self.clients[exchange_name]
         started = time.perf_counter()
         market_count = len(self.markets.get(exchange_name, {}))
@@ -388,20 +423,64 @@ class RealExecutionEngine:
             "latency_ms": None,
             "fee": None,
             "balance_access": False,
+            "trade_access": None,
+            "stage": "public_market",
             "error": None,
+            "sandbox": bool(getattr(client, "sandboxMode", False)),
         }
         try:
-            client.fetch_ticker("BTC/USDT")
-            result["balance_access"] = bool(client.fetch_balance())
+            ticker = client.fetch_ticker("BTC/USDT")
+        except Exception as exc:
+            result["error"] = f"Public market access failed: {exc}"
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        result["stage"] = "account_authentication"
+        try:
+            client.fetch_balance()
+            # A valid empty account response is still successful authentication.
+            result["balance_access"] = True
+        except Exception as exc:
+            result["error"] = f"Account authentication failed: {exc}"
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        result["stage"] = "trade_permission"
+        try:
+            if exchange_name == "binance":
+                # CCXT's `test` flag routes Binance Spot to POST /api/v3/order/test.
+                # Binance validates signature, TRADE permission, symbol filters,
+                # and the proposed order but never sends it to the matching engine.
+                ask = float(ticker.get("ask") or ticker.get("last") or 0.0)
+                if ask <= 0:
+                    raise RuntimeError("No usable BTC/USDT ask for the test order.")
+                constraints = self.market_constraints(exchange_name, "BTC/USDT")
+                test_cost = max(float(TRADE_SIZE_USDT), float(constraints["min_cost"] or 0.0))
+                test_amount = max(test_cost / ask,
+                                  float(constraints["min_amount"] or 0.0))
+                test_amount = self.normalize_amount(
+                    exchange_name, "BTC/USDT", test_amount)
+                client.create_order("BTC/USDT", "market", "buy", test_amount,
+                                    None, {"test": True})
+                result["trade_access"] = True
+        except Exception as exc:
+            result["trade_access"] = False
+            result["error"] = f"Trade-permission test failed: {exc}"
+            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            return result
+
+        result["stage"] = "complete"
+        try:
             if hasattr(client, "fetch_trading_fee"):
                 fee = client.fetch_trading_fee("BTC/USDT")
                 taker = fee.get("taker") if isinstance(fee, dict) else None
                 result["fee"] = float(taker) if taker is not None else None
-            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
-            result["ok"] = result["balance_access"] and market_count > 0
-        except Exception as exc:
-            result["error"] = str(exc)
-            result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        except Exception:
+            # Fee lookup is advisory; order-test authorization is authoritative.
+            result["fee"] = None
+        result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        result["ok"] = (result["balance_access"] and market_count > 0
+                        and result["trade_access"] is not False)
         return result
 
     def market_constraints(self, exchange_name, symbol):
@@ -508,20 +587,92 @@ class RealExecutionEngine:
         ask = float(ticker["ask"])
         quantity = self.plan_buy_quantity(
             exchange_name, symbol, amount_usdt, ask, fee)
-        return client.create_market_buy_order(symbol, quantity)
+        return self._place_market_order(exchange_name, symbol, "buy", quantity)
+
+    def _place_market_order(self, exchange_name, symbol, side, quantity):
+        """Submit once with our client id and resolve an ambiguous timeout.
+
+        A transport exception does not prove Binance rejected an order. It may
+        have reached the matching engine before the reply was lost. Searching
+        by the id generated here prevents a blind retry from doubling exposure.
+        """
+        client = self.clients[exchange_name]
+        client_order_id = orders.new_client_order_id()
+        params = {"clientOrderId": client_order_id}
+        if ORDER_INTENT_HOOK:
+            ORDER_INTENT_HOOK(client_order_id, exchange_name, symbol, side, quantity)
+        limit_price = (getattr(self, "_approved_limit_prices", {}) or {}).get(
+            (exchange_name, symbol, side))
+        bounded = bool(getattr(self, "bounded_orders", False) and limit_price
+                       and callable(getattr(client, "create_order", None)))
+        if bounded:
+            try:
+                precise_price = float(client.price_to_precision(symbol, limit_price))
+            except Exception:
+                precise_price = float(limit_price)
+            try:
+                created = client.create_order(
+                    symbol, "limit", side, float(quantity), precise_price,
+                    {"timeInForce": "FOK", "clientOrderId": client_order_id})
+            except Exception as exc:
+                recovered = orders.find_by_client_id(client, symbol, client_order_id)
+                if recovered is None:
+                    if ORDER_RESULT_HOOK:
+                        ORDER_RESULT_HOOK(client_order_id, "ambiguous", {"error": str(exc)})
+                    raise orders.OrderReconciliationError(
+                        f"Submitting protected {side} {symbol} on {exchange_name} "
+                        f"failed ({exc}) and order {client_order_id} could not be "
+                        "found. Verify the venue before resuming.",
+                        symbol=symbol, client_order_id=client_order_id,
+                        exchange=exchange_name) from exc
+                created = recovered
+            created = dict(created or {})
+            created.setdefault("clientOrderId", client_order_id)
+            if ORDER_RESULT_HOOK:
+                ORDER_RESULT_HOOK(client_order_id, created.get("status") or "submitted", created)
+            return created
+
+        method = (client.create_market_buy_order if side == "buy"
+                  else client.create_market_sell_order)
+        # Tiny test doubles and a few old CCXT-compatible adapters expose only
+        # (symbol, amount). Official CCXT clients accept the params argument.
+        try:
+            accepts_params = len(inspect.signature(method).parameters) >= 3
+        except (TypeError, ValueError):
+            accepts_params = True
+        try:
+            created = (method(symbol, quantity, params) if accepts_params
+                       else method(symbol, quantity))
+        except Exception as exc:
+            recovered = orders.find_by_client_id(client, symbol, client_order_id)
+            if recovered is None:
+                if ORDER_RESULT_HOOK:
+                    ORDER_RESULT_HOOK(client_order_id, "ambiguous", {"error": str(exc)})
+                raise orders.OrderReconciliationError(
+                    f"Submitting {side} {symbol} on {exchange_name} failed ({exc}) "
+                    f"and order {client_order_id} could not be found. Treat the "
+                    "position as open and verify it manually.",
+                    symbol=symbol, client_order_id=client_order_id,
+                    exchange=exchange_name) from exc
+            created = recovered
+        created = dict(created or {})
+        created.setdefault("clientOrderId", client_order_id)
+        if ORDER_RESULT_HOOK:
+            ORDER_RESULT_HOOK(client_order_id, created.get("status") or "submitted", created)
+        return created
 
     def place_market_buy_quantity(self, exchange_name, symbol, quantity):
         if not REAL_TRADING_ENABLED:
             raise RuntimeError("Real trading is disabled.")
         quantity = self.normalize_amount(exchange_name, symbol, quantity)
-        return self.clients[exchange_name].create_market_buy_order(symbol, quantity)
+        return self._place_market_order(exchange_name, symbol, "buy", quantity)
 
     def place_market_sell(self, exchange_name, symbol, quantity):
         if not REAL_TRADING_ENABLED:
             raise RuntimeError("Real trading is disabled.")
         client = self.clients[exchange_name]
         quantity = self.normalize_amount(exchange_name, symbol, quantity)
-        return client.create_market_sell_order(symbol, quantity)
+        return self._place_market_order(exchange_name, symbol, "sell", quantity)
 
     def check_order_book(self, exchange_name, symbol, side, quantity, reference_price):
         """Reject thin books or prices that moved too far since scanning.
@@ -564,6 +715,19 @@ class RealExecutionEngine:
                 f"Insufficient {side} liquidity on {exchange_name}: the visible "
                 f"book covers {float(estimate.quantity):.8f} of "
                 f"{float(quantity):.8f} {symbol}.")
+        # Limit the actual order to the worst book level needed for this exact
+        # quantity. FOK prevents an incomplete leg from resting or partially
+        # committing while the rest of an arbitrage route moves away.
+        consumed = max(1, int(estimate.levels_consumed))
+        try:
+            limit_price = float(levels[consumed - 1][0])
+        except (IndexError, TypeError, ValueError):
+            limit_price = float(average)
+        approved = getattr(self, "_approved_limit_prices", None)
+        if approved is None:
+            approved = {}
+            self._approved_limit_prices = approved
+        approved[(exchange_name, symbol, side)] = limit_price
         return float(average)
 
     def _confirm_fill(self, exchange_name, symbol, side, requested_quantity, order):
@@ -575,11 +739,17 @@ class RealExecutionEngine:
         then sold coin it had never bought. `orders.reconcile_order` polls until
         the exchange states a size, or raises; it never guesses one.
         """
-        return orders.reconcile_order(
+        client_order_id = str(order.get("clientOrderId") or order.get("client_order_id") or "")
+        if ORDER_RESULT_HOOK and client_order_id:
+            ORDER_RESULT_HOOK(client_order_id, "reconciling", order)
+        fill = orders.reconcile_order(
             self.clients[exchange_name], exchange_name, symbol, side,
             requested_quantity, order,
             poll_timeout=getattr(self, "poll_timeout", orders.DEFAULT_POLL_TIMEOUT),
             poll_interval=getattr(self, "poll_interval", orders.DEFAULT_POLL_INTERVAL))
+        if ORDER_RESULT_HOOK and fill.client_order_id:
+            ORDER_RESULT_HOOK(fill.client_order_id, fill.status, fill.as_dict())
+        return fill
 
     def _net_received(self, fill, currency, gross):
         """Gross fill minus a fee that was charged in the coin we received.
@@ -652,6 +822,8 @@ class RealExecutionEngine:
             raise RuntimeError("Buy order returned no filled quantity.")
 
         try:
+            self.check_order_book(
+                sell_exchange, symbol, "sell", filled_quantity, sell_price)
             sell_order = self.place_market_sell(sell_exchange, symbol, filled_quantity)
         except Exception as exc:
             raise UnhedgedPositionError(
@@ -753,6 +925,9 @@ class RealExecutionEngine:
         try:
             requested_eth = self.plan_buy_quantity(
                 exchange_name, middle_symbol, held_btc, live_eth_btc_price, fee)
+            self.check_order_book(
+                exchange_name, middle_symbol, "buy", requested_eth,
+                live_eth_btc_price)
             eth_order = self.place_market_buy_quantity(
                 exchange_name, middle_symbol, requested_eth)
         except Exception as exc:
@@ -779,6 +954,9 @@ class RealExecutionEngine:
         held_eth = self._net_received(eth_fill, base_coin(middle_symbol), filled_eth)
 
         try:
+            self.check_order_book(
+                exchange_name, final_symbol, "sell", held_eth,
+                live_eth_usdt_price)
             eth_sell_order = self.place_market_sell(
                 exchange_name, final_symbol, held_eth)
         except Exception as exc:
@@ -977,6 +1155,14 @@ class LiveFeed:
         if TRADING_STRATEGY == "triangular":
             first_client = next(iter(self.clients))
             discovered = discover_triangular_routes(self.markets[first_client])
+            # When an operator supplied a symbol whitelist, never discover a
+            # route outside it. This is essential for exchange-side symbol
+            # whitelists: finding a profitable fourth pair that the API key is
+            # forbidden to trade would strand the preceding leg.
+            allowed_symbols = set(symbols or [])
+            if allowed_symbols:
+                discovered = [route for route in discovered
+                              if set(route.get("symbols") or []).issubset(allowed_symbols)]
             # Every discovered route is arithmetically valid; almost none are
             # tradeable. Ranking by the thinnest leg's volume and keeping the
             # top slice is what turns a multi-minute scan into a fast one, and
@@ -989,6 +1175,19 @@ class LiveFeed:
         self.symbols = list(dict.fromkeys(route_symbols or (symbols or SYMBOLS)))
         self.rejected_quotes = {}
         self.last_fetch_seconds = 0.0
+        self.last_source = "rest"
+        self.stream = None
+        self.stream_error = ""
+        if os.environ.get("ARBICORE_STREAMING", "0") == "1":
+            try:
+                self.stream = streaming.CcxtProStream(
+                    list(self.clients), self.symbols, sandbox=SANDBOX_MODE)
+                self.stream.start()
+            except Exception as exc:
+                # Streaming is an optimization, never a reason to lose the
+                # well-tested REST path. Health exposes this degradation.
+                self.stream = None
+                self.stream_error = f"{type(exc).__name__}: {exc}"
 
     def _volume_snapshot(self, exchange_name):
         """24h volumes for route ranking, empty if the venue will not say.
@@ -1012,6 +1211,13 @@ class LiveFeed:
         pure network wait, and ccxt clients are not shared across them.
         """
         started = time.perf_counter()
+        active_stream = getattr(self, "stream", None)
+        if active_stream and active_stream.cache.complete(list(self.clients), self.symbols):
+            collected = active_stream.cache.snapshot(list(self.clients), self.symbols)
+            self.rejected_quotes = {}
+            self.last_fetch_seconds = time.perf_counter() - started
+            self.last_source = "websocket"
+            return collected
         now_ms = time.time() * 1000.0
         collected = {}
         rejected = {}
@@ -1035,13 +1241,16 @@ class LiveFeed:
 
         for name, (venue_quotes, venue_rejected) in results:
             for symbol, quote in venue_quotes.items():
-                collected.setdefault(symbol, {})[name] = {
-                    "bid": quote["bid"], "ask": quote["ask"]}
+                normalized = {"bid": quote["bid"], "ask": quote["ask"]}
+                if quote.get("age_ms"):
+                    normalized["age_ms"] = quote["age_ms"]
+                collected.setdefault(symbol, {})[name] = normalized
             if venue_rejected:
                 rejected[name] = venue_rejected
 
         self.rejected_quotes = rejected
         self.last_fetch_seconds = time.perf_counter() - started
+        self.last_source = "rest_fallback" if active_stream else "rest"
         return collected
 
 

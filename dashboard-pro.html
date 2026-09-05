@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ArbiCore Pro — Advanced Trading Platform</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><text y=%2252%22 font-size=%2252%22>⚡</text></svg>" />
+    <link
+      rel="stylesheet"
+      href="/node_modules/@fortawesome/fontawesome-free/css/all.min.css"
+    />
+    <script src="/node_modules/chart.js/dist/chart.min.js"></script>
+    <link rel="stylesheet" href="/dashboard-pro.css" />
+  </head>
+  <body>
+    <!-- SPACE BACKGROUND -->
+    <div class="space-bg"></div>
+    <div class="glass-orbs" aria-hidden="true">
+      <span class="glass-orb"></span><span class="glass-orb"></span>
+      <span class="glass-orb"></span><span class="glass-orb"></span>
+    </div>
+
+    <!-- LOGIN SCREEN -->
+    <div class="login-screen hidden" id="loginScreen">
+      <div class="login-card">
+        <div class="login-header">
+          <div class="login-logo">⚡</div>
+          <div class="login-title">ArbiCore Pro</div>
+          <div style="color: var(--text-muted); font-size: 0.875rem">
+            Advanced Trading Platform
+          </div>
+        </div>
+
+        <form id="loginForm">
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input
+              type="text"
+              class="form-input"
+              id="loginUsername"
+              placeholder="Enter username"
+              required
+            />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input
+              type="password"
+              class="form-input"
+              id="loginPassword"
+              placeholder="Enter password"
+              required
+            />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Authenticator code <span class="text-muted">(if enabled)</span></label>
+            <input type="text" class="form-input" id="loginTotp" inputmode="text"
+              autocomplete="one-time-code" maxlength="8" placeholder="6-digit code or recovery code" />
+          </div>
+
+          <button type="submit" class="btn-login">
+            <i class="fas fa-sign-in-alt"></i> Sign In
+          </button>
+          <div class="auth-switch">New trader? <button type="button" id="showRegisterButton">Create an account</button></div>
+          <div class="auth-switch"><button type="button" id="forgotPasswordButton">Forgot password?</button></div>
+        </form>
+      </div>
+    </div>
+
+    <div class="login-screen hidden" id="registerScreen">
+      <div class="login-card">
+        <div class="login-header">
+          <div class="login-logo"><i class="fas fa-user-plus"></i></div>
+          <div class="login-title">Create trader account</div>
+          <div class="text-muted" style="font-size: .875rem">Stored securely in the local ArbiCore database</div>
+        </div>
+        <form id="registerForm">
+          <div class="form-group">
+            <label class="form-label" for="registerUsername">Username</label>
+            <input class="form-input" id="registerUsername" autocomplete="username" minlength="3" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="registerEmail">Email</label>
+            <input class="form-input" id="registerEmail" type="email" autocomplete="email" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="registerPassword">Password</label>
+            <input class="form-input" id="registerPassword" type="password" autocomplete="new-password" minlength="12" required />
+          </div>
+          <button type="submit" class="btn-login"><i class="fas fa-user-check"></i> Register as Trader</button>
+          <div class="auth-switch">Already registered? <button type="button" id="showLoginButton">Sign in</button></div>
+        </form>
+      </div>
+    </div>
+
+    <!-- MAIN APP -->
+    <div class="app-shell" id="appContainer" style="display: none">
+      <!-- HEADER -->
+      <header>
+        <div class="header-left">
+          <div class="logo"><i class="fas fa-bolt"></i> ArbiCore</div>
+        </div>
+        <div class="header-right">
+          <button class="mobile-menu" id="mobileMenu" type="button" aria-label="Open navigation" aria-expanded="false">
+            <i class="fas fa-bars"></i>
+          </button>
+          <div
+            class="theme-toggle"
+            id="themeToggle"
+            title="Toggle dark/light mode"
+          >
+            <i class="fas fa-moon"></i>
+          </div>
+          <div class="status-indicator">
+            <div class="status-dot"></div>
+            <span>Active</span>
+          </div>
+          <div class="user-menu">
+            <button class="user-avatar" id="userAvatar" type="button" aria-label="Open user menu" aria-expanded="false">
+              A
+            </button>
+            <div class="dropdown-menu" id="dropdownMenu">
+              <button class="dropdown-item" type="button" data-page="profile">
+                <i class="fas fa-user"></i> Profile
+              </button>
+              <button class="dropdown-item" type="button" data-page="settings">
+                <i class="fas fa-cog"></i> Settings
+              </button>
+              <button class="dropdown-item" id="logoutButton" type="button">
+                <i class="fas fa-sign-out-alt"></i> Logout
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- SIDEBAR -->
+      <aside>
+        <div class="sidebar-section">
+          <div class="sidebar-label">Trading</div>
+          <a class="sidebar-link active" data-page="dashboard" role="button" tabindex="0">
+            <i class="fas fa-chart-line"></i> Dashboard
+          </a>
+          <a class="sidebar-link" data-page="trading" role="button" tabindex="0">
+            <i class="fas fa-sync"></i> Trading Terminal
+          </a>
+          <a class="sidebar-link" data-page="portfolio" role="button" tabindex="0">
+            <i class="fas fa-briefcase"></i> Portfolio
+          </a>
+          <a class="sidebar-link" data-page="history" role="button" tabindex="0">
+            <i class="fas fa-history"></i> Trade History
+          </a>
+        </div>
+
+        <div class="sidebar-section" id="adminSection" style="display: none">
+          <div class="sidebar-label">Administration</div>
+          <a class="sidebar-link" data-page="admin-dashboard" role="button" tabindex="0">
+            <i class="fas fa-tachometer-alt"></i> Admin Dashboard
+          </a>
+          <a class="sidebar-link" data-page="users" role="button" tabindex="0">
+            <i class="fas fa-users"></i> Users
+          </a>
+          <a class="sidebar-link" data-page="trades" role="button" tabindex="0">
+            <i class="fas fa-exchange-alt"></i> All Trades
+          </a>
+          <a class="sidebar-link" data-page="analytics" role="button" tabindex="0">
+            <i class="fas fa-chart-bar"></i> Analytics
+          </a>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-label">Settings</div>
+          <a class="sidebar-link" data-page="settings" role="button" tabindex="0">
+            <i class="fas fa-sliders-h"></i> Settings
+          </a>
+        </div>
+      </aside>
+
+      <!-- MAIN CONTENT -->
+      <main>
+        <!-- TRADER DASHBOARD -->
+        <div class="page active" id="dashboard">
+          <h1 class="mb-4">
+            <i class="fas fa-dashboard"></i> Welcome,
+            <span id="userName">Trader</span>! 👋
+          </h1>
+
+          <div class="dashboard-grid">
+            <div class="metric-card">
+              <div class="metric-label">💰 Total Balance</div>
+              <div class="metric-value">
+                $<span id="totalBalance">0.00</span>
+              </div>
+              <div class="metric-change balance-source" id="totalBalanceSource"><i class="fas fa-wallet"></i> Waiting for account data</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">📈 Total Profit</div>
+              <div class="metric-value text-success">
+                $<span id="totalProfit">0.00</span>
+              </div>
+              <div class="metric-change">Realized across your recorded trades</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">🎯 Win Rate</div>
+              <div class="metric-value"><span id="winRate">0</span>%</div>
+              <div class="metric-change">Calculated from recorded trades</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">🔄 Active Trades</div>
+              <div class="metric-value"><span id="activeTrades">0</span></div>
+              <div class="metric-change">Current scan-loop activity</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <i class="fas fa-receipt"></i> Recent Trades
+              </div>
+              <button class="btn btn-primary btn-sm" id="viewAllTradesButton" type="button">
+                <i class="fas fa-eye"></i> View All
+              </button>
+            </div>
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Exchange Pair</th>
+                    <th>Type</th>
+                    <th>Profit</th>
+                    <th>Status</th>
+                    <th>Time</th>
+                  </tr>
+                </thead>
+                <tbody id="recentTradesTable">
+                  <tr><td colspan="5" class="text-center text-muted">Loading trade history…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-chart-line"></i> Profit Trend
+                </div>
+              </div>
+              <div class="card-body chart-shell">
+                <canvas id="profitChart" style="height: 300px"></canvas>
+                <div class="chart-empty" id="profitChartEmpty"><div><i class="fas fa-chart-line"></i>No completed trades yet.<br />Start the paper engine to build a profit trend.</div></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-pie-chart"></i> Trade Distribution
+                </div>
+              </div>
+              <div class="card-body chart-shell">
+                <canvas id="distributionChart" style="height: 300px"></canvas>
+                <div class="chart-empty" id="distributionChartEmpty"><div><i class="fas fa-chart-pie"></i>No completed trades to distribute yet.</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ADMIN DASHBOARD -->
+        <div class="page" id="admin-dashboard">
+          <h1 class="mb-4"><i class="fas fa-crown"></i> Admin Dashboard</h1>
+
+          <div class="dashboard-grid">
+            <div class="metric-card">
+              <div class="metric-label">👥 Total Users</div>
+              <div class="metric-value"><span id="totalUsers">--</span></div>
+              <div class="metric-change">Local operator sessions</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">💰 Total Profit (All)</div>
+              <div class="metric-value text-success">
+                $<span id="adminTotalProfit">0.00</span>
+              </div>
+              <div class="metric-change">Recorded engine profit</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">📊 Platform Volume</div>
+              <div class="metric-value">
+                $<span id="platformVolume">0.00</span>M
+              </div>
+              <div class="metric-change">Recorded trade notional</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">🎯 Avg Win Rate</div>
+              <div class="metric-value"><span id="avgWinRate">0</span>%</div>
+              <div class="metric-change">Calculated from history</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <i class="fas fa-star"></i> Top Performers
+              </div>
+              <button
+                class="btn btn-primary btn-sm"
+                data-page="users"
+              >
+                <i class="fas fa-list"></i> View All Users
+              </button>
+            </div>
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Username</th>
+                    <th>Profit</th>
+                    <th>Trades</th>
+                    <th>Win Rate</th>
+                  </tr>
+                </thead>
+                <tbody id="topPerformersTable">
+                  <tr><td colspan="5" class="text-center text-muted">Loading session data…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-heartbeat"></i> Platform Health
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="flex flex-col gap-2">
+                  <div class="flex justify-between">
+                    <span class="text-muted">API Uptime:</span>
+                    <span class="text-success" id="apiHealth"
+                      ><i class="fas fa-check-circle"></i> Local</span
+                    >
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Avg Response:</span>
+                    <span id="feedLatency">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Active Sessions:</span>
+                    <span id="activeSessions">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Errors (24h):</span>
+                    <span class="text-danger" id="errorCount">0</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-info-circle"></i> Quick Stats
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="flex flex-col gap-2">
+                  <div class="flex justify-between">
+                    <span class="text-muted">Active Traders:</span>
+                    <strong id="activeTraders">--</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Total Trades Today:</span>
+                    <strong id="adminTradeCount">0</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Avg Trade Size:</span>
+                    <strong id="averageTradeSize">$0.00</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Network Status:</span>
+                    <span class="badge badge-success" id="networkStatus">Healthy</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ADMIN ALL TRADES PAGE -->
+        <div class="page" id="trades">
+          <div class="flex justify-between items-center mb-4">
+            <h1><i class="fas fa-exchange-alt"></i> All Platform Trades</h1>
+            <div style="display: flex; gap: 1rem">
+              <input
+                type="text"
+                id="tradeFilter"
+                class="form-input"
+                placeholder="Search trades..."
+                style="width: 300px"
+              />
+              <button class="btn btn-primary" id="exportTradesButton" type="button">
+                <i class="fas fa-download"></i> Export CSV
+              </button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>User</th>
+                    <th>Exchange Pair</th>
+                    <th>Type</th>
+                    <th>Profit</th>
+                    <th>Status</th>
+                    <th>Time</th>
+                  </tr>
+                </thead>
+                <tbody id="allTradesTable">
+                  <!-- Populated by JS -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- USERS PAGE -->
+        <div class="page" id="users">
+          <h1 class="mb-4"><i class="fas fa-users"></i> User Management</h1>
+
+          <div class="card">
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Username</th>
+                    <th>Status</th>
+                    <th>Trades</th>
+                    <th>Total Profit</th>
+                    <th>Win Rate</th>
+                    <th>Join Date</th>
+                  </tr>
+                </thead>
+                <tbody id="usersTable">
+                  <tr><td colspan="6" class="text-center text-muted">Loading operators…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- TRADING TERMINAL -->
+        <div class="page" id="trading">
+          <h1 class="mb-4"><i class="fas fa-sync"></i> Trading Terminal</h1>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-sliders-h"></i> Configuration
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label class="form-label">Trading Mode</label>
+                  <select class="form-select" id="tradingMode">
+                    <option value="demo">Demo data / Paper execution</option>
+                    <option value="live">Live data / Paper execution</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Order Execution</label>
+                  <select class="form-select" id="executionTarget">
+                    <option value="paper">Paper orders (safe)</option>
+                    <option value="testnet">Binance Spot Testnet</option>
+                    <option value="production">Real funds (production)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Strategy</label>
+                  <select class="form-select" id="tradingStrategy">
+                    <option value="cross_exchange">Cross-exchange (2+ funded venues)</option>
+                    <option value="triangular">Triangular (one venue)</option>
+                  </select>
+                </div>
+                <div class="form-group" id="realAcknowledgementGroup" style="display:none">
+                  <label class="form-label">Real-order confirmation</label>
+                  <input class="form-input" id="realAcknowledgement" autocomplete="off"
+                    placeholder="Type: I ACCEPT REAL LOSSES" />
+                  <small class="text-muted">Never enter API keys here. The confirmation is kept only until the server restarts.</small>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Trade Size (USDT)</label>
+                  <input
+                    type="number"
+                    class="form-input"
+                    id="tradeSize"
+                    min="10"
+                    step="1"
+                    value="200"
+                    placeholder="Enter trade size"
+                  />
+                </div>
+                <div class="grid-2" style="gap:.75rem">
+                  <div class="form-group">
+                    <label class="form-label">Maximum Position (USDT)</label>
+                    <input type="number" class="form-input" id="maxPosition" min="10" step="1" value="10" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Maximum Daily Loss (USDT)</label>
+                    <input type="number" class="form-input" id="maxDailyLoss" min="0.01" step="0.25" value="1" />
+                  </div>
+                </div>
+                <button
+                  class="btn btn-primary"
+                  id="startEngineButton"
+                  style="width: 100%; margin-top: 1rem"
+                >
+                  <i class="fas fa-rocket"></i> Start Bot
+                </button>
+                <button class="btn" id="testConnectionButton" type="button"
+                  style="width:100%;margin-top:.75rem">
+                  <i class="fas fa-plug-circle-check"></i> Test Exchange Access
+                </button>
+                <div id="realReadiness" class="text-muted" style="margin-top:.75rem;font-size:.84rem;line-height:1.5">
+                  Paper execution selected.
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-heartbeat"></i> System Status
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="flex flex-col gap-2">
+                  <div class="flex justify-between">
+                    <span class="text-muted">Bot:</span>
+                    <span class="badge badge-warning" id="engineStatus">Paused</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Scan Rate:</span>
+                    <span id="scanRate">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Opportunities:</span>
+                    <span id="opportunityCount">0 detected</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Data source:</span>
+                    <span id="statusDataSource">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Execution:</span>
+                    <span id="statusExecution">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Free Spot USDT:</span>
+                    <span id="statusFreeUsdt">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Connection stage:</span>
+                    <span id="statusConnectionStage">Not tested</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Testnet qualification:</span>
+                    <span id="statusSoak">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Market feed:</span>
+                    <span id="statusFeedHealth">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Inventory:</span>
+                    <span id="statusInventory">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Execution slippage:</span>
+                    <span id="statusSlippage">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Rejected orders:</span>
+                    <span id="statusRejectedOrders">0</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PORTFOLIO -->
+        <div class="page" id="portfolio">
+          <h1 class="mb-4"><i class="fas fa-briefcase"></i> Portfolio</h1>
+
+          <div class="card">
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Exchange</th>
+                    <th>Market</th>
+                    <th>Cash (USDT)</th>
+                    <th>Coin balance</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody id="portfolioTable">
+                  <tr><td colspan="5" class="text-center text-muted">Loading portfolio…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- PROFILE -->
+        <div class="page" id="profile">
+          <h1 class="mb-4"><i class="fas fa-user"></i> Profile</h1>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-info-circle"></i> Personal Info
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label class="form-label">Username</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    id="profileUsername"
+                    readonly
+                  />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Email</label>
+                  <input type="email" class="form-input" id="profileEmail" />
+                </div>
+                <button class="btn btn-primary" id="saveProfileButton" type="button" style="width: 100%">
+                  <i class="fas fa-save"></i> Save Changes
+                </button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-bar-chart"></i> Statistics
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="flex flex-col gap-2">
+                  <div class="flex justify-between">
+                    <span class="text-muted">Member Since:</span>
+                    <strong id="profileMemberSince">--</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Total Trades:</span>
+                    <strong id="profileTradeCount">0</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Win Rate:</span>
+                    <strong class="text-success" id="profileWinRate">0%</strong>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Total Profit:</span>
+                    <strong class="text-success" id="profileTotalProfit">$0.00</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SETTINGS -->
+        <div class="page" id="settings">
+          <h1 class="mb-4"><i class="fas fa-cog"></i> Settings</h1>
+
+          <div class="card mb-4">
+            <div class="card-header"><div class="card-title"><i class="fas fa-gauge-high"></i> Trading Controls</div></div>
+            <div class="card-body">
+              <form id="runtimeSettingsForm">
+                <div class="form-group">
+                  <label class="form-label" for="settingsScanInterval">Scan interval (seconds)</label>
+                  <input class="form-input" id="settingsScanInterval" type="number" min="0.5" max="60" step="0.5" required />
+                  <div class="text-muted" id="scanIntervalGuidance" style="font-size:.8rem;margin-top:.35rem">How often the engine requests a new market snapshot. Faster scanning increases API usage.</div>
+                </div>
+                <div class="grid-2" style="gap:.75rem">
+                  <div class="form-group"><label class="form-label" for="settingsMinProfit">Minimum net profit (%)</label><input class="form-input" id="settingsMinProfit" type="number" min="0.01" max="20" step="0.01" required /></div>
+                  <div class="form-group"><label class="form-label" for="settingsMaxSlippage">Maximum slippage (%)</label><input class="form-input" id="settingsMaxSlippage" type="number" min="0" max="5" step="0.01" required /></div>
+                  <div class="form-group"><label class="form-label" for="settingsOrdersMinute">Maximum orders / minute</label><input class="form-input" id="settingsOrdersMinute" type="number" min="1" max="120" step="1" required /></div>
+                  <div class="form-group"><label class="form-label" for="settingsTradesHour">Maximum trades / hour</label><input class="form-input" id="settingsTradesHour" type="number" min="1" max="500" step="1" required /></div>
+                </div>
+                <button class="btn btn-primary" type="submit" style="width:100%"><i class="fas fa-floppy-disk"></i> Save Trading Controls</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-palette"></i> Preferences
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label class="form-label">Theme</label>
+                  <select class="form-select" id="themePreference">
+                    <option value="dark">🌙 Dark</option>
+                    <option value="light">☀️ Light</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Notifications</label>
+                  <select class="form-select" id="notificationPreference">
+                    <option value="all">All</option>
+                    <option value="important">Important only</option>
+                    <option value="none">None</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-key"></i> API Keys
+                </div>
+              </div>
+              <div class="card-body">
+                <form id="binanceCredentialForm" autocomplete="off">
+                  <div class="form-group">
+                    <label class="form-label" for="binanceApiKey">Binance API key</label>
+                    <input class="form-input" id="binanceApiKey" type="password"
+                      autocomplete="new-password" spellcheck="false" required />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="binanceApiSecret">Binance secret key</label>
+                    <input class="form-input" id="binanceApiSecret" type="password"
+                      autocomplete="new-password" spellcheck="false" required />
+                  </div>
+                  <div class="text-muted" style="font-size:.82rem;line-height:1.5;margin-bottom:.75rem">
+                    Keys stay in server memory and are erased when the server stops.
+                    Use a trade-only key with withdrawals disabled and an IP allowlist.
+                  </div>
+                  <div id="binanceCredentialStatus" class="text-muted" style="font-size:.84rem;margin-bottom:.75rem">
+                    Binance is not connected.
+                  </div>
+                  <div class="flex gap-2">
+                    <button class="btn btn-primary" id="saveBinanceCredentials" type="submit" style="flex:1">
+                      <i class="fas fa-link"></i> Connect Binance
+                    </button>
+                    <button class="btn btn-danger" id="disconnectBinance" type="button">
+                      <i class="fas fa-link-slash"></i> Disconnect
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header"><div class="card-title"><i class="fas fa-user-shield"></i> Account Security</div></div>
+              <div class="card-body">
+                <form id="passwordChangeForm" autocomplete="off">
+                  <div class="form-group"><label class="form-label">Current password</label><input class="form-input" id="currentPassword" type="password" autocomplete="current-password" required /></div>
+                  <div class="form-group"><label class="form-label">New password</label><input class="form-input" id="newPassword" type="password" minlength="12" autocomplete="new-password" required /></div>
+                  <button class="btn btn-primary" type="submit" style="width:100%"><i class="fas fa-lock"></i> Change Password</button>
+                </form>
+                <button class="btn btn-secondary" id="reviewSafetySetup" type="button" style="width:100%;margin-top:.75rem"><i class="fas fa-route"></i> Review Safety Setup</button>
+                <button class="btn btn-secondary" id="enableMfa" type="button" style="width:100%;margin-top:.75rem"><i class="fas fa-shield-halved"></i> Enable Authenticator MFA</button>
+                <button class="btn btn-danger" id="disableMfa" type="button" style="width:100%;margin-top:.75rem;display:none"><i class="fas fa-shield"></i> Disable Authenticator MFA</button>
+                <button class="btn btn-secondary" id="revokeOtherSessions" type="button" style="width:100%;margin-top:.75rem"><i class="fas fa-user-lock"></i> Sign Out Other Devices</button>
+                <div id="accountSecurityStatus" class="text-muted" style="font-size:.82rem;line-height:1.5;margin-top:.75rem">Loading account security…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- HISTORY -->
+        <div class="page" id="history">
+          <h1 class="mb-4"><i class="fas fa-history"></i> Trade History</h1>
+
+          <div class="card">
+            <div class="card-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Route</th>
+                    <th>Type</th>
+                    <th>Profit</th>
+                    <th>Status</th>
+                    <th>Time</th>
+                  </tr>
+                </thead>
+                <tbody id="historyTable">
+                  <tr><td colspan="5" class="text-center text-muted">Loading trade history…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ANALYTICS -->
+        <div class="page" id="analytics">
+          <h1 class="mb-4"><i class="fas fa-chart-bar"></i> Analytics</h1>
+
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-chart-line"></i> Daily Profit
+                </div>
+              </div>
+              <div class="card-body">
+                <canvas id="dailyProfitChart" style="height: 300px"></canvas>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">
+                  <i class="fas fa-users"></i> User Growth
+                </div>
+              </div>
+              <div class="card-body">
+                <canvas id="userGrowthChart" style="height: 300px"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- ALL TRADES MODAL -->
+    <div class="modal-backdrop" id="allTradesModal">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">
+            <i class="fas fa-exchange-alt"></i> All Trades
+          </div>
+          <button class="modal-close" id="closeAllTradesButton" type="button" aria-label="Close all trades">×</button>
+        </div>
+        <div class="modal-body scroll-hidden">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>User</th>
+                <th>Pair</th>
+                <th>Type</th>
+                <th>Profit</th>
+                <th>Status</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="modalTradesTable">
+              <!-- Populated by JS -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="onboardingModal" role="dialog" aria-modal="true" aria-labelledby="onboardingTitle">
+      <div class="modal" style="max-width:720px">
+        <div class="modal-header">
+          <div class="modal-title" id="onboardingTitle"><i class="fas fa-route"></i> Start safely with ArbiCore</div>
+        </div>
+        <div class="modal-body scroll-hidden">
+          <div class="grid-3" style="margin-bottom:1.25rem">
+            <div class="metric-card"><div class="metric-label">1. Learn</div><strong>Use Paper mode first</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Practice with simulated funds and inspect every result.</p></div>
+            <div class="metric-card"><div class="metric-label">2. Verify</div><strong>Qualify on Testnet</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Complete the required safe cycles before production unlocks.</p></div>
+            <div class="metric-card"><div class="metric-label">3. Protect</div><strong>Use restricted keys</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Trading only, withdrawals disabled, trusted IPs enabled.</p></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="experienceMode">Interface mode</label>
+            <select class="form-select" id="experienceMode">
+              <option value="beginner">Beginner — automatic conservative limits</option>
+              <option value="expert">Expert — advanced settings with hard safety gates</option>
+            </select>
+          </div>
+          <label class="flex gap-2" style="align-items:flex-start;margin:.8rem 0">
+            <input type="checkbox" id="riskConsent" style="width:auto;margin-top:.2rem" />
+            <span>I understand that automation cannot guarantee profit and I may lose some or all trading funds.</span>
+          </label>
+          <label class="flex gap-2" style="align-items:flex-start;margin:.8rem 0 1.2rem">
+            <input type="checkbox" id="termsConsent" style="width:auto;margin-top:.2rem" />
+            <span>I accept the <a href="/legal" target="_blank" rel="noopener" style="color:var(--primary-light)">Terms, Risk Disclosure, and Privacy Notice</a>, including exchange-data processing and audit logging.</span>
+          </label>
+          <button class="btn btn-primary" id="completeOnboarding" type="button" style="width:100%"><i class="fas fa-shield-halved"></i> Continue to Paper Trading</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/dashboard-pro.js" defer></script>
+  </body>
+</html>

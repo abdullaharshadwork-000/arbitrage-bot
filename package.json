@@ -1,0 +1,15 @@
+{
+  "name": "arbicore-browser-tests",
+  "private": true,
+  "scripts": {
+    "test": "npm run test:browser",
+    "test:browser": "node tests/browser_smoke.js"
+  },
+  "devDependencies": {
+    "playwright-core": "1.55.0"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^6.4.0",
+    "chart.js": "^3.9.1"
+  }
+}
