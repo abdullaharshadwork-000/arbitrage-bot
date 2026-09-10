@@ -15,17 +15,50 @@ check, the alert log and the recovery actions.
 
 ## Run
 
-```bash
-pip install -r requirements.txt
+From the `arbitrage-bot` directory, install Python and browser dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+npm.cmd ci --ignore-scripts
 ```
 
 ```bash
 python server.py
 ```
 
+On this Windows workstation, the `python` app-execution alias is inaccessible.
+The verified interpreter can be invoked directly from PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\Python\pythoncore-3.14-64\python.exe" server.py
+```
+
+Use the same interpreter path with `-m pip` or `-m pytest` if needed. Other
+machines should use their own installed Python or virtual environment path.
+
 Open the URL the banner prints. It tries 5000 first and falls back to 5050,
 5055, 8000, 8080 — on Windows, port 5000 is often reserved by Hyper-V/WSL2, so
 do not assume 5000.
+
+Opening the website does not start the engine. Keep **Paper** selected for
+evaluation; selecting real funds is not evidence that a strategy is qualified.
+The new trend strategy remains blocked for real-money execution.
+
+The Trading Terminal includes **Live Market & Decision**: public exchange
+candlesticks, EMA overlays, volume, closed-candle suggestions, and the signed-in
+account's saved risk status. Changing this chart's exchange/pair does not change
+the engine configuration or submit an order. See [the architecture and release
+gates](LIVE_SYSTEM_ARCHITECTURE.md).
+
+Run the browser suite safely against a fresh temporary database, with exchange
+network access disabled:
+
+```powershell
+python tests/run_browser_smoke.py
+```
+
+This test does not load `live_config.py` or use your database/API keys. It tests
+the market UI using deterministic fixtures, not authenticated live execution.
 
 ## Access control
 
@@ -80,6 +113,7 @@ a maintained HTTPS reverse proxy.
 | GET | `/api/readiness` | Whether the current config could legally run, and why not |
 | GET | `/api/balances` | Per-exchange balances and their valuation |
 | GET | `/api/history` | Trades from `arbicore.db` |
+| GET | `/api/intelligence` | Market regime, next-scan forecasts, confidence decisions, and live-data strategy evidence |
 | GET | `/api/risk` | Risk-manager snapshot (counters, halt state, stranded inventory) |
 | GET | `/api/recovery` | Open manual-recovery records |
 | GET | `/api/trades.csv` | The real `trades.csv` this run is appending to |

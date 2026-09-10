@@ -5,6 +5,5 @@ Flask==3.1.3
 cryptography==46.0.6
 waitress==3.0.2
 
-# Optional: websocket market data (Stage 3). Install only if you enable the
-# streaming feed — the REST feed works without it.
-# ccxt[pro]==4.5.47
+# This pinned CCXT build includes ``ccxt.pro``. Public WebSocket books remain
+# optional; its authenticated order stream is a production-readiness gate.

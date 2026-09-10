@@ -118,8 +118,36 @@ class SandboxClientTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["trade_access"])
         args = client.create_order.call_args.args
-        self.assertEqual(args[:3], ("BTC/USDT", "market", "buy"))
-        self.assertEqual(args[-1], {"test": True})
+        self.assertEqual(args[:3], ("BTC/USDT", "limit", "buy"))
+        self.assertEqual(args[-1]["test"], True)
+        self.assertEqual(args[-1]["timeInForce"], "FOK")
+
+    def test_public_feed_does_not_require_or_receive_private_credentials(self):
+        class PublicClient:
+            def load_markets(self):
+                return {"BTC/USDT": {"active": True}}
+
+        saved = (bot.REAL_TRADING_ENABLED, bot.TRADING_STRATEGY)
+        bot.REAL_TRADING_ENABLED = True
+        bot.TRADING_STRATEGY = "cross_exchange"
+        self.addCleanup(setattr, bot, "REAL_TRADING_ENABLED", saved[0])
+        self.addCleanup(setattr, bot, "TRADING_STRATEGY", saved[1])
+        with mock.patch.object(
+                bot, "validate_real_trading_config",
+                side_effect=AssertionError("public feeds must not inspect credentials")), \
+                mock.patch.object(
+                    bot, "create_public_exchange_client",
+                    side_effect=lambda _exchange: PublicClient()) as factory:
+            live_feed = bot.LiveFeed(
+                ["binance", "kucoin"], ["BTC/USDT"])
+        self.assertEqual(set(live_feed.clients), {"binance", "kucoin"})
+        self.assertEqual(factory.call_count, 2)
+
+    def test_triangular_readiness_targets_every_actual_route_leg(self):
+        self.assertEqual(
+            server.execution_symbols(
+                {"strategy": "triangular"}, ["SOL/USDT"]),
+            ["BTC/USDT", "ETH/BTC", "ETH/USDT"])
 
 
 class ServerRealStartTests(unittest.TestCase):
@@ -170,8 +198,13 @@ class ServerRealStartTests(unittest.TestCase):
         payload = response.get_json()
         self.assertNotIn("top-secret-value", str(payload))
         self.assertFalse(payload["persistent"])
-        self.assertEqual(bot.EXCHANGE_CREDENTIALS["binance"]["secret"],
-                         "top-secret-value")
+        stored_secrets = {
+            exchanges.get("binance", {}).get("secret")
+            for exchanges in server.user_credentials.values()
+        }
+        self.assertIn("top-secret-value", stored_secrets)
+        self.assertNotEqual(bot.EXCHANGE_CREDENTIALS["binance"].get("secret"),
+                            "top-secret-value")
 
     def test_testnet_verification_cannot_authorize_production(self):
         verified_at = datetime.now().isoformat()

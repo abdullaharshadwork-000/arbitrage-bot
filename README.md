@@ -66,6 +66,12 @@ Live *data* needs no account and no API keys; price feeds are public. Real
 acknowledgement string `REAL_TRADING_ACK`, and trade-only API keys with
 withdrawals disabled. Read `LIVE_TRADING_GUIDE.md` before touching that column.
 
+New trader accounts start with live market data and a simulated paper wallet.
+The paper wallet starts at a fixed **20,000 USDT total** regardless of how many
+venues or symbols are selected, then changes with simulated fills and live
+valuation. The synthetic feed remains available as an explicitly labelled
+offline tutorial.
+
 ## 5. What each scan does
 
 1. Fetch order books for every configured symbol on every configured exchange.
@@ -73,10 +79,29 @@ withdrawals disabled. Read `LIVE_TRADING_GUIDE.md` before touching that column.
    venue.
 3. Price the trade against **book depth**, not just the top level, and subtract
    both fees plus expected slippage.
-4. Ask the risk manager whether this trade is allowed at all.
-5. Execute it — simulated or real — then reconcile what actually filled against
+4. Estimate whether the edge can survive current volatility and collection
+   latency. Real execution waits for enough observations and rejects stressed
+   or low-confidence opportunities.
+5. Ask the risk manager whether this trade is allowed at all.
+6. Execute it — simulated or real — then reconcile what actually filled against
    what was requested.
-6. Record it in `trades.csv` and `arbicore.db`, and publish it to the dashboard.
+7. Record it in `trades.csv` and `arbicore.db`, and publish it to the dashboard.
+
+### Decision intelligence
+
+`arbicore/intelligence.py` is a transparent short-horizon statistical model,
+not a promise of future prices. It records recent quote changes, classifies the
+market as warming up, stable, volatile, trending, or stressed, and builds an
+adaptive profit floor from measured volatility and feed latency. The dashboard
+shows its observation count, confidence, predicted post-uncertainty edge, and
+the reason for each decision.
+
+The model is advisory in paper execution and mandatory in real execution. A
+restart or structural market change clears its quote window, so real candidates
+are refused until the new configuration warms up again. Historical strategy
+ranking requires a statistically positive lower-bound estimate rather than
+calling a few lucky trades a successful strategy. None of these estimates can
+guarantee profit.
 
 ## 6. Settings
 
@@ -143,7 +168,7 @@ refusal collapse into one counted row.
 | `arbitrage-bot-terminal.html` | Dashboard |
 | `start_live.py` | Launcher that validates the real-trading config first |
 | `live_config.example.py` | Template for `live_config.py` (gitignored) |
-| `tests/` | 291 tests |
+| `tests/` | Automated engine, security, intelligence, persistence and browser tests |
 | `arbicore.db` / `trades.csv` | Trade history (created on first run) |
 | `LIVE_TRADING_GUIDE.md` | Everything required before real orders |
 | `README_WEB.md` | Dashboard, API routes, access control |

@@ -33,7 +33,8 @@ os.environ["ARBICORE_DB"] = str(_TMP / "import.db")
 
 import arbitrage_bot as bot           # noqa: E402
 import server                          # noqa: E402
-from arbicore import alerts, risk      # noqa: E402
+from arbicore import alerts, intelligence, orders, risk      # noqa: E402
+from arbicore.money import D                    # noqa: E402
 
 QUOTES = {
     "BTC/USDT": {
@@ -111,7 +112,25 @@ class FakeEngine:
 
     def place_market_sell(self, exchange, symbol, quantity):
         self.closed.append((exchange, symbol, quantity))
-        return {"id": "close-1"}
+        return {"id": "close-1", "clientOrderId": "close-client-1"}
+
+    def normalize_amount(self, exchange, symbol, quantity):
+        return float(quantity)
+
+    def fetch_ticker(self, exchange, symbol):
+        return {"bid": 100.0, "ask": 101.0}
+
+    def check_order_book(self, *args):
+        return 100.0
+
+    def _confirm_fill(self, exchange, symbol, side, quantity, order):
+        return orders.Fill(
+            exchange, symbol, side, order["id"], order["clientOrderId"],
+            "closed", D(quantity), D(quantity), D("100"), D(quantity) * D("100"),
+            reconciled=True)
+
+    def _dust_tolerance(self, exchange, symbol, quantity):
+        return 0.0
 
 
 class ServerTestCase(unittest.TestCase):
@@ -125,6 +144,7 @@ class ServerTestCase(unittest.TestCase):
             "feed": server.feed, "wallet": server.wallet,
             "engine": server.real_engine, "symbols": server.active_symbols,
             "notifier": server.notifier, "risk": server.risk_manager,
+            "intelligence": server.market_intelligence,
             "thread": server._thread, "real_flag": bot.REAL_TRADING_ENABLED,
         }
         server.DB_FILE = self.db_path
@@ -134,10 +154,14 @@ class ServerTestCase(unittest.TestCase):
 
         server.state.update({
             "running": False, "scan_count": 0, "trades_count": 0,
+            "start_value": 3000.0,
             "attempts_count": 0, "total_profit": 0.0, "recent": [],
             "trades": [], "unhedged_positions": [], "error": None,
             "chart_series": [], "latest_cycle": None, "quotes": {},
             "mid_prices": {}, "risk": {}, "alerts": {}, "startup_check": None,
+            "last_scan_started_at": None, "last_scan_completed_at": None,
+            "last_scan_duration_seconds": None, "last_scan_status": "paused",
+            "last_scan_message": "Engine is paused.",
         })
         server.state["config"].update({
             "mode": "live", "execution_mode": "paper",
@@ -146,12 +170,14 @@ class ServerTestCase(unittest.TestCase):
             "max_slippage": 0.25, "interval": 0.0, "gap_chance": 0.0,
             "max_daily_loss": 50.0, "max_position_notional": 400.0,
             "max_consecutive_failures": 3, "max_orders_per_minute": 20,
+            "intelligence_enabled": True, "min_model_confidence": 0.65,
             "triangular_routes": [],
         })
         server.state["active_exchanges"] = ["binance", "kucoin"]
         server.active_symbols = ["BTC/USDT"]
         server.notifier = alerts.Notifier(webhook_url="", console=None)
         server.risk_manager = risk.RiskManager(server.risk_settings())
+        server.market_intelligence = intelligence.OpportunityIntelligence()
         server._thread = None
         server._stop_flag.clear()
         server._emergency_stop.clear()
@@ -166,6 +192,7 @@ class ServerTestCase(unittest.TestCase):
         server.active_symbols = self._saved["symbols"]
         server.notifier = self._saved["notifier"]
         server.risk_manager = self._saved["risk"]
+        server.market_intelligence = self._saved["intelligence"]
         server._thread = self._saved["thread"]
         bot.REAL_TRADING_ENABLED = self._saved["real_flag"]
 
@@ -186,6 +213,12 @@ class ServerTestCase(unittest.TestCase):
         server.wallet = wallet if wallet is not None else FakeWallet()
         server.real_engine = engine
         server._stop_flag.clear()
+        # Existing loop tests target execution and recovery behavior. Give the
+        # independent confidence gate a stable, fully warmed quote history so
+        # those tests reach the boundary they are intended to exercise.
+        server.market_intelligence = intelligence.OpportunityIntelligence()
+        for _ in range(server.market_intelligence.min_observations + 1):
+            server.market_intelligence.observe(server.feed.quotes, 0.02)
 
         def stop_after(_seconds):
             server._stop_flag.set()
@@ -196,6 +229,45 @@ class ServerTestCase(unittest.TestCase):
 
 class TestScanLoopLocking(ServerTestCase):
     """The regression that matters most: the lock is free during a trade."""
+
+    def test_signal_save_failure_restores_wallet_and_stops(self):
+        from arbicore.paper import PaperAccount
+        paper = PaperAccount(["binance"], ["BTC/USDT"], 20000,
+                             {"BTC/USDT": 100}, "signal_trend")
+        feed = FakeFeed()
+        feed.clients = {"binance": object()}
+        server.state["config"].update(strategy="signal_trend", execution_mode="paper")
+        server.state["active_exchanges"] = ["binance"]
+        def tick(*args, **kwargs):
+            paper.ledger.debit("binance", "USDT", 100)
+            paper.signal_state["position"] = {"symbol": "BTC/USDT"}
+            return {}, {"status": "filled"}
+        with mock.patch.object(server.signals, "paper_tick", side_effect=tick), \
+             mock.patch.object(server, "persist_trade", side_effect=RuntimeError("disk unavailable")):
+            self.run_one_scan(feed=feed, wallet=paper)
+        self.assertEqual(paper.total_value({}), 20000)
+        self.assertNotIn("position", paper.signal_state)
+        self.assertFalse(server.state["running"])
+        self.assertIn("Last committed", server.state["error"])
+
+    def test_three_empty_real_feeds_latch_safety_halt(self):
+        server.state["config"]["execution_mode"] = "real"
+        guard = server.safety.ExecutionSafety()
+        with mock.patch.object(server, "execution_safety", guard):
+            for _ in range(3):
+                self.run_one_scan(feed=FakeFeed(quotes={}))
+            self.assertTrue(guard.halted)
+            self.assertEqual(server.state["last_scan_status"], "safety_halt")
+            self.assertFalse(server.state["running"])
+
+    def test_paper_equity_loss_blocks_new_trades(self):
+        server.state["start_value"] = 3100.0
+        paper = FakeWallet()
+        self.run_one_scan(wallet=paper)
+        self.assertEqual(paper.calls, [])
+        self.assertEqual(server.state["last_scan_status"], "safety_halt")
+        self.assertIn("equity loss", server.state["error"])
+        self.assertEqual(server.state["paper_portfolio_value"], 3000.0)
 
     def test_state_lock_is_available_while_an_order_is_in_flight(self):
         seen = []
@@ -230,6 +302,20 @@ class TestScanLoopLocking(ServerTestCase):
         self.assertEqual(server.state["feed_health"]["fetch_seconds"], 0.02)
         self.assertEqual(server.state["scan_count"], 1)
         self.assertEqual(server.state["attempts_count"], 1)
+        self.assertEqual(server.state["last_scan_status"], "trade_executed")
+        self.assertIsNotNone(server.state["last_scan_completed_at"])
+
+    def test_missing_live_quotes_are_reported_not_logged_as_no_opportunity(self):
+        empty_feed = FakeFeed(quotes={})
+
+        self.run_one_scan(feed=empty_feed)
+
+        self.assertEqual(server.state["scan_count"], 1)
+        self.assertEqual(server.state["last_scan_status"], "feed_unavailable")
+        self.assertIn("retry automatically", server.state["last_scan_message"])
+        self.assertEqual(server.state["feed_health"]["status"], "warming_up")
+        self.assertFalse(any(item.get("type") == "miss"
+                             for item in server.state["recent"]))
 
 
 class TestTradeRecording(ServerTestCase):
@@ -308,7 +394,10 @@ class TestRiskGate(ServerTestCase):
 
     def test_a_halted_risk_manager_refuses_to_start(self):
         server.risk_manager.halt(risk.HALT_DAILY_LOSS, "down too far today")
-        response = self.client().post("/api/start")
+        # Test the already-owned worker's risk gate, not a context switch that
+        # legitimately loads a different account's persisted risk state.
+        with mock.patch.object(server, "require_engine_owner", return_value=None):
+            response = self.client().post("/api/start")
         self.assertEqual(response.status_code, 409)
         self.assertIn("daily_loss_limit", response.get_json()["error"])
         self.assertFalse(server.state["running"])
@@ -445,6 +534,21 @@ class TestUnhedgedPosition(ServerTestCase):
         self.assertFalse(position["quantity_confirmed"])
         self.assertIn("UNCONFIRMED", server.state["error"])
 
+    def test_a_recovery_without_an_exchange_id_uses_the_client_id(self):
+        server.state["config"]["execution_mode"] = "real"
+        failure = bot.UnhedgedPositionError(
+            "binance", "kucoin", "BTC/USDT", 0.02,
+            {"clientOrderId": "arbi-timeout-1"},
+            RuntimeError("exchange reply was lost"),
+            quantity_confirmed=False)
+        self.run_one_scan(wallet=None, engine=FakeEngine(failure))
+        self.assertEqual(
+            server.state["unhedged_positions"][0]["buy_order_id"],
+            "arbi-timeout-1")
+        self.assertEqual(
+            server.load_persisted_recovery()[0]["buy_order_id"],
+            "arbi-timeout-1")
+
     def test_closing_a_recovery_clears_the_stranded_latch(self):
         server.state["config"]["execution_mode"] = "real"
         bot.REAL_TRADING_ENABLED = True
@@ -477,6 +581,84 @@ class TestUnhedgedPosition(ServerTestCase):
         self.assertIn("upper bound", response.get_json()["error"])
         self.assertEqual(engine.closed, [],
                          "a market sell of an unconfirmed size was sent")
+
+
+class TestDurableSafetyState(ServerTestCase):
+    def test_risk_checkpoint_round_trips_through_the_database(self):
+        previous_owner = server.state.get("owner_user_id")
+        self.addCleanup(server.state.__setitem__, "owner_user_id", previous_owner)
+        server.state["owner_user_id"] = 1
+        server.risk_manager.record_success(D("-1.23456789"))
+        server.risk_manager.record_stranded(
+            "binance", "BTC", D("0.00012"), "second leg failed")
+
+        self.assertTrue(server.persist_risk_state())
+        payload = server.load_risk_state(1)
+        restored = risk.RiskManager(server.risk_settings())
+        self.assertTrue(restored.restore_state(payload))
+        self.assertEqual(restored.realized_today, D("-1.23456789"))
+        self.assertEqual(restored.stranded[0]["quantity"], D("0.00012"))
+        self.assertTrue(restored.halted)
+
+    def test_a_corrupt_risk_checkpoint_fails_closed(self):
+        with server.db() as connection:
+            connection.execute(
+                "INSERT INTO risk_states (user_id, payload, updated_at) "
+                "VALUES (1, 'not-json', 'now')")
+        server.activate_user_context(1)
+        self.assertTrue(server.risk_manager.halted)
+        self.assertEqual(server.risk_manager.halt_limit, risk.HALT_RECONCILE)
+        self.assertIn("could not be restored", server.risk_manager.halt_reason)
+
+    def test_a_corrupt_recovery_record_remains_visible_and_non_closeable(self):
+        with server.db() as connection:
+            connection.execute(
+                "INSERT INTO recovery_positions "
+                "(buy_order_id, created_at, payload, user_id, status, updated_at) "
+                "VALUES ('recovery-corrupt', 'now', 'not-json', 1, 'open', 'now')")
+        positions = server.load_persisted_recovery(1)
+        self.assertEqual(positions[0]["buy_order_id"], "recovery-corrupt")
+        self.assertFalse(positions[0]["quantity_confirmed"])
+        self.assertIn("unreadable", positions[0]["error"])
+
+    def test_worker_lease_cannot_be_stolen_until_it_is_stale(self):
+        previous_lease = server.WORKER_LEASE_ID
+        self.addCleanup(setattr, server, "WORKER_LEASE_ID", previous_lease)
+        server.WORKER_LEASE_ID = "worker-a"
+        self.assertTrue(server.acquire_worker_lease(1))
+
+        server.WORKER_LEASE_ID = "worker-b"
+        self.assertFalse(server.acquire_worker_lease(1))
+        self.assertFalse(server.heartbeat_worker_lease(1))
+
+        with server.db() as connection:
+            connection.execute(
+                "UPDATE worker_leases SET heartbeat_at = ? WHERE user_id = 1",
+                (time.time() - server.WORKER_LEASE_TTL_SECONDS - 1,))
+        self.assertTrue(server.acquire_worker_lease(1))
+        self.assertTrue(server.heartbeat_worker_lease(1))
+
+    def test_a_late_open_event_cannot_regress_a_terminal_order(self):
+        previous_owner = server.state.get("owner_user_id")
+        self.addCleanup(server.state.__setitem__, "owner_user_id", previous_owner)
+        server.state["owner_user_id"] = 1
+        server.persist_order_intent(
+            "arbi-terminal", "binance", "BTC/USDT", "buy", "0.001")
+        server.update_order_intent(
+            "arbi-terminal", "closed",
+            {"id": "exchange-1", "filled": "0.001", "average": "100000"})
+        server.update_order_intent(
+            "arbi-terminal", "reconciling", {"id": "exchange-1"})
+
+        with server.db() as connection:
+            status = connection.execute(
+                "SELECT status FROM order_intents WHERE client_order_id = ?",
+                ("arbi-terminal",)).fetchone()[0]
+            events = connection.execute(
+                "SELECT event_type FROM order_events WHERE client_order_id = ?",
+                ("arbi-terminal",)).fetchall()
+        self.assertEqual(status, "closed")
+        self.assertIn(("reconciling",), events)
 
 
 class TestThreadLifecycle(ServerTestCase):
@@ -608,6 +790,13 @@ class TestConfigValidation(ServerTestCase):
             response = self.post({"execution_mode": "real"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(server.state["config"]["execution_mode"], "real")
+
+    def test_real_execution_cannot_disable_decision_intelligence(self):
+        response = self.post({
+            "execution_mode": "real", "intelligence_enabled": False,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("mandatory", response.get_json()["error"])
 
 
 class TestDatabase(ServerTestCase):

@@ -17,3 +17,4 @@ sim_results/
 .venv/
 venv/
 node_modules/
+test-results/

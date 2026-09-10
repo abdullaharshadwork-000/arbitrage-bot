@@ -60,7 +60,7 @@ class ExecutionSafety:
         self.halted_at = None
         self.feed_failures = 0
 
-    def observe_feed(self, quotes, fetch_seconds):
+    def observe_feed(self, quotes, fetch_seconds, required_routes=None):
         """Reject slow, empty, crossed, or stale quote snapshots."""
         ages = []
         quote_count = 0
@@ -85,12 +85,28 @@ class ExecutionSafety:
             "max_quote_age_ms": maximum_age,
             "fetch_seconds": float(fetch_seconds or 0.0),
         }
+        viable_routes = 0
+        for route in required_routes or []:
+            symbols = route.get("symbols") or []
+            exchange = route.get("exchange")
+            minimum_venues = int(route.get("min_venues") or 1)
+            if exchange:
+                complete = all(exchange in (quotes or {}).get(symbol, {})
+                               for symbol in symbols)
+            else:
+                complete = all(len((quotes or {}).get(symbol, {})) >= minimum_venues
+                               for symbol in symbols)
+            viable_routes += int(complete)
+        self.last_observation["viable_routes"] = viable_routes
         reason = ""
         limit = ""
         if quote_count == 0:
             limit, reason = "empty_feed", "the live feed returned no usable quotes"
         elif invalid:
             limit, reason = "invalid_feed", f"the live feed returned {invalid} invalid quote(s)"
+        elif required_routes and viable_routes == 0:
+            limit, reason = "route_coverage", (
+                "the live feed has no complete executable route")
         elif maximum_age > self.max_quote_age_ms:
             limit, reason = "stale_feed", (
                 f"quote age {maximum_age:.0f}ms exceeds the "
@@ -109,7 +125,8 @@ class ExecutionSafety:
         return SAFE
 
     def dynamic_size(self, configured, free_quote, remaining_loss_budget,
-                     visible_depth=None, volatility_pct=0):
+                     visible_depth=None, volatility_pct=0,
+                     worst_case_loss_pct="1.0"):
         """Return a size capped by cash, depth, loss budget, and volatility.
 
         This only reduces the operator's configured size.  It can never raise
@@ -120,8 +137,9 @@ class ExecutionSafety:
             caps.append(D(visible_depth) * Decimal("0.20"))
         budget = D(remaining_loss_budget)
         if budget > ZERO:
-            # Assume a worst-case 1% route loss when sizing from loss budget.
-            caps.append(budget / Decimal("0.01"))
+            loss_fraction = max(
+                Decimal("0.0001"), D(worst_case_loss_pct) / Decimal("100"))
+            caps.append(budget / loss_fraction)
         volatility = max(ZERO, D(volatility_pct))
         volatility_factor = Decimal("1") / (Decimal("1") + volatility / Decimal("2"))
         return max(ZERO, min(caps) * volatility_factor)

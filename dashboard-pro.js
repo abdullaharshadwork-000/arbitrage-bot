@@ -4,7 +4,10 @@ let currentUser = null;
       let refreshTimer = null;
       let refreshInFlight = false;
       let tradingConfigDirty = false;
+      let runtimeSettingsDirty = false;
       let lastConnectionTestResult = null;
+      let connectionTestInFlight = false;
+      let credentialStatuses = [];
       let chartSignature = "";
       const charts = {};
       const $ = (id) => document.getElementById(id);
@@ -22,6 +25,8 @@ let currentUser = null;
       }
 
       function notify(message, error = false) {
+        // Safety/error notices are never suppressed by cosmetic preferences.
+        if (!error && currentUser && $("notificationPreference").value !== "all") return;
         const toast = $("toast");
         toast.textContent = message;
         toast.className = `toast active${error ? " error" : ""}`;
@@ -37,6 +42,16 @@ let currentUser = null;
 
       function money(value) {
         return Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      }
+
+      function formatDateTime(value) {
+        if (!value) return "--";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString([], {
+          year: "numeric", month: "short", day: "numeric",
+          hour: "2-digit", minute: "2-digit", second: "2-digit",
+        });
       }
 
       function animateMetric(id, nextValue, digits = 2) {
@@ -70,22 +85,25 @@ let currentUser = null;
         element.metricAnimation = requestAnimationFrame(frame);
       }
 
-      function setTheme(theme) {
+      function setTheme(theme, persist = true) {
         const light = theme === "light";
         document.body.classList.toggle("light-mode", light);
         $("themeToggle").innerHTML = `<i class="fas fa-${light ? "sun" : "moon"}"></i>`;
         $("themeToggle").title = `Switch to ${light ? "dark" : "light"} mode`;
         document.querySelectorAll("#themePreference").forEach((select) => select.value = theme);
-        localStorage.setItem("arbicore-theme", theme);
+        if (persist && currentUser) api("/api/account/preferences", {
+          method: "POST", body: JSON.stringify({theme}),
+        }).catch((error) => notify(error.message, true));
         Object.values(charts).forEach((chart) => chart.destroy());
         Object.keys(charts).forEach((key) => delete charts[key]);
         chartSignature = "";
         if (currentUser) renderCharts(allTrades);
+        window.MarketOverviewUI?.themeChanged();
       }
 
       $("themeToggle").addEventListener("click", () =>
         setTheme(document.body.classList.contains("light-mode") ? "dark" : "light"));
-      setTheme(localStorage.getItem("arbicore-theme") || "dark");
+      setTheme("dark", false);
 
       function showRegister() {
         $("loginScreen").classList.add("hidden");
@@ -163,13 +181,24 @@ let currentUser = null;
       });
 
       function showApp() {
+        tradingConfigDirty = false;
+        runtimeSettingsDirty = false;
+        lastConnectionTestResult = null;
+        $("exchangeCredentialForm").reset();
         $("loginScreen").classList.add("hidden");
         $("appContainer").style.display = "grid";
         $("userName").textContent = currentUser.username;
         $("userAvatar").textContent = currentUser.username.slice(0, 1).toUpperCase();
         $("profileUsername").value = currentUser.username;
         $("profileEmail").value = localStorage.getItem(`arbicore-email-${currentUser.username}`) || "";
-        $("notificationPreference").value = localStorage.getItem("arbicore-notifications") || "all";
+        $("notificationPreference").value = "all";
+        setTheme("dark", false);
+        const accountId = currentUser.id;
+        api("/api/account/preferences").then((preferences) => {
+          if (currentUser?.id !== accountId) return;
+          setTheme(preferences.theme, false);
+          $("notificationPreference").value = preferences.notifications;
+        }).catch((error) => notify(error.message, true));
         const admin = currentUser.role === "admin";
         $("adminSection").style.display = admin ? "block" : "none";
         openPage(admin ? "admin-dashboard" : "dashboard");
@@ -200,9 +229,15 @@ let currentUser = null;
               terms_accepted: $("termsConsent").checked,
             }),
           });
+          // A new trader should practise against the market that exists now,
+          // while keeping every fill and balance simulated. The synthetic feed
+          // remains an explicit offline tutorial choice.
+          $("tradingMode").value = "live";
+          $("executionTarget").value = "paper";
+          tradingConfigDirty = true;
           $("onboardingModal").classList.remove("active");
           openPage("trading");
-          notify("Safety setup saved. Begin in Paper mode.");
+          notify("Safety setup saved. Paper trading will use real market data.");
         } catch (error) {
           notify(error.message, true);
         } finally {
@@ -222,6 +257,7 @@ let currentUser = null;
         document.querySelector("aside").classList.remove("mobile-open");
         $("mobileMenu").setAttribute("aria-expanded", "false");
         requestAnimationFrame(() => Object.values(charts).forEach((chart) => chart.resize()));
+        window.MarketOverviewUI?.sync(currentUser, engineState, page === "trading");
       }
 
       function toggleDropdown() {
@@ -269,7 +305,6 @@ let currentUser = null;
           const stats = result.stats || {};
           animateMetric("totalProfit", stats.total_profit, 2);
           animateMetric("winRate", stats.win_rate, 1);
-          animateMetric("activeTrades", stats.active_trades, 0);
           $("profileMemberSince").textContent = stats.member_since || "This session";
           $("profileTradeCount").textContent = Number(stats.total_trades || 0).toLocaleString();
           $("profileWinRate").textContent = `${Number(stats.win_rate || 0).toFixed(1)}%`;
@@ -281,16 +316,36 @@ let currentUser = null;
 
       async function refreshOperationalInsights() {
         try {
-          const [qualityResult, inventoryResult] = await Promise.all([
+          const [qualityResult, inventoryResult, intelligenceResult] = await Promise.all([
             api("/api/execution-quality"), api("/api/inventory-plan"),
+            api("/api/intelligence"),
           ]);
           const quality = qualityResult.quality || {};
           $("statusSlippage").textContent = `${money(quality.realized_slippage_usdt)} USDT`;
           $("statusRejectedOrders").textContent = Number(quality.rejected_orders || 0);
-          $("statusInventory").textContent = inventoryResult.ready ? "Ready for one route" : "Funding incomplete";
-          $("statusInventory").className = inventoryResult.ready ? "text-success" : "text-warning";
+          const paperExecution = engineState?.config?.execution_mode !== "real";
+          $("statusInventory").textContent = paperExecution
+            ? "Simulated wallet"
+            : (inventoryResult.ready ? "Ready for one route" : "Funding incomplete");
+          $("statusInventory").className = paperExecution || inventoryResult.ready ? "text-success" : "text-warning";
+          const model = intelligenceResult.model || {};
+          const latest = (model.latest_decisions || [])[0] || null;
+          $("statusModelRegime").textContent = String(model.regime || "warming_up").replaceAll("_", " ");
+          $("statusModelRegime").className = model.regime === "stressed" ? "text-danger" : (model.ready ? "text-success" : "text-warning");
+          $("statusModelConfidence").textContent = latest
+            ? `${(Number(latest.confidence || 0) * 100).toFixed(1)}% (${Number(latest.observations || 0)} samples)`
+            : `${Number(model.observations || 0)}/${Number(model.minimum_observations || 0)} observations`;
+          $("statusPredictedEdge").textContent = latest
+            ? `${Number(latest.predicted_edge_pct || 0) >= 0 ? "+" : ""}${Number(latest.predicted_edge_pct || 0).toFixed(3)}% / floor ${Number(latest.adaptive_floor_pct || 0).toFixed(3)}%`
+            : "Waiting for an opportunity";
+          const evidence = intelligenceResult.strategy_evidence || {};
+          $("statusStrategyEvidence").textContent = evidence.recommended_strategy
+            ? `${evidence.recommended_strategy} leads live-data history`
+            : "No live-data strategy qualified yet";
+          $("intelligenceExplanation").textContent = latest?.reason || evidence.message || model.warning || "Probabilistic estimate only.";
         } catch (_) {
           $("statusInventory").textContent = "Unavailable";
+          $("statusModelRegime").textContent = "Unavailable";
         }
       }
 
@@ -298,23 +353,60 @@ let currentUser = null;
         try {
           engineState = await api("/api/state");
           const running = Boolean(engineState.running);
-          $("engineStatus").textContent = running ? "Running" : "Paused";
-          $("engineStatus").className = `badge badge-${running ? "success" : "warning"}`;
+          const signalMode = engineState.config?.strategy === "signal_trend";
+          $("signalPanel").classList.toggle("hidden", !signalMode);
+          if (signalMode) {
+            $("signalCapabilities").innerHTML = (engineState.signal_capabilities || []).map((item) =>
+              `<p><strong>${escapeHtml(item.label)}</strong> · Live-data paper supported · ${escapeHtml(item.environment)}<br><span class="text-muted">${escapeHtml(item.blocker)}</span></p>`).join("");
+            const position = engineState.signal_position;
+            $("signalPosition").textContent = position
+              ? `${position.symbol}: ${Number(position.quantity).toPrecision(6)} units · Entry $${money(position.entry)} · Stop $${money(position.stop)} · Target $${money(position.target)}`
+              : "No open signal position.";
+            $("signalReports").innerHTML = Object.entries(engineState.signal_reports || {}).map(([symbol, report]) =>
+              `<p><strong>${escapeHtml(symbol)} — ${escapeHtml(report.action)}</strong><br>${escapeHtml(report.reason)}${report.rsi14 != null ? `<br>RSI ${Number(report.rsi14).toFixed(1)} · 5m ${Number(report.momentum5_pct).toFixed(2)}% · 10m ${Number(report.momentum10_pct).toFixed(2)}%` : ""}</p>`).join("") || "Waiting for the first candle scan.";
+          }
+          const workerFailed = engineState.last_scan_status === "crashed";
+          $("engineStatus").textContent = workerFailed ? "Crashed" : (running ? "Running" : "Paused");
+          $("engineStatus").className = `badge badge-${workerFailed ? "danger" : (running ? "success" : "warning")}`;
           $("startEngineButton").innerHTML = `<i class="fas fa-${running ? "pause" : "rocket"}"></i> ${running ? "Pause Engine" : "Start Engine"}`;
-          $("scanRate").textContent = `${Number(engineState.config?.interval || 0).toFixed(1)}s / cycle`;
+          $("scanRate").textContent = signalMode ? "Automatic · 5s checks / closed 1m signals" : `${Number(engineState.config?.interval || 0).toFixed(1)}s / cycle`;
           $("opportunityCount").textContent = `${Number(engineState.attempts_count || 0)} detected`;
+          animateMetric("activeTrades", engineState.scan_count, 0);
+          const scanStatus = String(engineState.last_scan_status || (running ? "starting" : "paused"));
+          const scanLabel = scanStatus.replaceAll("_", " ");
+          const scanTime = engineState.last_scan_completed_at
+            ? formatDateTime(engineState.last_scan_completed_at)
+            : "waiting for first scan";
+          $("scanProgressText").textContent = running
+            ? `${scanLabel} · ${scanTime}`
+            : (workerFailed
+                ? `Crashed · ${scanTime}`
+                : `Paused · ${Number(engineState.scan_count || 0)} completed`);
+          $("scanProgressText").title = engineState.last_scan_message || "";
+          $("scanProgressText").className = `metric-change ${scanStatus === "feed_unavailable" || scanStatus === "crashed" ? "text-danger" : ""}`;
           const target = engineState.config?.execution_mode === "real"
             ? (engineState.config?.sandbox_mode ? "testnet" : "production") : "paper";
-          $("statusDataSource").textContent = engineState.config?.mode === "live" ? "Binance live" : "Synthetic demo";
+          $("statusDataSource").textContent = engineState.config?.mode === "live" ? "Live exchange order books" : "Synthetic tutorial";
           $("statusExecution").textContent = target === "production" ? "REAL FUNDS" : (target === "testnet" ? "Testnet" : "Paper");
           $("statusExecution").className = target === "production" ? "text-danger" : "text-success";
-          $("statusFreeUsdt").textContent = `${money(engineState.balance_valuation?.free_usdt)} USDT`;
+          const paperCash = Object.values(engineState.balances || {}).reduce((venueTotal, venue) =>
+            venueTotal + Object.values(venue || {}).reduce((total, balance) =>
+              total + (balance?.source === "paper" ? Number(balance.cash_usdt || 0) : 0), 0), 0);
+          $("statusFreeUsdt").textContent = target === "paper"
+            ? `${money(paperCash)} virtual USDT`
+            : `${money(engineState.balance_valuation?.free_usdt)} USDT`;
           const latestExchange = (engineState.exchange_status || [])[0];
-          $("statusConnectionStage").textContent = latestExchange?.stage || (engineState.readiness?.ready ? "complete" : "Not tested");
+          $("statusConnectionStage").textContent = target === "paper"
+            ? "Not required (paper)"
+            : (latestExchange?.stage || (engineState.readiness?.ready ? "complete" : "Not tested"));
           const soak = engineState.readiness?.testnet_soak;
           $("statusSoak").textContent = soak ? `${Number(soak.completed || 0)}/${Number(soak.required || 0)} cycles` : "--";
           const feedHealth = engineState.feed_health || {};
-          $("statusFeedHealth").textContent = feedHealth.source || (engineState.config?.mode === "demo" ? "demo" : "REST");
+          const feedSource = feedHealth.source || (engineState.config?.mode === "demo" ? "demo" : "REST");
+          $("statusFeedHealth").textContent = `${feedSource} · ${feedHealth.status || "warming up"} · ${Number(feedHealth.usable_symbols || 0)}/${Number(feedHealth.symbols || 0)} markets`;
+          $("statusFeedHealth").className = feedHealth.status === "online"
+            ? "text-success"
+            : (feedHealth.status === "degraded" ? "text-warning" : "text-danger");
           $("scanIntervalGuidance").textContent = `Recommended minimum for this setup: ${Number(engineState.recommended_scan_interval || 1).toFixed(1)} seconds. Faster values are adjusted automatically.`;
           updateDisplayedBalance(target);
           if (!tradingConfigDirty) {
@@ -326,18 +418,27 @@ let currentUser = null;
             $("maxDailyLoss").value = engineState.config?.max_daily_loss || 1;
             $("realAcknowledgementGroup").style.display = target === "production" ? "block" : "none";
           }
-          if (!document.activeElement?.closest("#runtimeSettingsForm")) {
+          if (!runtimeSettingsDirty && !document.activeElement?.closest("#runtimeSettingsForm")) {
             $("settingsScanInterval").value = engineState.config?.interval ?? 5;
             $("settingsMinProfit").value = engineState.config?.min_profit ?? 0.15;
             $("settingsMaxSlippage").value = engineState.config?.max_slippage ?? 0.25;
             $("settingsOrdersMinute").value = engineState.config?.max_orders_per_minute ?? 20;
             $("settingsTradesHour").value = engineState.config?.max_trades_per_hour ?? 12;
+            $("settingsIntelligence").value = engineState.config?.intelligence_enabled === false ? "disabled" : "enabled";
+            $("settingsModelConfidence").value = Math.round(Number(engineState.config?.min_model_confidence ?? 0.65) * 100);
+            renderExchangeChoices(engineState.available_exchanges || [], engineState.active_exchanges || []);
           }
           const readiness = engineState.readiness || {};
-          const credentialText = (readiness.credentials || []).map((item) =>
+          const paperExecution = engineState.config?.execution_mode !== "real";
+          const credentialText = paperExecution ? "" : (readiness.credentials || []).map((item) =>
             `${item.exchange}: ${item.configured ? "configured" : "missing"}`).join(" · ");
-          $("realReadiness").innerHTML = `<strong>${readiness.ready ? "Ready" : "Not ready"}</strong> — ${escapeHtml(readiness.message || "")}${credentialText ? `<br>${escapeHtml(credentialText)}` : ""}`;
-          if (lastConnectionTestResult) {
+          $("realReadiness").innerHTML = paperExecution
+            ? '<strong>Paper ready</strong> — Simulated execution uses no API key or real funds.'
+            : `<strong>${readiness.ready ? "Ready" : "Not ready"}</strong> — ${escapeHtml(readiness.message || "")}${credentialText ? `<br>${escapeHtml(credentialText)}` : ""}`;
+          if (connectionTestInFlight) {
+            $("realReadiness").textContent = "Testing exchange access… Please wait.";
+            $("realReadiness").classList.remove("text-danger", "text-success");
+          } else if (lastConnectionTestResult) {
             $("realReadiness").textContent = lastConnectionTestResult.message;
             $("realReadiness").classList.toggle("text-danger", lastConnectionTestResult.failed);
             $("realReadiness").classList.toggle("text-success", !lastConnectionTestResult.failed);
@@ -345,6 +446,7 @@ let currentUser = null;
           document.querySelector(".status-indicator span").textContent = running ? "Engine running" : "Engine paused";
           document.querySelector(".status-dot").style.background = running ? "var(--success)" : "var(--warning)";
           renderPortfolio(engineState);
+          window.MarketOverviewUI?.sync(currentUser, engineState, $("trading").classList.contains("active"));
           if (engineState.error) notify(engineState.error, true);
         } catch (error) {
           notify(`State refresh failed: ${error.message}`, true);
@@ -368,8 +470,32 @@ let currentUser = null;
           ? (available
               ? '<i class="fas fa-building-columns"></i> Connected exchange valuation'
               : '<i class="fas fa-plug-circle-xmark"></i> Test exchange access to load balance')
-          : '<i class="fas fa-flask"></i> Demo / paper wallet';
+          : (engineState.config?.mode === "live"
+              ? '<i class="fas fa-satellite-dish"></i> Demo wallet valued from live markets'
+              : '<i class="fas fa-flask"></i> Synthetic tutorial wallet');
         $("totalBalanceSource").className = `metric-change balance-source ${realTarget && available ? "text-success" : ""}`;
+        const performance = engineState.paper_performance;
+        $("paperPerformance").hidden = realTarget || !performance;
+        if (!realTarget && performance) {
+          $("paperPerformance").textContent = `This wallet: trades $${money(performance.trade_profit)} · market movement $${money(performance.inventory_change)} · net $${money(performance.net_change)}`;
+          $("paperPerformance").className = `metric-change ${performance.net_change < 0 ? "text-danger" : "text-success"}`;
+        }
+      }
+
+      function exchangeLabel(exchange) {
+        return exchange === "okx"
+          ? "OKX"
+          : String(exchange || "").replace(/^./, (letter) => letter.toUpperCase());
+      }
+
+      function renderExchangeChoices(available, selected) {
+        const selectedSet = new Set(selected || []);
+        $("tradingExchanges").innerHTML = (available || []).map((exchange) => `
+          <label class="badge badge-info" style="display:inline-flex;align-items:center;gap:.45rem;cursor:pointer;padding:.55rem .7rem">
+            <input type="checkbox" name="tradingExchange" value="${escapeHtml(exchange)}"
+              ${selectedSet.has(exchange) ? "checked" : ""} style="width:auto" />
+            ${escapeHtml(exchangeLabel(exchange))}
+          </label>`).join("");
       }
 
       async function toggleEngine() {
@@ -406,12 +532,21 @@ let currentUser = null;
         const target = $("executionTarget").value;
         const executionMode = target === "paper" ? "paper" : "real";
         const strategy = $("tradingStrategy").value;
+        if (strategy === "signal_trend" && (target !== "paper" || mode !== "live")) {
+          throw new Error("Automatic trend signals require Live data and Paper execution.");
+        }
         const tradeSize = Number($("tradeSize").value);
         const maxPosition = Number($("maxPosition").value);
         const maxDailyLoss = Number($("maxDailyLoss").value);
+        const exchanges = [...document.querySelectorAll('input[name="tradingExchange"]:checked')]
+          .map((input) => input.value);
         if (!Number.isFinite(tradeSize) || tradeSize < 10) throw new Error("Trade size must be at least 10 USDT.");
         if (!Number.isFinite(maxPosition) || maxPosition < tradeSize) throw new Error("Maximum position must be at least the trade size.");
         if (!Number.isFinite(maxDailyLoss) || maxDailyLoss <= 0) throw new Error("Maximum daily loss must be greater than zero.");
+        if (!exchanges.length) throw new Error("Select at least one trading venue.");
+        if (strategy === "cross_exchange" && exchanges.length < 2) throw new Error("Cross-exchange trading needs at least two venues.");
+        if (strategy === "triangular" && exchanges.length !== 1) throw new Error("Triangular trading needs exactly one venue.");
+        if (strategy === "signal_trend" && exchanges.length !== 1) throw new Error("Automatic trend signals need exactly one venue.");
         const config = {
           mode: executionMode === "real" ? "live" : mode,
           execution_mode: executionMode,
@@ -419,11 +554,11 @@ let currentUser = null;
           trade_size: tradeSize,
           max_position_notional: maxPosition,
           max_daily_loss: maxDailyLoss,
+          exchanges,
         };
         if (executionMode === "real") {
           config.sandbox_mode = target === "testnet";
           config.real_trading_enabled = true;
-          if (strategy === "triangular") config.exchanges = ["binance"];
         }
         if (target === "production") {
           config.real_trading_ack = $("realAcknowledgement").value.trim();
@@ -435,6 +570,11 @@ let currentUser = null;
       }
 
       async function testExchangeConnection({ throwOnError = false } = {}) {
+        if (connectionTestInFlight) {
+          if (throwOnError) throw new Error("An exchange access test is already in progress.");
+          return null;
+        }
+        connectionTestInFlight = true;
         const button = $("testConnectionButton");
         button.disabled = true;
         const readiness = $("realReadiness");
@@ -454,7 +594,7 @@ let currentUser = null;
           const summary = (result.exchanges || []).map((item) =>
             `${item.exchange}: ${item.ok ? "connected" : item.error || "failed"}`).join(" · ");
           const message = summary || "Authenticated exchange access verified.";
-          finalMessage = `Ready — ${message}`;
+          finalMessage = `Access test completed — ${message}. Trading readiness is checked separately before starting.`;
           lastConnectionTestResult = { message: finalMessage, failed: false };
           readiness.textContent = finalMessage;
           notify(message);
@@ -468,6 +608,7 @@ let currentUser = null;
           if (throwOnError) throw error;
           return null;
         } finally {
+          connectionTestInFlight = false;
           button.disabled = false;
           button.innerHTML = originalLabel;
           await refreshState();
@@ -487,7 +628,19 @@ let currentUser = null;
         updateDisplayedBalance(event.target.value);
       });
       $("tradingMode").addEventListener("change", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
-      $("tradingStrategy").addEventListener("change", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
+      $("tradingStrategy").addEventListener("change", () => {
+        tradingConfigDirty = true;
+        lastConnectionTestResult = null;
+        if ($("tradingStrategy").value === "signal_trend") {
+          $("tradingMode").value = "live";
+          $("executionTarget").value = "paper";
+          $("realAcknowledgementGroup").style.display = "none";
+          const venues = [...document.querySelectorAll('input[name="tradingExchange"]')];
+          const selected = venues.find((input) => input.checked) || venues[0];
+          venues.forEach((input) => { input.checked = input === selected; });
+        }
+      });
+      $("tradingExchanges").addEventListener("change", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
       $("tradeSize").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
       $("maxPosition").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
       $("maxDailyLoss").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
@@ -505,16 +658,21 @@ let currentUser = null;
 
       function tradeRow(trade, includeUser = false) {
         const profit = Number(trade.profit_usdt || 0);
-        const strategy = trade.strategy === "triangular" ? "Triangle" : "Cross";
+        const strategy = trade.strategy === "signal_trend" ? "Trend" : trade.strategy === "triangular" ? "Triangle" : "Cross";
         const pair = trade.sell_exchange ? `${trade.buy_exchange || "--"} → ${trade.sell_exchange}` : trade.symbol;
-        return `<tr>${includeUser ? `<td>${escapeHtml(currentUser?.username || "operator")}</td>` : ""}<td>${escapeHtml(pair || trade.symbol || "--")}</td><td><span class="badge badge-info">${strategy}</span></td><td class="${profit >= 0 ? "text-success" : "text-danger"}">${profit >= 0 ? "+" : ""}$${money(profit)}</td><td><span class="badge badge-${trade.status === "completed" ? "success" : "warning"}">${escapeHtml(trade.status || "completed")}</span></td><td>${escapeHtml(trade.time || "--")}</td></tr>`;
+        const successful = ["completed", "filled", "closed"].includes(
+          String(trade.status || "").toLowerCase());
+        return `<tr>${includeUser ? `<td>${escapeHtml(currentUser?.username || "operator")}</td>` : ""}<td>${escapeHtml(pair || trade.symbol || "--")}</td><td><span class="badge badge-info">${strategy}</span></td><td class="${profit >= 0 ? "text-success" : "text-danger"}">${profit >= 0 ? "+" : ""}$${money(profit)}</td><td><span class="badge badge-${successful ? "success" : "warning"}">${escapeHtml(trade.status || "completed")}</span></td><td>${escapeHtml(formatDateTime(trade.time))}</td></tr>`;
       }
 
       function renderTradeTables(trades) {
         const empty = '<tr><td colspan="6" class="text-center text-muted">No trades recorded yet. Start the paper engine to collect data.</td></tr>';
+        const query = $("tradeFilter")?.value.trim().toLowerCase() || "";
+        const filtered = trades.filter((trade) => JSON.stringify(trade).toLowerCase().includes(query));
         $("recentTradesTable").innerHTML = trades.length ? trades.slice(0, 5).map((t) => tradeRow(t)).join("") : empty;
         $("modalTradesTable").innerHTML = trades.length ? trades.map((t) => tradeRow(t, true)).join("") : empty;
-        $("allTradesTable").innerHTML = trades.length ? trades.map((t) => tradeRow(t, true)).join("") : empty;
+        $("allTradesTable").innerHTML = filtered.length ? filtered.map((t) => tradeRow(t, true)).join("")
+          : '<tr><td colspan="7" class="text-center text-muted">No matching trades.</td></tr>';
         $("historyTable").innerHTML = trades.length ? trades.map((t) => tradeRow(t)).join("") : empty;
       }
 
@@ -731,6 +889,7 @@ let currentUser = null;
 
       async function logout() {
         clearInterval(refreshTimer);
+        window.MarketOverviewUI?.stop();
         // Let an already-started dashboard poll finish while the session is
         // still valid. Otherwise logout revokes its cookie halfway through and
         // the remaining requests flash avoidable 401/403 errors in the UI.
@@ -754,14 +913,14 @@ let currentUser = null;
         } catch (_) {}
         currentUser = null;
         $("loginForm").reset();
+        window.MarketOverviewUI?.stop();
         showLogin();
         $("appContainer").style.display = "none";
         $("adminSection").style.display = "none";
       }
 
       $("tradeFilter")?.addEventListener("input", (event) => {
-        const query = event.target.value.toLowerCase();
-        $("allTradesTable").innerHTML = allTrades.filter((trade) => JSON.stringify(trade).toLowerCase().includes(query)).map((trade) => tradeRow(trade, true)).join("");
+        renderTradeTables(allTrades);
       });
 
       $("mobileMenu").addEventListener("click", () => {
@@ -781,11 +940,16 @@ let currentUser = null;
         notify("Profile preferences saved on this device.");
       });
 
-      $("notificationPreference").addEventListener("change", (event) => {
-        localStorage.setItem("arbicore-notifications", event.target.value);
-        notify("Notification preference saved.");
+      $("notificationPreference").addEventListener("change", async (event) => {
+        try {
+          await api("/api/account/preferences", {method: "POST",
+            body: JSON.stringify({notifications: event.target.value})});
+          notify("Notification preference saved.");
+        } catch (error) { notify(error.message, true); }
       });
 
+      $("runtimeSettingsForm").addEventListener("input", () => { runtimeSettingsDirty = true; });
+      $("runtimeSettingsForm").addEventListener("change", () => { runtimeSettingsDirty = true; });
       $("runtimeSettingsForm").addEventListener("submit", async (event) => {
         event.preventDefault();
         const button = event.submitter;
@@ -795,14 +959,19 @@ let currentUser = null;
           max_slippage: Number($("settingsMaxSlippage").value),
           max_orders_per_minute: Number($("settingsOrdersMinute").value),
           max_trades_per_hour: Number($("settingsTradesHour").value),
+          intelligence_enabled: $("settingsIntelligence").value === "enabled",
+          min_model_confidence: Number($("settingsModelConfidence").value) / 100,
         };
-        if (!Object.values(config).every(Number.isFinite)) {
+        if (![config.interval, config.min_profit, config.max_slippage,
+              config.max_orders_per_minute, config.max_trades_per_hour,
+              config.min_model_confidence].every(Number.isFinite)) {
           notify("Every trading control must be a valid number.", true);
           return;
         }
         button.disabled = true;
         try {
           await api("/api/config", { method: "POST", body: JSON.stringify(config) });
+          runtimeSettingsDirty = false;
           notify("Trading controls saved. They apply from the next scan.");
           await refreshState();
         } catch (error) {
@@ -896,45 +1065,86 @@ let currentUser = null;
       async function refreshCredentialStatus() {
         try {
           const result = await api("/api/user/api-keys");
-          const binance = (result.exchanges || []).find((item) => item.exchange === "binance");
-          const configured = Boolean(binance?.configured);
-          $("binanceCredentialStatus").innerHTML = configured
-            ? `<span class="text-success"><i class="fas fa-circle-check"></i> Connected ${escapeHtml(binance.api_key || "")}</span> · ${escapeHtml(binance.source || "server")}`
-            : '<span class="text-muted"><i class="fas fa-circle-xmark"></i> Binance is not connected.</span>';
-          $("saveBinanceCredentials").disabled = false;
-          $("disconnectBinance").disabled = !configured;
+          credentialStatuses = result.exchanges || [];
+          const select = $("credentialExchange");
+          const selected = select.value;
+          select.innerHTML = credentialStatuses.map((item) =>
+            `<option value="${escapeHtml(item.exchange)}">${escapeHtml(item.label || exchangeLabel(item.exchange))}</option>`).join("");
+          if (credentialStatuses.some((item) => item.exchange === selected)) select.value = selected;
+          $("exchangeCredentialList").innerHTML = credentialStatuses.map((item) =>
+            `<div><i class="fas fa-${item.configured ? "circle-check" : "circle-xmark"}"></i> `
+            + `${escapeHtml(item.label || exchangeLabel(item.exchange))}: `
+            + `<span class="${item.configured ? "text-success" : "text-muted"}">${item.configured ? `connected ${escapeHtml(item.api_key || "")}` : "not connected"}</span>`
+            + `${item.active ? " · selected for trading" : ""}</div>`).join("");
+          syncCredentialForm();
         } catch (error) {
-          $("binanceCredentialStatus").textContent = error.message;
+          $("exchangeCredentialStatus").textContent = error.message;
         }
       }
 
-      $("binanceCredentialForm").addEventListener("submit", async (event) => {
+      function syncCredentialForm() {
+        const exchange = $("credentialExchange").value;
+        const status = credentialStatuses.find((item) => item.exchange === exchange) || {
+          exchange,
+          label: exchangeLabel(exchange),
+          configured: false,
+          requires_password: ["kucoin", "okx"].includes(exchange),
+          available: true,
+        };
+        const label = status.label || exchangeLabel(exchange);
+        $("credentialApiKeyLabel").textContent = `${label} API key`;
+        $("credentialApiSecretLabel").textContent = `${label} secret key`;
+        $("credentialPassphraseGroup").style.display = status.requires_password ? "block" : "none";
+        $("credentialPassphrase").required = Boolean(status.requires_password);
+        if (!status.requires_password) $("credentialPassphrase").value = "";
+        $("exchangeCredentialStatus").innerHTML = status.configured
+          ? `<span class="text-success"><i class="fas fa-circle-check"></i> Connected ${escapeHtml(status.api_key || "")}</span> · ${escapeHtml(status.source || "server")}`
+          : `<span class="text-muted"><i class="fas fa-circle-xmark"></i> ${escapeHtml(label)} is not connected.</span>`;
+        $("saveExchangeCredentials").innerHTML = `<i class="fas fa-link"></i> Connect ${escapeHtml(label)}`;
+        $("saveExchangeCredentials").disabled = status.available === false;
+        $("disconnectExchange").disabled = !status.configured || status.source === "env" || status.available === false;
+      }
+
+      $("credentialExchange").addEventListener("change", () => {
+        $("credentialApiKey").value = "";
+        $("credentialApiSecret").value = "";
+        $("credentialPassphrase").value = "";
+        syncCredentialForm();
+      });
+
+      $("exchangeCredentialForm").addEventListener("submit", async (event) => {
         event.preventDefault();
-        const button = $("saveBinanceCredentials");
+        const button = $("saveExchangeCredentials");
         button.disabled = true;
         try {
+          const exchange = $("credentialExchange").value;
           const result = await api("/api/user/api-keys", {
             method: "POST",
             body: JSON.stringify({
-              exchange: "binance",
-              api_key: $("binanceApiKey").value.trim(),
-              api_secret: $("binanceApiSecret").value.trim(),
+              exchange,
+              api_key: $("credentialApiKey").value.trim(),
+              api_secret: $("credentialApiSecret").value.trim(),
+              password: $("credentialPassphrase").value.trim(),
             }),
           });
-          $("binanceCredentialForm").reset();
+          $("credentialApiKey").value = "";
+          $("credentialApiSecret").value = "";
+          $("credentialPassphrase").value = "";
           notify(result.message);
           await Promise.all([refreshCredentialStatus(), refreshState()]);
         } catch (error) {
           notify(error.message, true);
         } finally {
-          button.disabled = false;
+          syncCredentialForm();
         }
       });
 
-      $("disconnectBinance").addEventListener("click", async () => {
-        if (!window.confirm("Erase the Binance credentials currently held by this server process?")) return;
+      $("disconnectExchange").addEventListener("click", async () => {
+        const exchange = $("credentialExchange").value;
+        const label = exchangeLabel(exchange);
+        if (!window.confirm(`Erase the ${label} credentials currently held by this server?`)) return;
         try {
-          const result = await api("/api/user/api-keys/binance", { method: "DELETE" });
+          const result = await api(`/api/user/api-keys/${encodeURIComponent(exchange)}`, { method: "DELETE" });
           notify(result.message);
           await Promise.all([refreshCredentialStatus(), refreshState()]);
         } catch (error) { notify(error.message, true); }

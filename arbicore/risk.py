@@ -207,6 +207,33 @@ class RiskManager:
         """Call once per order actually sent, for the rate window."""
         self._order_times.append(self._clock())
 
+    def reserve_orders(self, count):
+        """Atomically reserve capacity for every leg in a route.
+
+        The caller must reserve the entire route before its first leg.  Merely
+        checking the current count is unsafe: a three-leg route could pass with
+        one slot remaining and then exceed the exchange/order safety cap.
+        Reservations intentionally remain in the one-minute window even when a
+        later leg is not submitted.  Conservatively throttling after a failed
+        route is safer than immediately retrying around an exchange incident.
+        """
+        self._roll_day()
+        requested = max(0, int(count))
+        placed = self._recent_orders()
+        limit = int(self.settings.max_orders_per_minute)
+        if requested <= 0:
+            return RiskDecision(False, "a route must contain at least one order", "order_rate")
+        if placed + requested > limit:
+            return RiskDecision(
+                False,
+                f"{placed} orders are already reserved in the last minute; "
+                f"this {requested}-leg route would exceed the {limit}/min cap",
+                "order_rate",
+            )
+        now = self._clock()
+        self._order_times.extend([now] * requested)
+        return ALLOWED
+
     def record_success(self, realized_profit):
         """A completed round trip. Profit may still be negative."""
         self._roll_day()
@@ -313,6 +340,86 @@ class RiskManager:
             ],
             "recent_limits": list(self.history)[-10:],
         }
+
+    def export_state(self):
+        """Return the exact, persistence-safe state needed after a restart."""
+        self._roll_day()
+        return {
+            "version": 1,
+            "day": self._day,
+            "realized_today": str(self.realized_today),
+            "trades_today": self.trades_today,
+            "wins_today": self.wins_today,
+            "losses_today": self.losses_today,
+            "consecutive_failures": self.consecutive_failures,
+            "peak_equity": str(self.peak_equity),
+            "equity": str(self.equity),
+            "halted": self.halted,
+            "halt_limit": self.halt_limit,
+            "halt_reason": self.halt_reason,
+            "halted_at": self.halted_at,
+            "killed": self.killed,
+            "stranded": [
+                {**item, "quantity": str(item["quantity"])}
+                for item in self.stranded
+            ],
+            "order_times": list(self._order_times),
+            "history": list(self.history),
+        }
+
+    def restore_state(self, payload):
+        """Restore a state created by :meth:`export_state`.
+
+        Invalid or future-dated timestamps are ignored rather than weakening a
+        limit.  Daily P&L counters reset when the stored UTC day is no longer
+        current, while latches, stranded inventory, failures and equity remain
+        in force until an operator resolves them.
+        """
+        if not isinstance(payload, dict):
+            return False
+        today = _utc_day(self._clock())
+        stored_day = str(payload.get("day") or "")
+        self._day = today
+        if stored_day == today:
+            self.realized_today = D(payload.get("realized_today"))
+            self.trades_today = max(0, int(payload.get("trades_today", 0)))
+            self.wins_today = max(0, int(payload.get("wins_today", 0)))
+            self.losses_today = max(0, int(payload.get("losses_today", 0)))
+        else:
+            self.realized_today = ZERO
+            self.trades_today = self.wins_today = self.losses_today = 0
+        self.consecutive_failures = max(
+            0, int(payload.get("consecutive_failures", 0)))
+        self.peak_equity = max(ZERO, D(payload.get("peak_equity")))
+        self.equity = max(ZERO, D(payload.get("equity")))
+        self.halted = bool(payload.get("halted"))
+        self.halt_limit = str(payload.get("halt_limit") or "")
+        self.halt_reason = str(payload.get("halt_reason") or "")
+        self.halted_at = payload.get("halted_at")
+        self.killed = bool(payload.get("killed"))
+        self.stranded = []
+        for item in payload.get("stranded") or []:
+            if not isinstance(item, dict):
+                continue
+            self.stranded.append({
+                "at": float(item.get("at") or self._clock()),
+                "exchange": str(item.get("exchange") or ""),
+                "currency": str(item.get("currency") or ""),
+                "quantity": max(ZERO, D(item.get("quantity"))),
+                "detail": str(item.get("detail") or ""),
+            })
+        now = self._clock()
+        self._order_times = deque(
+            float(value) for value in (payload.get("order_times") or [])
+            if isinstance(value, (int, float)) and now - 60.0 < float(value) <= now
+        )
+        self.history = deque(
+            [item for item in (payload.get("history") or []) if isinstance(item, dict)][-200:],
+            maxlen=200,
+        )
+        if self.killed and not self.halted:
+            self.halt(HALT_KILL, "kill switch was engaged before restart")
+        return True
 
     def _loss_used_pct(self):
         budget = self.settings.max_daily_loss_usdt

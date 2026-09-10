@@ -65,6 +65,7 @@ class Fill:
     cost: Decimal
     fee_cost: Decimal = ZERO
     fee_currency: str = ""
+    fee_items: tuple = ()
     reconciled: bool = False
     polls: int = 0
     raw: dict = field(default_factory=dict, repr=False)
@@ -92,6 +93,10 @@ class Fill:
             "cost": float(self.cost),
             "fee_cost": float(self.fee_cost),
             "fee_currency": self.fee_currency,
+            "fees": [
+                {"cost": float(item["cost"]), "currency": item["currency"]}
+                for item in self.fee_items
+            ],
             "reconciled": self.reconciled,
             "polls": self.polls,
         }
@@ -106,21 +111,42 @@ def new_client_order_id(prefix="arbi"):
     return f"{prefix}{uuid.uuid4().hex[:20]}"
 
 
+def _extract_fees(payload):
+    """Return fees grouped by currency without adding unlike assets.
+
+    CCXT may return both ``fee`` and ``fees`` and an order can pay commission
+    in more than one currency.  Adding 0.01 BNB to 0.02 USDT is meaningless, so
+    the normalized representation is a tuple of per-currency amounts.
+    """
+    entries = payload.get("fees")
+    if not isinstance(entries, list) or not entries:
+        fee = payload.get("fee")
+        entries = [fee] if isinstance(fee, dict) else []
+    grouped = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("cost") is None:
+            continue
+        currency = str(entry.get("currency") or "").upper()
+        grouped[currency] = grouped.get(currency, ZERO) + D(entry.get("cost"))
+    return tuple(
+        {"cost": cost, "currency": currency}
+        for currency, cost in sorted(grouped.items())
+        if cost != ZERO
+    )
+
+
 def _extract_fee(payload):
-    """Pull (cost, currency) out of either the `fee` dict or the `fees` list."""
-    fee = payload.get("fee")
-    if isinstance(fee, dict) and fee.get("cost") is not None:
-        return D(fee.get("cost")), str(fee.get("currency") or "")
-    fees = payload.get("fees")
-    if isinstance(fees, list) and fees:
-        total = ZERO
-        currency = ""
-        for entry in fees:
-            if not isinstance(entry, dict):
-                continue
-            total += D(entry.get("cost"))
-            currency = str(entry.get("currency") or currency)
-        return total, currency
+    """Backward-compatible single-currency fee projection.
+
+    Multi-currency fees stay in :attr:`Fill.fee_items`; returning ``MULTI`` and
+    zero here prevents legacy callers from silently treating unlike assets as
+    one number.
+    """
+    fees = _extract_fees(payload)
+    if len(fees) == 1:
+        return fees[0]["cost"], fees[0]["currency"]
+    if len(fees) > 1:
+        return ZERO, "MULTI"
     return ZERO, ""
 
 
@@ -230,10 +256,12 @@ def reconcile_order(client, exchange, symbol, side, requested_quantity, created,
 
         if settled and filled is not None and filled <= ZERO:
             # A definite answer: the order closed without filling anything.
+            fee_cost, fee_currency = _extract_fee(payload)
             return Fill(exchange, symbol, side, str(order_id or ""),
                         client_order_id, status or "closed", requested,
-                        ZERO, ZERO, ZERO, *_extract_fee(payload),
-                        reconciled=True, polls=polls, raw=payload)
+                        ZERO, ZERO, ZERO, fee_cost, fee_currency,
+                        _extract_fees(payload), reconciled=True, polls=polls,
+                        raw=payload)
 
         if (settled and filled is not None and filled > ZERO
                 and average is not None and average > ZERO):
@@ -242,8 +270,8 @@ def reconcile_order(client, exchange, symbol, side, requested_quantity, created,
                         client_order_id, status or "closed", requested, filled,
                         average,
                         cost if cost is not None else filled * average,
-                        fee_cost, fee_currency, reconciled=True, polls=polls,
-                        raw=payload)
+                        fee_cost, fee_currency, _extract_fees(payload),
+                        reconciled=True, polls=polls, raw=payload)
 
         if clock() >= deadline or not order_id or not _supports(client, "fetchOrder"):
             break
@@ -265,6 +293,7 @@ def reconcile_order(client, exchange, symbol, side, requested_quantity, created,
             return Fill(exchange, symbol, side, str(order_id), client_order_id,
                         payload.get("status") or "closed", requested, filled,
                         average, cost, fee_cost, fee_currency,
+                        _extract_fees(payload),
                         reconciled=True, polls=polls, raw=payload)
 
     detail = f" Last lookup error: {last_error}." if last_error else ""
@@ -280,6 +309,25 @@ def reconcile_order(client, exchange, symbol, side, requested_quantity, created,
 
 def find_by_client_id(client, symbol, client_order_id):
     """Locate an order by the id we generated, for resolving a timed-out submit."""
+    # Direct lookup is essential for terminal FOK orders: they are absent from
+    # open orders and can fall outside a paginated closed-order response.  CCXT
+    # does not unify this parameter across venues, so try the two common forms
+    # and accept a response only when it echoes our id.
+    if _supports(client, "fetchOrder"):
+        variants = (
+            (None, symbol, {"origClientOrderId": client_order_id}),
+            (client_order_id, symbol, {"clientOrderId": client_order_id}),
+        )
+        for arguments in variants:
+            try:
+                found = client.fetch_order(*arguments)
+            except Exception:
+                continue
+            if isinstance(found, dict) and str(
+                    found.get("clientOrderId")
+                    or (found.get("info") or {}).get("clientOrderId") or ""
+            ) == client_order_id:
+                return dict(found)
     for capability, method in (("fetchOpenOrders", "fetch_open_orders"),
                                ("fetchClosedOrders", "fetch_closed_orders")):
         if not _supports(client, capability):

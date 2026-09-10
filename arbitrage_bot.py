@@ -75,9 +75,11 @@ EXCHANGES_MASTER = list(EXCHANGES)
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 SYMBOLS_MASTER = list(SYMBOLS)
 
-START_CASH_PER_EXCHANGE = 1000.0   # virtual USDT on each exchange,
-                                   # per symbol (half is auto-converted
-                                   # to the coin so we can sell instantly)
+# Paper capital is one account-level total. It must not multiply or shrink when
+# a user changes the number of selected exchanges or symbols.
+PAPER_STARTING_BALANCE_USDT = 20_000.0
+# Retained for old live_config.py files. New wallets use the fixed total above.
+START_CASH_PER_EXCHANGE = 1000.0
 
 TRADE_SIZE_USDT = 200.0   # how much virtual money each trade uses
 
@@ -138,7 +140,14 @@ def resolve_sandbox_mode(environ=None):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def validate_real_trading_config():
+def _credentials_from_map(exchange_name, credential_map):
+    if credential_map is None:
+        return resolve_credentials(exchange_name)
+    return arbiconfig.Credentials.from_mapping(
+        exchange_name, credential_map.get(exchange_name) or {}, source="user_vault")
+
+
+def validate_real_trading_config(credential_map=None):
     """Returns a dict describing whether it is safe to start live trading."""
     if not REAL_TRADING_ENABLED:
         return {
@@ -184,15 +193,13 @@ def validate_real_trading_config():
         return {"ok": False, "message": "TRADING_STRATEGY must be cross_exchange or triangular."}
 
     configured = []
+    incomplete = []
     for exchange in EXCHANGES:
-        creds = resolve_credentials(exchange)
+        creds = _credentials_from_map(exchange, credential_map)
         if creds.complete:
             configured.append(exchange)
-        elif creds.api_key or creds.api_secret:
-            return {
-                "ok": False,
-                "message": f"Exchange '{exchange}' is missing a full API credential pair.",
-            }
+        else:
+            incomplete.append((exchange, creds.missing()))
 
     required_exchanges = 2 if TRADING_STRATEGY == "cross_exchange" else 1
     if len(configured) < required_exchanges:
@@ -203,6 +210,15 @@ def validate_real_trading_config():
                 if required_exchanges == 2
                 else "At least one exchange needs valid API keys for triangular arbitrage."
             ),
+        }
+    if incomplete:
+        exchange, missing = incomplete[0]
+        labels = {"api_key": "API key", "api_secret": "secret key",
+                  "password": "API passphrase"}
+        return {
+            "ok": False,
+            "message": (f"Selected exchange '{exchange}' is missing "
+                        + ", ".join(labels[item] for item in missing) + "."),
         }
 
     return {"ok": True, "message": "Real trading configuration is valid."}
@@ -307,18 +323,22 @@ def resolve_credentials(exchange_name, environ=None):
     }, source="live_config")
 
 
-def create_exchange_client(exchange_name):
+def create_exchange_client(exchange_name, credential_map=None):
     """Build a CCXT client using configured API credentials."""
     import ccxt
 
-    creds = resolve_credentials(exchange_name)
-    config = {"enableRateLimit": True}
+    creds = _credentials_from_map(exchange_name, credential_map)
+    config = {"enableRateLimit": True, "returnResponseHeaders": True}
     if exchange_name == "binance":
         # Binance currency metadata is an authenticated SAPI request in CCXT.
         # Market discovery must remain public so an auth/IP rejection can be
         # reported at the correct diagnostic stage instead of masquerading as
         # "could not load markets".
-        config["options"] = {"fetchCurrencies": False}
+        config["options"] = {
+            "fetchCurrencies": False,
+            "adjustForTimeDifference": True,
+            "recvWindow": 5000,
+        }
     # Blank values are left out rather than passed as empty strings: some venues
     # treat a present-but-empty apiKey as a broken key instead of no key.
     config.update({name: value
@@ -338,6 +358,27 @@ def create_exchange_client(exchange_name):
         except Exception as exc:
             raise RuntimeError(
                 f"Could not enable sandbox mode for {exchange_name}: {exc}") from exc
+    return client
+
+
+def create_public_exchange_client(exchange_name):
+    """Build a credential-free market-data client.
+
+    Public quote collection never needs a user's trading secret. Keeping it on
+    a separate unauthenticated connector prevents accidental private calls and
+    makes the authenticated connector's rate budget auditable.
+    """
+    import ccxt
+
+    exchange_class = getattr(ccxt, exchange_name, None)
+    if exchange_class is None:
+        raise ValueError(f"Unsupported exchange: {exchange_name}")
+    config = {"enableRateLimit": True, "returnResponseHeaders": True}
+    if exchange_name == "binance":
+        config["options"] = {"fetchCurrencies": False}
+    client = exchange_class(config)
+    if resolve_sandbox_mode():
+        client.set_sandbox_mode(True)
     return client
 
 
@@ -374,9 +415,11 @@ class UnhedgedPositionError(RuntimeError):
 class RealExecutionEngine:
     """Thin wrapper around live exchange APIs with strict safety checks."""
 
-    def __init__(self, exchanges):
+    def __init__(self, exchanges, credential_map=None):
         self.exchanges = exchanges
-        self.clients = {name: create_exchange_client(name) for name in exchanges}
+        self.clients = {
+            name: create_exchange_client(name, credential_map) for name in exchanges
+        }
         self.markets = {}
         self.fee_rates = {}
         # Production orders are bounded limit-FOK orders.  A market order can
@@ -393,25 +436,43 @@ class RealExecutionEngine:
         return discover_triangular_routes(self.markets.get(exchange_name, {}))
 
     def taker_fee(self, exchange_name, symbol="BTC/USDT"):
-        """Return the exchange taker fee, falling back to configured safety settings."""
+        """Return a verified account fee; an unavailable fee blocks execution."""
         fee_rates = getattr(self, "fee_rates", {})
-        if exchange_name in fee_rates:
-            return fee_rates[exchange_name]
+        cache_key = (exchange_name, symbol)
+        checked = getattr(self, "fee_checked_at", {})
+        if cache_key in fee_rates and time.monotonic() - checked.get(cache_key, 0) < 300:
+            return fee_rates[cache_key]
         fee = None
         client = self.clients[exchange_name]
         try:
-            if hasattr(client, "fetch_trading_fee"):
+            if (exchange_name == "binance"
+                    and callable(getattr(client, "private_get_account_commission", None))):
+                market = getattr(self, "markets", {}).get(exchange_name, {}).get(symbol, {})
+                payload = client.private_get_account_commission({
+                    "symbol": market.get("id") or symbol.replace("/", "")})
+                if (payload.get("standardCommission") or {}).get("taker") is None:
+                    raise RuntimeError("Account commission response is incomplete.")
+                fee = sum(
+                    float((payload.get(section) or {}).get("taker") or 0.0)
+                    for section in ("standardCommission", "specialCommission",
+                                    "taxCommission")
+                )
+            if fee is None and hasattr(client, "fetch_trading_fee"):
                 payload = client.fetch_trading_fee(symbol)
                 value = payload.get("taker") if isinstance(payload, dict) else None
                 if value is not None:
                     fee = float(value)
         except Exception:
             fee = None
-        fee_rates[exchange_name] = fee if fee is not None else TAKER_FEE
+        if fee is None or not D(fee).is_finite() or not 0 <= fee < 0.05:
+            raise RuntimeError(f"Verified trading fee unavailable for {symbol} on {exchange_name}.")
+        fee_rates[cache_key] = fee
+        checked[cache_key] = time.monotonic()
+        self.fee_checked_at = checked
         self.fee_rates = fee_rates
-        return fee_rates[exchange_name]
+        return fee_rates[cache_key]
 
-    def connection_status(self, exchange_name):
+    def connection_status(self, exchange_name, symbols=None):
         """Check public data, account auth, and trade permission in distinct stages."""
         client = self.clients[exchange_name]
         started = time.perf_counter()
@@ -454,15 +515,38 @@ class RealExecutionEngine:
                 ask = float(ticker.get("ask") or ticker.get("last") or 0.0)
                 if ask <= 0:
                     raise RuntimeError("No usable BTC/USDT ask for the test order.")
-                constraints = self.market_constraints(exchange_name, "BTC/USDT")
-                test_cost = max(float(TRADE_SIZE_USDT), float(constraints["min_cost"] or 0.0))
-                test_amount = max(test_cost / ask,
-                                  float(constraints["min_amount"] or 0.0))
-                test_amount = self.normalize_amount(
-                    exchange_name, "BTC/USDT", test_amount)
-                client.create_order("BTC/USDT", "market", "buy", test_amount,
-                                    None, {"test": True})
+                tested = []
+                for symbol in list(dict.fromkeys(symbols or ["BTC/USDT"])):
+                    if symbol not in self.markets.get(exchange_name, {}):
+                        raise RuntimeError(f"{symbol} is not available on {exchange_name}.")
+                    quote = ticker if symbol == "BTC/USDT" else client.fetch_ticker(symbol)
+                    price = float(quote.get("ask") or quote.get("last") or 0.0)
+                    if price <= 0:
+                        raise RuntimeError(f"No usable {symbol} ask for the test order.")
+                    constraints = self.market_constraints(exchange_name, symbol)
+                    minimum_cost = float(constraints["min_cost"] or 0.0)
+                    test_cost = max(
+                        minimum_cost * 1.02,
+                        float(constraints["min_amount"] or 0.0) * price * 1.02,
+                    )
+                    if quote_coin(symbol).upper() == "USDT":
+                        test_cost = max(test_cost, min(float(TRADE_SIZE_USDT), 25.0))
+                    if test_cost <= 0:
+                        raise RuntimeError(
+                            f"{symbol} does not expose enough filter data for a safe test order.")
+                    test_amount = self.normalize_amount(
+                        exchange_name, symbol,
+                        max(test_cost / price, float(constraints["min_amount"] or 0.0)))
+                    limit_price = self.normalize_price(exchange_name, symbol, price)
+                    self.validate_order_constraints(
+                        exchange_name, symbol, test_amount, limit_price)
+                    client.create_order(
+                        symbol, "limit", "buy", test_amount, limit_price,
+                        {"timeInForce": "FOK", "clientOrderId": orders.new_client_order_id("test"),
+                         "test": True, "newOrderRespType": "FULL"})
+                    tested.append(symbol)
                 result["trade_access"] = True
+                result["tested_symbols"] = tested
         except Exception as exc:
             result["trade_access"] = False
             result["error"] = f"Trade-permission test failed: {exc}"
@@ -489,11 +573,44 @@ class RealExecutionEngine:
         limits = market.get("limits", {})
         amount_limits = limits.get("amount", {})
         cost_limits = limits.get("cost", {})
+        price_limits = limits.get("price", {})
         return {
+            "active": market.get("active") is not False,
             "precision": market.get("precision", {}).get("amount"),
             "min_amount": amount_limits.get("min") or 0.0,
+            "max_amount": amount_limits.get("max"),
             "min_cost": cost_limits.get("min") or 0.0,
+            "max_cost": cost_limits.get("max"),
+            "min_price": price_limits.get("min") or 0.0,
+            "max_price": price_limits.get("max"),
         }
+
+    def normalize_price(self, exchange_name, symbol, price):
+        try:
+            return float(self.clients[exchange_name].price_to_precision(symbol, price))
+        except Exception:
+            return float(price)
+
+    def validate_order_constraints(self, exchange_name, symbol, amount, price):
+        constraints = self.market_constraints(exchange_name, symbol)
+        if not constraints["active"]:
+            raise RuntimeError(f"{symbol} is not active for trading on {exchange_name}.")
+        value = float(amount)
+        limit_price = float(price)
+        cost = value * limit_price
+        if value < float(constraints["min_amount"] or 0.0):
+            raise RuntimeError(f"Order amount is below {symbol} minimum.")
+        if constraints["max_amount"] is not None and value > float(constraints["max_amount"]):
+            raise RuntimeError(f"Order amount is above {symbol} maximum.")
+        if cost < float(constraints["min_cost"] or 0.0):
+            raise RuntimeError(f"Order notional is below {symbol} minimum.")
+        if constraints["max_cost"] is not None and cost > float(constraints["max_cost"]):
+            raise RuntimeError(f"Order notional is above {symbol} maximum.")
+        if limit_price < float(constraints["min_price"] or 0.0):
+            raise RuntimeError(f"Order price is below {symbol} minimum.")
+        if constraints["max_price"] is not None and limit_price > float(constraints["max_price"]):
+            raise RuntimeError(f"Order price is above {symbol} maximum.")
+        return constraints
 
     def normalize_amount(self, exchange_name, symbol, amount):
         client = self.clients[exchange_name]
@@ -504,6 +621,8 @@ class RealExecutionEngine:
         constraints = self.market_constraints(exchange_name, symbol)
         if normalized < constraints["min_amount"]:
             raise RuntimeError(f"Order amount is below {symbol} minimum.")
+        if constraints["max_amount"] is not None and normalized > float(constraints["max_amount"]):
+            raise RuntimeError(f"Order amount is above {symbol} maximum.")
         return normalized
 
     def fetch_ticker(self, exchange_name, symbol):
@@ -598,22 +717,29 @@ class RealExecutionEngine:
         """
         client = self.clients[exchange_name]
         client_order_id = orders.new_client_order_id()
-        params = {"clientOrderId": client_order_id}
-        if ORDER_INTENT_HOOK:
-            ORDER_INTENT_HOOK(client_order_id, exchange_name, symbol, side, quantity)
-        limit_price = (getattr(self, "_approved_limit_prices", {}) or {}).get(
-            (exchange_name, symbol, side))
+        params = {"clientOrderId": client_order_id, "newOrderRespType": "FULL"}
+        approved_prices = getattr(self, "_approved_limit_prices", {}) or {}
+        limit_price = approved_prices.pop((exchange_name, symbol, side), None)
         bounded = bool(getattr(self, "bounded_orders", False) and limit_price
                        and callable(getattr(client, "create_order", None)))
+        if getattr(self, "bounded_orders", False) and not bounded:
+            raise RuntimeError(
+                f"No fresh bounded price was approved for {side} {symbol} on {exchange_name}.")
         if bounded:
             try:
                 precise_price = float(client.price_to_precision(symbol, limit_price))
             except Exception:
                 precise_price = float(limit_price)
+            self.validate_order_constraints(
+                exchange_name, symbol, quantity, precise_price)
+            if ORDER_INTENT_HOOK:
+                ORDER_INTENT_HOOK(
+                    client_order_id, exchange_name, symbol, side, quantity)
             try:
                 created = client.create_order(
                     symbol, "limit", side, float(quantity), precise_price,
-                    {"timeInForce": "FOK", "clientOrderId": client_order_id})
+                    {"timeInForce": "FOK", "clientOrderId": client_order_id,
+                     "newOrderRespType": "FULL"})
             except Exception as exc:
                 recovered = orders.find_by_client_id(client, symbol, client_order_id)
                 if recovered is None:
@@ -641,6 +767,9 @@ class RealExecutionEngine:
         except (TypeError, ValueError):
             accepts_params = True
         try:
+            if ORDER_INTENT_HOOK:
+                ORDER_INTENT_HOOK(
+                    client_order_id, exchange_name, symbol, side, quantity)
             created = (method(symbol, quantity, params) if accepts_params
                        else method(symbol, quantity))
         except Exception as exc:
@@ -742,6 +871,14 @@ class RealExecutionEngine:
         client_order_id = str(order.get("clientOrderId") or order.get("client_order_id") or "")
         if ORDER_RESULT_HOOK and client_order_id:
             ORDER_RESULT_HOOK(client_order_id, "reconciling", order)
+        event_stream = getattr(self, "order_stream", None)
+        initial_status = str(order.get("status") or "").lower()
+        needs_update = (initial_status not in orders.TERMINAL_STATUSES
+                        or order.get("filled") is None)
+        if event_stream is not None and client_order_id and needs_update:
+            streamed = event_stream.wait_for(client_order_id, timeout=2.0)
+            if isinstance(streamed, dict):
+                order = {**order, **streamed}
         fill = orders.reconcile_order(
             self.clients[exchange_name], exchange_name, symbol, side,
             requested_quantity, order,
@@ -758,9 +895,53 @@ class RealExecutionEngine:
         account pays fees in a discount token. Sizing the next leg off the
         gross figure asks to trade coin that is not there.
         """
-        if (fill.fee_currency or "").upper() == (currency or "").upper():
-            return max(0.0, float(gross) - float(fill.fee_cost))
+        fee_total = sum(
+            float(item.get("cost") or 0.0)
+            for item in (getattr(fill, "fee_items", ()) or ())
+            if str(item.get("currency") or "").upper() == (currency or "").upper()
+        )
+        if not fee_total and (fill.fee_currency or "").upper() == (currency or "").upper():
+            fee_total = float(fill.fee_cost)
+        if fee_total:
+            return max(0.0, float(gross) - fee_total)
         return float(gross)
+
+    def _fee_value_usdt(self, exchange_name, fill, exclude_currencies=()):
+        """Value all non-implicit fill fees in USDT without mixing assets."""
+        excluded = {str(value).upper() for value in exclude_currencies}
+        items = list(getattr(fill, "fee_items", ()) or ())
+        if not items and float(fill.fee_cost):
+            items = [{"cost": fill.fee_cost, "currency": fill.fee_currency}]
+        base = base_coin(fill.symbol).upper()
+        quote = quote_coin(fill.symbol).upper()
+        total = 0.0
+        for item in items:
+            currency = str(item.get("currency") or "").upper()
+            amount = float(item.get("cost") or 0.0)
+            if not currency or currency in excluded or amount == 0:
+                continue
+            if currency == "USDT":
+                total += amount
+            elif currency == base and quote == "USDT":
+                total += amount * float(fill.average_price)
+            elif currency == quote and base == "USDT":
+                total += amount / float(fill.average_price)
+            else:
+                markets = self.markets.get(exchange_name, {})
+                direct = f"{currency}/USDT"
+                inverse = f"USDT/{currency}"
+                if direct in markets:
+                    ticker = self.clients[exchange_name].fetch_ticker(direct)
+                    total += amount * float(ticker.get("bid") or ticker.get("last") or 0)
+                elif inverse in markets:
+                    ticker = self.clients[exchange_name].fetch_ticker(inverse)
+                    ask = float(ticker.get("ask") or ticker.get("last") or 0)
+                    if ask <= 0:
+                        raise RuntimeError(f"Could not value {currency} commission in USDT.")
+                    total += amount / ask
+                else:
+                    raise RuntimeError(f"Could not value {currency} commission in USDT.")
+        return total
 
     def _dust_tolerance(self, exchange_name, symbol, quantity):
         """Largest unsold remainder worth ignoring rather than halting over.
@@ -852,9 +1033,10 @@ class RealExecutionEngine:
             sell_order.get("cost") or (filled_sell * live_sell_price))
         # Quote-currency fees are a cash cost the `cost` fields do not include.
         # A fee charged in the base coin already shows up as a smaller sell.
-        quote_fees = sum(
-            float(fill.fee_cost) for fill in (buy_fill, sell_fill)
-            if (fill.fee_currency or "").upper() == quote.upper())
+        fee_value_usdt = (
+            self._fee_value_usdt(buy_exchange, buy_fill)
+            + self._fee_value_usdt(sell_exchange, sell_fill)
+        )
         return {
             "buy_order": buy_order,
             "sell_order": sell_order,
@@ -862,7 +1044,8 @@ class RealExecutionEngine:
             "sell_fill": sell_fill.as_dict(),
             "filled_quantity": filled_quantity,
             "unsold_dust": max(0.0, shortfall),
-            "profit_usdt": sell_proceeds - buy_cost - quote_fees,
+            "fee_value_usdt": fee_value_usdt,
+            "profit_usdt": sell_proceeds - buy_cost - fee_value_usdt,
         }
 
     def execute_triangular(self, exchange_name, start_usdt, prices, symbols=None):
@@ -877,9 +1060,9 @@ class RealExecutionEngine:
         first_price = prices[first_symbol]
         middle_price = prices[middle_symbol]
         final_price = prices[final_symbol]
-        fee = self.taker_fee(exchange_name, symbols[0])
-        btc_quantity = (start_usdt / first_price) * (1 - fee)
-        eth_quantity = (btc_quantity / middle_price) * (1 - fee)
+        fees = [self.taker_fee(exchange_name, symbol) for symbol in symbols]
+        btc_quantity = (start_usdt / first_price) * (1 - fees[0])
+        eth_quantity = (btc_quantity / middle_price) * (1 - fees[1])
         live_btc_price = self.check_order_book(
             exchange_name, first_symbol, "buy", btc_quantity, first_price)
         live_eth_btc_price = self.check_order_book(
@@ -888,9 +1071,9 @@ class RealExecutionEngine:
             exchange_name, final_symbol, "sell", eth_quantity, final_price)
 
         conservative_final = (
-            start_usdt * (1 - fee) / live_btc_price
-            * (1 - fee) / live_eth_btc_price
-            * live_eth_usdt_price * (1 - fee)
+            start_usdt * (1 - fees[0]) / live_btc_price
+            * (1 - fees[1]) / live_eth_btc_price
+            * live_eth_usdt_price * (1 - fees[2])
         )
         conservative_profit_pct = (conservative_final - start_usdt) / start_usdt * 100
         if conservative_profit_pct < MIN_PROFIT_PCT:
@@ -904,7 +1087,7 @@ class RealExecutionEngine:
         # UnhedgedPositionError - the only error the server records for
         # recovery - and never a bare RuntimeError.
         requested_btc = self.plan_buy_quantity(
-            exchange_name, first_symbol, start_usdt, live_btc_price, fee)
+            exchange_name, first_symbol, start_usdt, live_btc_price, fees[0])
         btc_order = self.place_market_buy_quantity(
             exchange_name, first_symbol, requested_btc)
         try:
@@ -924,7 +1107,7 @@ class RealExecutionEngine:
 
         try:
             requested_eth = self.plan_buy_quantity(
-                exchange_name, middle_symbol, held_btc, live_eth_btc_price, fee)
+                exchange_name, middle_symbol, held_btc, live_eth_btc_price, fees[1])
             self.check_order_book(
                 exchange_name, middle_symbol, "buy", requested_eth,
                 live_eth_btc_price)
@@ -950,7 +1133,14 @@ class RealExecutionEngine:
         # Whatever BTC the middle leg did not spend is still sitting there. It
         # is reported rather than silently forgotten, but it is dust-sized and
         # does not stop the loop from closing.
-        residual_btc = max(0.0, held_btc - float(eth_fill.cost))
+        middle_quote_fees = sum(
+            float(item.get("cost") or 0.0)
+            for item in (getattr(eth_fill, "fee_items", ()) or ())
+            if str(item.get("currency") or "").upper()
+            == quote_coin(middle_symbol).upper()
+        )
+        residual_btc = max(
+            0.0, held_btc - float(eth_fill.cost) - middle_quote_fees)
         held_eth = self._net_received(eth_fill, base_coin(middle_symbol), filled_eth)
 
         try:
@@ -978,13 +1168,18 @@ class RealExecutionEngine:
                 eth_order, RuntimeError("Final triangular leg was partially filled."),
             )
 
-        quote = quote_coin(final_symbol)
         start_cost = float(btc_fill.cost) or float(btc_order.get("cost") or start_usdt)
         proceeds = float(sell_fill.cost) or float(
             eth_sell_order.get("cost") or (filled_sell * live_eth_usdt_price))
-        quote_fees = sum(
-            float(leg.fee_cost) for leg in (btc_fill, sell_fill)
-            if (leg.fee_currency or "").upper() == quote.upper())
+        fee_value_usdt = (
+            self._fee_value_usdt(
+                exchange_name, btc_fill,
+                exclude_currencies={base_coin(first_symbol)})
+            + self._fee_value_usdt(
+                exchange_name, eth_fill,
+                exclude_currencies={base_coin(middle_symbol)})
+            + self._fee_value_usdt(exchange_name, sell_fill)
+        )
         return {
             "buy_order": btc_order,
             "middle_order": eth_order,
@@ -992,7 +1187,8 @@ class RealExecutionEngine:
             "legs": [btc_fill.as_dict(), eth_fill.as_dict(), sell_fill.as_dict()],
             "residual_base": residual_btc,
             "unsold_dust": max(0.0, shortfall),
-            "profit_usdt": proceeds - start_cost - quote_fees,
+            "fee_value_usdt": fee_value_usdt,
+            "profit_usdt": proceeds - start_cost - fee_value_usdt,
         }
 
 
@@ -1017,6 +1213,14 @@ class PaperWallet:
     def __init__(self, exchanges, symbols, cash, start_prices):
         self.usdt = {}   # usdt[exchange][symbol]
         self.coin = {}   # coin[exchange][symbol]
+        # A live public feed can temporarily omit one market while another venue
+        # is still healthy. Keep the last valid mark for every paper asset so a
+        # partial/outage response cannot turn a 20,000 USDT demo account into
+        # $0.00 or crash the worker with KeyError.
+        self.valuation_prices = {
+            symbol: float(price) for symbol, price in start_prices.items()
+            if float(price) > 0
+        }
         for ex in exchanges:
             self.usdt[ex] = {}
             self.coin[ex] = {}
@@ -1026,6 +1230,16 @@ class PaperWallet:
                 # the coin on the expensive exchange to sell instantly.
                 self.usdt[ex][sym] = cash / 2
                 self.coin[ex][sym] = (cash / 2) / start_prices[sym]
+
+    @classmethod
+    def with_total_balance(cls, exchanges, symbols, total_balance, start_prices):
+        """Create a wallet whose initial value is one fixed account total."""
+        exchanges = list(dict.fromkeys(exchanges))
+        symbols = list(dict.fromkeys(symbols))
+        buckets = len(exchanges) * len(symbols)
+        if buckets <= 0:
+            raise ValueError("A paper wallet needs at least one exchange and symbol.")
+        return cls(exchanges, symbols, float(total_balance) / buckets, start_prices)
 
     def buy(self, exchange, symbol, spend_usdt, price, fee):
         """Buy coin on `exchange`, spending `spend_usdt`. Returns coin amount."""
@@ -1062,12 +1276,19 @@ class PaperWallet:
         return coin_amount, received
 
     def total_value(self, mid_prices):
-        """Total portfolio value in USDT at current prices."""
+        """Total portfolio value in USDT using the latest valid mark per asset."""
+        for symbol, price in (mid_prices or {}).items():
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                self.valuation_prices[symbol] = price
         total = 0.0
         for ex in self.usdt:
             for sym in self.usdt[ex]:
                 total += self.usdt[ex][sym]
-                total += self.coin[ex][sym] * mid_prices[sym]
+                total += self.coin[ex][sym] * self.valuation_prices[sym]
         return total
 
 
@@ -1124,30 +1345,36 @@ class DemoFeed:
 
 class LiveFeed:
     """
-    Fetches REAL prices from the exchanges using the ccxt library.
-    If REAL_TRADING_ENABLED is on, it expects valid API keys for each exchange.
+    Fetches public prices from credential-free CCXT clients.
+
+    Credential validation belongs to ``RealExecutionEngine``. Repeating it here
+    breaks encrypted per-user credentials (which are intentionally never copied
+    into process globals) and needlessly attaches secrets to market-data calls.
     """
 
     def __init__(self, exchanges, symbols=None):
         import ccxt  # imported here so demo mode doesn't need it
-        config_result = validate_real_trading_config()
-        if REAL_TRADING_ENABLED and not config_result["ok"]:
-            raise SystemExit(config_result["message"])
 
         self.clients = {}
         self.markets = {}
         for name in exchanges:
             try:
                 if REAL_TRADING_ENABLED:
-                    self.clients[name] = create_exchange_client(name)
+                    client = create_public_exchange_client(name)
                 else:
-                    self.clients[name] = getattr(ccxt, name)({"enableRateLimit": True})
-                self.markets[name] = self.clients[name].load_markets()
+                    client = getattr(ccxt, name)({"enableRateLimit": True})
+                markets = client.load_markets()
+                # Publish a venue only after market discovery succeeded. The old
+                # order left failed clients in this mapping, so initialization
+                # looked successful and every later scan quietly returned zero
+                # quotes forever.
+                self.clients[name] = client
+                self.markets[name] = markets
             except Exception as e:
                 print(f"  [!] Could not connect to {name}: {e}")
         required_clients = 2 if TRADING_STRATEGY == "cross_exchange" else 1
         if len(self.clients) < required_clients:
-            raise SystemExit(
+            raise RuntimeError(
                 f"Need at least {required_clients} working exchange(s) for {TRADING_STRATEGY}."
             )
         self.routes = []
@@ -1258,36 +1485,45 @@ class LiveFeed:
 #  THE ARBITRAGE SCANNER
 # ==================================================================
 
-def find_opportunity(quotes_for_symbol):
+def _fee_for(fees, exchange=None, symbol=None, index=0):
+    if callable(fees):
+        return float(fees(exchange, symbol))
+    if isinstance(fees, dict):
+        return float(fees.get((exchange, symbol), fees.get(symbol, TAKER_FEE)))
+    if isinstance(fees, (list, tuple)):
+        return float(fees[index])
+    return float(TAKER_FEE if fees is None else fees)
+
+
+def find_opportunity(quotes_for_symbol, fees=None, symbol=None, min_profit=None):
     """
     Given quotes[exchange] = {'bid','ask'} for one symbol,
-    find the best buy (lowest ask) and best sell (highest bid).
+    find the directed exchange pair with the highest return after both fees.
     Returns (buy_exchange, sell_exchange, buy_price, sell_price,
              net_profit_pct) or None if no profitable gap.
     """
-    best_ask_ex = min(quotes_for_symbol, key=lambda e: quotes_for_symbol[e]["ask"])
-    best_bid_ex = max(quotes_for_symbol, key=lambda e: quotes_for_symbol[e]["bid"])
-
-    if best_ask_ex == best_bid_ex:
-        return None  # same exchange -> not cross-exchange arbitrage
-
-    ask = quotes_for_symbol[best_ask_ex]["ask"]
-    bid = quotes_for_symbol[best_bid_ex]["bid"]
-    if bid <= ask:
-        return None  # no gap
-
-    # Profit math: buy 1 coin costs `ask` (+fee), selling gives `bid` (-fee).
-    # The fees compound - the sell fee applies to the grossed-up proceeds - so
-    # subtracting 2*fee from the gross spread overstates the edge, always in
-    # the direction that loses money.
-    gross_pct = (bid - ask) / ask * 100          # before fees, for reporting
-    net_pct = float(net_spread_pct(ask, bid, TAKER_FEE, TAKER_FEE))
-    if gross_pct <= 0:
+    threshold = D(MIN_PROFIT_PCT if min_profit is None else min_profit)
+    best = None
+    for buy_ex, buy_quote in quotes_for_symbol.items():
+        ask = D(buy_quote.get("ask"))
+        buy_fee = D(_fee_for(fees, buy_ex, symbol))
+        if not ask.is_finite() or ask <= ZERO or not buy_fee.is_finite() or not ZERO <= buy_fee < ONE:
+            continue
+        for sell_ex, sell_quote in quotes_for_symbol.items():
+            if buy_ex == sell_ex:
+                continue
+            bid = D(sell_quote.get("bid"))
+            sell_fee = D(_fee_for(fees, sell_ex, symbol))
+            if not bid.is_finite() or bid <= ask or not sell_fee.is_finite() or not ZERO <= sell_fee < ONE:
+                continue
+            # The widest raw spread need not be the best route once each
+            # venue's fees are charged. Compare every directed pair exactly.
+            net = net_spread_pct(ask, bid, buy_fee, sell_fee)
+            if net >= threshold and (best is None or net > best[4]):
+                best = (buy_ex, sell_ex, ask, bid, net)
+    if best is None:
         return None
-
-    if net_pct >= MIN_PROFIT_PCT:
-        return best_ask_ex, best_bid_ex, ask, bid, net_pct
-    return None
+    return best[0], best[1], float(best[2]), float(best[3]), float(best[4])
 
 
 def find_triangular_opportunity(quotes, exchange, start_usdt, fee):
@@ -1321,21 +1557,31 @@ def calculate_triangular_route(quotes, exchange, start_usdt, fee, symbols, route
     first_quote = quotes[symbols[0]][exchange]
     second_quote = quotes[symbols[1]][exchange]
     final_quote = quotes[symbols[2]][exchange]
-    first_amount = (start_usdt * (1 - fee)) / first_quote["ask"]
-    second_amount = (first_amount * (1 - fee)) / second_quote["ask"]
-    final_usdt = second_amount * final_quote["bid"] * (1 - fee)
-    profit = final_usdt - start_usdt
-    profit_pct = (profit / start_usdt) * 100
+    first_fee = _fee_for(fee, exchange, symbols[0], 0)
+    second_fee = _fee_for(fee, exchange, symbols[1], 1)
+    final_fee = _fee_for(fee, exchange, symbols[2], 2)
+    capital = D(start_usdt)
+    prices = [D(first_quote.get("ask")), D(second_quote.get("ask")), D(final_quote.get("bid"))]
+    rates = [D(first_fee), D(second_fee), D(final_fee)]
+    if (not capital.is_finite() or capital <= ZERO
+            or any(not p.is_finite() or p <= ZERO for p in prices)
+            or any(not f.is_finite() or not ZERO <= f < ONE for f in rates)):
+        return None
+    first_amount = capital * (ONE - rates[0]) / prices[0]
+    second_amount = first_amount * (ONE - rates[1]) / prices[1]
+    final_usdt = second_amount * prices[2] * (ONE - rates[2])
+    profit = final_usdt - capital
+    profit_pct = profit / capital * HUNDRED
     return {
         "exchange": exchange,
         "route": route,
-        "profit_usdt": profit,
-        "profit_pct": profit_pct,
+        "profit_usdt": float(profit),
+        "profit_pct": float(profit_pct),
         "symbols": symbols,
         "prices": {symbols[0]: first_quote["ask"],
                    symbols[1]: second_quote["ask"],
                    symbols[2]: final_quote["bid"]},
-        "final_usdt": final_usdt,
+        "final_usdt": float(final_usdt),
     }
 
 
@@ -1434,6 +1680,7 @@ def main():
 
     if MODE == "live":
         feed = LiveFeed(EXCHANGES)
+        wallet_exchanges = list(feed.clients)
         start_prices = {}
         print("  Fetching starting prices...", end=" ", flush=True)
         first = feed.get_quotes()
@@ -1444,11 +1691,13 @@ def main():
         print("done.")
     else:
         feed = DemoFeed(EXCHANGES, SYMBOLS)
+        wallet_exchanges = list(EXCHANGES)
         start_prices = dict(DEMO_START_PRICES)
 
     active_symbols = [s for s in SYMBOLS if s in start_prices]
-    wallet = PaperWallet(EXCHANGES, active_symbols,
-                         START_CASH_PER_EXCHANGE, start_prices)
+    wallet = PaperWallet.with_total_balance(
+        wallet_exchanges, active_symbols, PAPER_STARTING_BALANCE_USDT,
+        start_prices)
     start_value = wallet.total_value(start_prices)
 
     init_csv()

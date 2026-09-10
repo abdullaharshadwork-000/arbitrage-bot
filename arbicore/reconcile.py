@@ -91,12 +91,19 @@ class RecoveryReport:
 
 
 def open_orders_for(client, symbols):
-    """Every resting order across the symbols we trade.
+    """Every resting order visible to the account.
 
-    Asks per symbol rather than account-wide: several exchanges require a
-    symbol for fetchOpenOrders, and a silent failure here would report a clean
-    account while orders sat on the book.
+    Prefer the account-wide endpoint so a first run also catches manual orders
+    on non-selected symbols which may lock quote/base inventory. Some exchanges
+    require a symbol, so fall back to strict per-symbol queries and report every
+    failed query as a blocker rather than claiming the account is clean.
     """
+    try:
+        orders = client.fetch_open_orders() or []
+        return [dict(order) for order in orders], []
+    except Exception:
+        pass
+
     found = []
     problems = []
     for symbol in symbols:
@@ -188,7 +195,7 @@ def _describe_order(order):
 
 def startup_check(clients, symbols, expected_balances=None, prices=None,
                   pending_records=None, max_clock_skew_ms=2000,
-                  clock=time.time, quote="USDT"):
+                  clock=time.time, quote="USDT", require_clock=False):
     """Ask every venue what is outstanding before the loop is allowed to start.
 
     `clients` is {exchange: ccxt_client}. `expected_balances` is
@@ -228,7 +235,10 @@ def startup_check(clients, symbols, expected_balances=None, prices=None,
                       "filled": float(D(order.get("filled")))}))
 
         skew = clock_skew_ms(client, clock=clock)
-        if skew is not None and abs(skew) > int(max_clock_skew_ms):
+        if skew is None and require_clock:
+            errors.append(
+                f"{exchange}: could not verify exchange clock for signed requests")
+        elif skew is not None and abs(skew) > int(max_clock_skew_ms):
             discrepancies.append(Discrepancy(
                 kind="clock_skew", exchange=exchange,
                 detail=(f"local clock is {skew}ms from {exchange}'s, past the "
@@ -251,7 +261,7 @@ def startup_check(clients, symbols, expected_balances=None, prices=None,
                 detail=(f"{exchange} {drift['currency']}: expected "
                         f"{float(drift['expected'])}, found {float(drift['actual'])} "
                         f"({float(drift['gap']):+})"),
-                blocking=False,
+                blocking=True,
                 data={k: (float(v) if isinstance(v, Decimal) else v)
                       for k, v in drift.items()}))
 

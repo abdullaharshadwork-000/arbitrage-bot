@@ -22,11 +22,13 @@ class CredentialVault:
     def enabled(self):
         return self._fernet is not None
 
-    def encrypt(self, api_key, api_secret):
+    def encrypt(self, api_key, api_secret, password=""):
         if not self._fernet:
             raise RuntimeError("Encrypted credential persistence is not configured.")
-        payload = json.dumps({"apiKey": api_key, "secret": api_secret},
-                             separators=(",", ":")).encode("utf-8")
+        values = {"apiKey": api_key, "secret": api_secret}
+        if password:
+            values["password"] = password
+        payload = json.dumps(values, separators=(",", ":")).encode("utf-8")
         return self._fernet.encrypt(payload).decode("ascii")
 
     def decrypt(self, ciphertext):
@@ -37,7 +39,10 @@ class CredentialVault:
         except InvalidToken as exc:
             raise RuntimeError("Stored exchange credentials cannot be decrypted.") from exc
         result = json.loads(payload.decode("utf-8"))
-        return {"apiKey": result["apiKey"], "secret": result["secret"]}
+        values = {"apiKey": result["apiKey"], "secret": result["secret"]}
+        if result.get("password"):
+            values["password"] = result["password"]
+        return values
 
     def encrypt_text(self, value):
         if not self.enabled:

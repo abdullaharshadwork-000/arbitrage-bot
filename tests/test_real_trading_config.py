@@ -8,6 +8,14 @@ import server
 from arbicore import config as arbiconfig
 
 
+def exchange_mock():
+    client = Mock()
+    client.private_get_account_commission.return_value = {
+        "standardCommission": {"taker": str(arbitrage_bot.TAKER_FEE)}}
+    client.fetch_trading_fee.return_value = {"taker": arbitrage_bot.TAKER_FEE}
+    return client
+
+
 def api_client():
     """A test client carrying the session token the access guard requires.
 
@@ -88,6 +96,23 @@ class RealTradingConfigTests(unittest.TestCase):
         bought = wallet.buy("binance", "BTC/USDT", 100, 10000, 0.001)
         self.assertIsNotNone(bought)
         self.assertGreater(bought, 0)
+
+    def test_paper_wallet_starts_with_one_fixed_twenty_thousand_total(self):
+        prices = {"BTC/USDT": 10000, "ETH/USDT": 1000}
+        wallet = arbitrage_bot.PaperWallet.with_total_balance(
+            ["binance", "kucoin"], list(prices), 20_000, prices)
+
+        self.assertAlmostEqual(wallet.total_value(prices), 20_000.0)
+
+    def test_paper_wallet_keeps_last_mark_when_a_live_quote_is_missing(self):
+        prices = {"BTC/USDT": 10000, "ETH/USDT": 1000}
+        wallet = arbitrage_bot.PaperWallet.with_total_balance(
+            ["binance", "kucoin"], list(prices), 20_000, prices)
+
+        partial_value = wallet.total_value({"BTC/USDT": 11000})
+
+        self.assertGreater(partial_value, 20_000.0)
+        self.assertAlmostEqual(wallet.total_value({}), partial_value)
 
     def test_triangular_opportunity_applies_three_fees(self):
         original_min_profit = arbitrage_bot.MIN_PROFIT_PCT
@@ -203,7 +228,8 @@ class RealTradingConfigTests(unittest.TestCase):
             arbitrage_bot.TRADING_STRATEGY = "triangular"
             arbitrage_bot.EXCHANGES = ["kucoin"]
             arbitrage_bot.EXCHANGE_CREDENTIALS = {
-                "kucoin": {"apiKey": "abc", "secret": "def"},
+                "kucoin": {"apiKey": "abc", "secret": "def",
+                            "password": "phrase"},
             }
             result = arbitrage_bot.validate_real_trading_config()
             self.assertTrue(result["ok"], result["message"])
@@ -345,8 +371,8 @@ class RealTradingConfigTests(unittest.TestCase):
         try:
             arbitrage_bot.REAL_TRADING_ENABLED = True
             arbitrage_bot.EXECUTION_MODE = "real"
-            buy_client = Mock()
-            sell_client = Mock()
+            buy_client = exchange_mock()
+            sell_client = exchange_mock()
             balances = {"USDT": {"free": 1000}, "BTC": {"free": 1}}
             buy_client.fetch_balance.return_value = balances
             sell_client.fetch_balance.return_value = balances
@@ -383,8 +409,8 @@ class RealTradingConfigTests(unittest.TestCase):
         try:
             arbitrage_bot.REAL_TRADING_ENABLED = True
             arbitrage_bot.EXECUTION_MODE = "real"
-            buy_client = Mock()
-            sell_client = Mock()
+            buy_client = exchange_mock()
+            sell_client = exchange_mock()
             balances = {"USDT": {"free": 1000}, "BTC": {"free": 1}}
             buy_client.fetch_balance.return_value = balances
             sell_client.fetch_balance.return_value = balances
@@ -418,7 +444,7 @@ class RealTradingConfigTests(unittest.TestCase):
         try:
             arbitrage_bot.REAL_TRADING_ENABLED = True
             arbitrage_bot.EXECUTION_MODE = "real"
-            client = Mock()
+            client = exchange_mock()
             client.fetch_balance.return_value = {
                 "USDT": {"free": 1000}, "BTC": {"free": 0}, "ETH": {"free": 0},
             }
@@ -466,8 +492,8 @@ class RealTradingConfigTests(unittest.TestCase):
         try:
             arbitrage_bot.REAL_TRADING_ENABLED = True
             arbitrage_bot.EXECUTION_MODE = "real"
-            buy_client = Mock()
-            sell_client = Mock()
+            buy_client = exchange_mock()
+            sell_client = exchange_mock()
             balances = {"USDT": {"free": 1000}, "BTC": {"free": 1}}
             buy_client.fetch_balance.return_value = balances
             sell_client.fetch_balance.return_value = balances
@@ -498,8 +524,8 @@ class RealTradingConfigTests(unittest.TestCase):
             arbitrage_bot.REAL_TRADING_ENABLED = True
             arbitrage_bot.EXECUTION_MODE = "real"
             arbitrage_bot.MIN_PROFIT_PCT = 0.5
-            buy_client = Mock()
-            sell_client = Mock()
+            buy_client = exchange_mock()
+            sell_client = exchange_mock()
             balances = {"USDT": {"free": 1000}, "BTC": {"free": 1}}
             buy_client.fetch_balance.return_value = balances
             sell_client.fetch_balance.return_value = balances
@@ -677,7 +703,8 @@ class RealTradingAcknowledgementTests(unittest.TestCase):
         arbitrage_bot.EXCHANGES = ["binance", "kucoin"]
         arbitrage_bot.EXCHANGE_CREDENTIALS = {
             "binance": {"apiKey": "abc", "secret": "def"},
-            "kucoin": {"apiKey": "ghi", "secret": "jkl"},
+            "kucoin": {"apiKey": "ghi", "secret": "jkl",
+                        "password": "phrase"},
         }
 
     def test_the_flag_without_the_acknowledgement_is_refused(self):

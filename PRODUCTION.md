@@ -1,5 +1,22 @@
 # ArbiCore production runbook
 
+## Current hardening milestone
+
+- Dashboard paper execution uses a shared asset ledger and depth-aware fills,
+  including the three legs of triangular routes. A new paper account starts
+  with 20,000 USDT total, not 20,000 per pair or exchange.
+- Paper snapshots are keyed by user and tutorial/live-paper mode. Successful
+  trade records and wallet snapshots commit together. Interrupted simulated
+  routes retain their recovery marker and block further simulated execution.
+- Real execution requires a verified fee (cached for at most five minutes);
+  an unavailable fee does not fall back to an assumed rate.
+- Theme and notification preferences are stored per authenticated account.
+  Error and safety notices remain visible regardless of notification settings.
+- New trade rows carry tutorial/paper/testnet/production mode tags. Historical
+  unclassified rows remain `legacy`; performance-view separation is not yet
+  complete. Independent per-account workers and recovery/backup tooling also
+  remain unfinished. This milestone is not a certification for real funds.
+
 ## Live execution controls enforced by this build
 
 - Live orders use price-bounded `limit` orders with `FOK` (fill-or-kill), using
@@ -13,9 +30,17 @@
   execution.
 - Order intents and status transitions are persisted and exposed, per owner,
   at `GET /api/orders`.
+- Risk counters, high-water equity, kill switches, worker leases and recovery
+  positions are durable per owner and restored before startup reconciliation.
+- Authenticated order events are consumed through CCXT Pro when available;
+  terminal fills still have a bounded REST reconciliation fallback.
 - Startup reconciliation, ambiguous-order recovery by client ID, partial-fill
   handling, stranded-position persistence, drawdown/daily-loss limits, order
   rate limits, and the emergency stop remain mandatory.
+- A transparent next-scan uncertainty model is mandatory for real execution.
+  It blocks warming-up, stressed-regime, and low-confidence opportunities and
+  records its confidence, predicted edge, adaptive floor, and regime with each
+  completed trade for audit.
 
 These controls reduce execution risk; they cannot guarantee profit or make a
 networked trading system risk-free.
@@ -77,17 +102,18 @@ Sustained failed logins are temporarily locked, users can revoke other sessions,
 and disabling MFA requires both the current password and an authenticator or
 one-time recovery code.
 
-Rotate a key by pausing the engine, disconnecting Binance, revoking the old key at
-Binance, and connecting the replacement. Keep withdrawals and transfers disabled;
+Rotate a key by pausing the engine, disconnecting the venue in Settings, revoking
+the old key at that exchange, and connecting the replacement. Keep withdrawals and transfers disabled;
 allow only Reading and Spot Trading, restrict the source IP, and allowlist only
 `BTCUSDT`, `ETHBTC`, and `ETHUSDT` for the triangular strategy.
 
 ## Qualification and activation
 
-Production readiness requires a completed Binance Testnet soak run with the
-configured number of successful cycles. Set `ARBICORE_TESTNET_FAILURE_EVERY` to a
-positive number only during a sandbox soak to verify that the worker survives
-injected scan failures. The setting has no effect in production mode.
+Production readiness requires confirmed, fully persisted Binance Testnet routes
+under the same code and safety-configuration fingerprint. Empty scans no longer
+count. Qualification also requires at least one confirmed recovery exercise and
+zero unresolved order intents. Set `ARBICORE_REQUIRED_TESTNET_RECOVERIES` to
+raise the recovery-drill requirement.
 
 Before production activation, confirm all readiness stages are green:
 
@@ -96,7 +122,8 @@ Before production activation, confirm all readiness stages are green:
 3. Binance's non-executing order-test endpoint;
 4. free Spot USDT and exposure limits;
 5. startup reconciliation with no open/ambiguous orders or stranded inventory;
-6. completed testnet qualification.
+6. authenticated private order stream with REST fallback;
+7. completed Testnet route and recovery qualification.
 
 The Start action still requires the exact `I ACCEPT REAL LOSSES` acknowledgement.
 

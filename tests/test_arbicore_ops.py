@@ -269,6 +269,15 @@ class TestStartupCheck(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("0.2/0.5 filled", found[0].detail)
 
+    def test_an_open_order_outside_the_selected_symbols_still_blocks_start(self):
+        outside = {**RESTING, "id": "99", "symbol": "SOL/USDT"}
+        report = reconcile.startup_check(
+            {"binance": FakeVenue([outside])}, ["BTC/USDT"],
+            clock=lambda: 1000.0)
+        self.assertTrue(report.blocking)
+        self.assertEqual(report.of_kind("open_order")[0].data["symbol"],
+                         "SOL/USDT")
+
     def test_an_unreachable_venue_is_not_reported_as_safe(self):
         # The failure mode this guards: blocking=False on an account nobody
         # could read is a green light to trade blind.
@@ -315,7 +324,7 @@ class TestStartupCheck(unittest.TestCase):
                                          clock=lambda: 1000.0)
         self.assertEqual(report.of_kind("clock_skew"), ())
 
-    def test_balance_drift_is_reported_without_blocking_the_start(self):
+    def test_balance_drift_blocks_the_start_until_inventory_is_reconciled(self):
         venue = FakeVenue(balance={"USDT": Decimal("500")})
         report = reconcile.startup_check(
             {"binance": venue}, ["BTC/USDT"],
@@ -323,8 +332,8 @@ class TestStartupCheck(unittest.TestCase):
             prices={}, clock=lambda: 1000.0)
         drift = report.of_kind("balance_drift")
         self.assertEqual(len(drift), 1)
-        self.assertFalse(drift[0].blocking)
-        self.assertFalse(report.blocking)
+        self.assertTrue(drift[0].blocking)
+        self.assertTrue(report.blocking)
 
     def test_as_dict_is_json_safe(self):
         report = reconcile.startup_check({"binance": FakeVenue([RESTING])},

@@ -1,7 +1,7 @@
 import unittest
 
 from arbicore import auth
-from arbicore.streaming import StreamingBookCache
+from arbicore.streaming import PrivateOrderStream, StreamingBookCache
 
 
 class Clock:
@@ -29,6 +29,25 @@ class StreamingCacheTests(unittest.TestCase):
         cache.update("binance", "BTC/USDT", 100, 101, 10)
         self.assertFalse(cache.update("binance", "BTC/USDT", 100, 101, 12))
         self.assertEqual(cache.health()["sequence_gaps"], 1)
+
+
+class PrivateOrderStreamTests(unittest.TestCase):
+    def test_an_authenticated_event_wakes_reconciliation_and_is_auditable(self):
+        seen = []
+        stream = PrivateOrderStream(
+            ["binance"], {"binance": {"apiKey": "masked", "secret": "masked"}},
+            on_event=lambda exchange, event: seen.append((exchange, event["id"])))
+        event = {"id": "exchange-1", "clientOrderId": "arbi-1",
+                 "status": "closed", "filled": 0.002}
+        self.assertTrue(stream.publish("binance", event))
+        self.assertEqual(stream.wait_for("arbi-1", timeout=0), {
+            **event, "exchange": "binance"})
+        self.assertEqual(seen, [("binance", "exchange-1")])
+
+    def test_events_without_our_client_order_id_are_ignored(self):
+        stream = PrivateOrderStream([], {})
+        self.assertFalse(stream.publish("binance", {"id": "not-ours"}))
+        self.assertIsNone(stream.wait_for("missing", timeout=0))
 
 
 class TotpTests(unittest.TestCase):

@@ -199,6 +199,20 @@ class TestReconcileOrder(unittest.TestCase):
         self.assertEqual(listed.fee_cost, Decimal("0.15"))
         self.assertEqual(listed.fee_currency, "BNB")
 
+    def test_fees_in_different_assets_are_never_added_together(self):
+        fill = reconcile_order(
+            FakeClient(), "binance", "BTC/USDT", "buy", "0.002",
+            {"id": "1", "status": "closed", "filled": 0.002,
+             "average": 100000.0,
+             "fees": [{"cost": 0.000001, "currency": "BTC"},
+                      {"cost": 0.02, "currency": "USDT"}]})
+        self.assertEqual(fill.fee_cost, ZERO)
+        self.assertEqual(fill.fee_currency, "MULTI")
+        self.assertEqual(fill.fee_items, (
+            {"cost": Decimal("0.000001"), "currency": "BTC"},
+            {"cost": Decimal("0.02"), "currency": "USDT"},
+        ))
+
 
 class TestSubmitMarketOrder(unittest.TestCase):
 
@@ -239,6 +253,26 @@ class TestSubmitMarketOrder(unittest.TestCase):
         client = FakeClient(closed_orders=[{"clientOrderId": "arbi-1", "id": "9"}])
         self.assertEqual(find_by_client_id(client, "BTC/USDT", "arbi-1")["id"], "9")
         self.assertIsNone(find_by_client_id(client, "BTC/USDT", "arbi-missing"))
+
+    def test_find_by_client_id_uses_direct_lookup_for_terminal_fok_orders(self):
+        class DirectClient(FakeClient):
+            def __init__(self):
+                super().__init__(open_orders=[], closed_orders=[])
+                self.direct_calls = []
+
+            def fetch_order(self, order_id, symbol=None, params=None):
+                self.direct_calls.append((order_id, symbol, params))
+                requested = (params or {}).get("origClientOrderId")
+                if requested == "arbi-terminal":
+                    return {"id": "77", "clientOrderId": requested,
+                            "status": "closed", "filled": 0.002}
+                return {}
+
+        client = DirectClient()
+        found = find_by_client_id(client, "BTC/USDT", "arbi-terminal")
+        self.assertEqual(found["id"], "77")
+        self.assertEqual(client.direct_calls[0][2], {
+            "origClientOrderId": "arbi-terminal"})
 
 
 class TestFill(unittest.TestCase):

@@ -28,7 +28,9 @@ def live_real(**overrides):
     base.update(overrides)
     settings = Settings(**base)
     return settings.with_credentials({
-        name: Credentials(name, "key-" + name, SECRET, source="test")
+        name: Credentials(name, "key-" + name, SECRET,
+                          "phrase" if name in {"kucoin", "okx"} else "",
+                          source="test")
         for name in settings.exchanges})
 
 
@@ -60,6 +62,8 @@ class TestCredentials(unittest.TestCase):
                          ["api_key", "api_secret"])
         self.assertEqual(Credentials("binance", "k").missing(), ["api_secret"])
         self.assertTrue(Credentials("binance", "k", "s").complete)
+        self.assertEqual(Credentials("kucoin", "k", "s").missing(), ["password"])
+        self.assertTrue(Credentials("okx", "k", "s", "phrase").complete)
 
     def test_env_vars_follow_one_documented_pattern(self):
         env = {"ARBI_BINANCE_API_KEY": "  k  ",
@@ -82,7 +86,8 @@ class TestCredentials(unittest.TestCase):
         resolved = load_credentials(
             ["binance", "kucoin"],
             fallback={"binance": {"apiKey": "from-file", "secret": SECRET},
-                      "kucoin": {"apiKey": "kc", "secret": SECRET}},
+                      "kucoin": {"apiKey": "kc", "secret": SECRET,
+                                  "password": "phrase"}},
             environ=env)
         self.assertEqual(resolved["binance"].api_key, "from-env")
         self.assertEqual(resolved["binance"].source, "env")
@@ -273,6 +278,34 @@ class TestRiskManager(unittest.TestCase):
         self.assertFalse(risk.check("200"))
         clock.advance(61)
         self.assertTrue(risk.check("200"))
+
+    def test_a_whole_route_reserves_its_order_slots_atomically(self):
+        risk, clock = manager(max_orders_per_minute=3)
+        self.assertTrue(risk.reserve_orders(2))
+        refused = risk.reserve_orders(2)
+        self.assertFalse(refused)
+        self.assertEqual(refused.limit, "order_rate")
+        self.assertEqual(risk.snapshot()["orders_last_minute"], 2)
+        clock.advance(61)
+        self.assertTrue(risk.reserve_orders(3))
+
+    def test_latched_risk_and_exact_money_survive_a_restart(self):
+        original, clock = manager()
+        original.record_success(Decimal("-1.23456789"))
+        original.update_equity(Decimal("9876.54321001"))
+        original.reserve_orders(2)
+        original.record_stranded("binance", "BTC", Decimal("0.00012345"),
+                                 "sell leg failed")
+
+        restored, _ = manager()
+        restored._clock = clock
+        self.assertTrue(restored.restore_state(original.export_state()))
+        self.assertEqual(restored.realized_today, Decimal("-1.23456789"))
+        self.assertEqual(restored.equity, Decimal("9876.54321001"))
+        self.assertEqual(restored.stranded[0]["quantity"], Decimal("0.00012345"))
+        self.assertEqual(restored.snapshot()["orders_last_minute"], 2)
+        self.assertTrue(restored.halted)
+        self.assertFalse(restored.resume()[0])
 
     def test_consecutive_failures_latch_a_halt(self):
         risk, _clock = manager()

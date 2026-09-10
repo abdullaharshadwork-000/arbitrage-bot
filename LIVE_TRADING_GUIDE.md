@@ -16,7 +16,7 @@ start with a sentence telling you which:
 | `REAL_TRADING_ENABLED` | `True` | `live_config.py` |
 | `SANDBOX_MODE` | `True` for testnet, `False` for production | dashboard, environment, or `live_config.py` |
 | `REAL_TRADING_ACK` | `"I ACCEPT REAL LOSSES"` | `live_config.py` or `ARBI_REAL_TRADING_ACK` |
-| API key + secret | per exchange | environment (preferred) or `live_config.py` |
+| API key + secret (+ API passphrase for KuCoin/OKX) | per exchange | encrypted user vault or server environment |
 
 Two gates exist because one boolean is not a decision. A config file copied from
 another machine keeps its flags; the written acknowledgement is the part nobody
@@ -34,7 +34,7 @@ connection test passes.
 For Binance, that connection test sends a signed request to Binance's
 non-executing test-order endpoint. It verifies account access, `TRADE`
 permission, and order filters without placing an order. The approval is bound
-to the selected target, exchanges, and strategy, and expires after five
+to the selected target, exchanges, symbols, strategy, and safety configuration, and expires after five
 minutes. A testnet approval therefore cannot arm production trading.
 
 ## 2. Where the keys go
@@ -57,9 +57,13 @@ committed, backed up by an editor, or read out of a stale copy of the folder.
 `live_config.py` is gitignored, which protects the repository and nothing else —
 the keys in it are still plaintext on your disk.
 
-The browser never accepts or stores API secrets. Configure them in the server
-environment and restart; the dashboard only reports whether each credential
-pair is present and whether authenticated access passed.
+The Settings page accepts Binance, KuCoin, OKX, and Bybit credentials over the
+authenticated, same-origin session. KuCoin and OKX also show their required API
+passphrase field. Credentials are encrypted before database storage when
+`ARBICORE_MASTER_KEY` is configured and are never returned to the browser. If
+the master key is absent they remain memory-only and disappear on restart.
+Each engine receives an immutable copy of its owner's credentials; public
+market-data clients are credential-free.
 
 ## 3. How the API keys must be configured
 
@@ -89,8 +93,10 @@ the gap lasts seconds. So before real mode is worth trying:
 
 ## 5. Suggested sequence
 
-1. Run in **demo** mode and watch the mechanics.
-2. Switch `MODE` to `"live"` with `EXECUTION_MODE = "paper"`. This reads real
+1. Start with `MODE = "live"` and `EXECUTION_MODE = "paper"`. The fixed 20,000
+   USDT demo wallet follows current public market data without using API keys.
+2. Optionally use **Synthetic tutorial market** when offline. For serious paper
+   evaluation, switch back to live data. This reads real
    order books and simulates fills against them with latency and slippage. Leave
    it running for days, not minutes.
 3. Compare the paper results against what the spreads actually were. If paper is
@@ -122,9 +128,18 @@ blotter as `blocked` and the loop keeps scanning. A halt stops the loop and need
 `Resume` in the dashboard, which keeps the day's counters — resuming does not
 forgive the loss that triggered it.
 
-Before the first real scan, a startup check verifies clock skew against the
-venues, balances, and that every symbol is tradable. Blocking problems prevent
-real trading outright.
+Before the first real scan, a startup check verifies clock skew, balances, open
+orders, route inventory, symbol limits, and every non-terminal order intent from
+earlier processes. Any unknown execution or material balance drift blocks real
+trading.
+
+Real candidates also pass the decision-intelligence gate. It needs a fresh
+warm-up window for every engine configuration, estimates next-scan uncertainty
+from observed quote movement and collection latency, and raises the effective
+profit floor in volatile conditions. A stressed regime or confidence below the
+configured minimum refuses the candidate before any order capacity is reserved.
+The forecast is visible in the dashboard and is probabilistic; it does not turn
+a weak strategy into a profitable one.
 
 ## 7. When one leg fills and the other does not
 
@@ -135,8 +150,9 @@ This is the expensive failure, and it will happen eventually. The bot:
    quantity, so it survives a restart.
 3. Shows it in the dashboard with the manual actions.
 
-If the exchange confirmed the fill quantity, the dashboard can market-sell it
-back for you. If it did **not**, the recorded quantity is an upper bound and the
+If the exchange confirmed the fill quantity, the dashboard can submit a
+price-bounded FOK close and removes the recovery record only after the fill is
+confirmed. If it did **not**, the recorded quantity is an upper bound and the
 bot refuses to sell automatically — selling a size that was never bought either
 fails or dumps unrelated inventory. Go and look at the order on the exchange.
 
@@ -148,9 +164,10 @@ run starts trading around inventory it does not know about.
 
 - Set an alert webhook. Without one, a 3am halt goes unnoticed until someone
   opens the dashboard.
-- The dashboard is bound to `127.0.0.1` and every mutating request needs the
-  session token printed at startup. It has no user accounts and no TLS — do not
-  expose it. See `README_WEB.md`.
+- The local server is bound to `127.0.0.1`; browser sessions are authenticated
+  and every mutation also requires the same-origin API token. Remote deployment
+  requires HTTPS, secure cookies, a reverse proxy and the production checks in
+  `PRODUCTION.md`.
 - Keep `trades.csv` and `arbicore.db`. They are how you find out whether the
   strategy actually made money after fees, rather than whether it felt like it.
 

@@ -21,6 +21,7 @@ Then open:
 """
 
 import contextlib
+import copy
 import csv
 import io
 import os
@@ -35,16 +36,24 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+import hashlib
+import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, g, jsonify, redirect, request, send_from_directory, Response, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import arbitrage_bot as bot
-from arbicore import alerts, auth as auth_security, config as arbiconfig, reconcile, risk, safety
+from arbicore import alerts, auth as auth_security, config as arbiconfig, intelligence, orders, reconcile, risk, safety, streaming
 from arbicore.vault import CredentialVault
+from arbicore.paper import PaperAccount
+from arbicore import signals
+from arbicore.exchange_signals import capabilities as signal_capabilities
+from arbicore.market import MarketOverview
+
+market_overview = MarketOverview(bot.EXCHANGES_MASTER, bot.DEMO_START_PRICES)
 
 app = Flask(__name__, static_folder=None)
 # Overridable so a test run - or a second instance - never writes into the
@@ -199,12 +208,18 @@ state_lock = threading.Lock()
 
 state = {
     "running": False,
+    "worker_status": "paused",
     "scan_count": 0,
+    "last_scan_started_at": None,
+    "last_scan_completed_at": None,
+    "last_scan_duration_seconds": None,
+    "last_scan_status": "paused",
+    "last_scan_message": "Engine is paused.",
     "trades_count": 0,
     "attempts_count": 0,
     "total_profit": 0.0,
-    "portfolio_value": 0.0,
-    "paper_portfolio_value": 0.0,
+    "portfolio_value": bot.PAPER_STARTING_BALANCE_USDT,
+    "paper_portfolio_value": bot.PAPER_STARTING_BALANCE_USDT,
     "live_portfolio_value": None,
     "start_value": 0.0,
     "portfolio_source": "paper_wallet",
@@ -241,6 +256,8 @@ state = {
         "max_consecutive_failures": bot.MAX_CONSECUTIVE_FAILURES,
         "max_orders_per_minute": bot.MAX_ORDERS_PER_MINUTE,
         "max_trades_per_hour": int(os.environ.get("ARBICORE_MAX_TRADES_PER_HOUR", "12")),
+        "intelligence_enabled": True,
+        "min_model_confidence": 0.65,
     },
     "active_exchanges": list(bot.EXCHANGES),
     "active_symbols": list(bot.SYMBOLS),
@@ -249,14 +266,91 @@ state = {
     "startup_check": None,
     "feed_health": {},
     "execution_safety": {},
+    "intelligence": {},
+    "private_order_stream": {"running": False, "last_error": "not initialized"},
     "error": None,
     "owner_user_id": None,
 }
 
 # Names and roles seen during this local server process. No passwords or API
 # credentials are stored here, and the directory resets on restart.
+DEFAULT_ACCOUNT_STATE = copy.deepcopy(state)
+DEFAULT_ACCOUNT_STATE["config"].update({
+    "mode": "live", "execution_mode": "paper",
+    "real_trading_enabled": False, "sandbox_mode": False,
+})
 session_users = {}
 user_credentials = {}
+execution_context = threading.local()
+WORKER_LEASE_ID = uuid.uuid4().hex
+# Long enough that a bounded multi-leg route can reconcile without another
+# process deciding the worker died and taking the same account.  A clean stop
+# releases immediately; only a crashed worker incurs this takeover delay.
+WORKER_LEASE_TTL_SECONDS = max(
+    60.0, float(os.environ.get("ARBICORE_WORKER_LEASE_TTL_SECONDS", "300")))
+
+
+def utc_now_iso():
+    """Timezone-aware timestamp used for all new operational records."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def current_credential_map(user_id=None):
+    """Return a private copy of one owner's credentials.
+
+    Exchange clients receive this mapping at construction and never read a
+    mutable process-global credential dictionary.  With no database owner (the
+    CLI/service path), the engine deliberately falls back to environment or
+    local configuration credentials for backward compatibility.
+    """
+    identity = state.get("owner_user_id") if user_id is None else user_id
+    if isinstance(identity, int) and identity > 0:
+        return {
+            exchange: dict(values)
+            for exchange, values in user_credentials.get(identity, {}).items()
+        }
+    return None
+
+
+def acquire_worker_lease(user_id):
+    if not isinstance(user_id, int) or user_id <= 0:
+        return True
+    now = time.time()
+    with db() as connection:
+        # One conditional UPSERT is atomic. A SELECT followed by REPLACE lets
+        # two processes both observe an empty row and both believe they own it.
+        cursor = connection.execute(
+            "INSERT INTO worker_leases "
+            "(user_id, lease_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "lease_id = excluded.lease_id, acquired_at = excluded.acquired_at, "
+            "heartbeat_at = excluded.heartbeat_at "
+            "WHERE worker_leases.lease_id = ? OR worker_leases.heartbeat_at < ?",
+            (user_id, WORKER_LEASE_ID, utc_now_iso(), now,
+             WORKER_LEASE_ID, now - WORKER_LEASE_TTL_SECONDS),
+        )
+        return cursor.rowcount == 1
+
+
+def heartbeat_worker_lease(user_id):
+    if not isinstance(user_id, int) or user_id <= 0:
+        return True
+    with db() as connection:
+        cursor = connection.execute(
+            "UPDATE worker_leases SET heartbeat_at = ? "
+            "WHERE user_id = ? AND lease_id = ?",
+            (time.time(), user_id, WORKER_LEASE_ID),
+        )
+        return cursor.rowcount == 1
+
+
+def release_worker_lease(user_id):
+    if isinstance(user_id, int) and user_id > 0:
+        with db() as connection:
+            connection.execute(
+                "DELETE FROM worker_leases WHERE user_id = ? AND lease_id = ?",
+                (user_id, WORKER_LEASE_ID),
+            )
 
 
 def request_user():
@@ -314,8 +408,6 @@ def require_engine_owner(user, claim=False):
     if owner_id is None and claim:
         state["owner_user_id"] = identity
         activate_user_context(identity)
-        for exchange, credentials in user_credentials.get(identity, {}).items():
-            bot.EXCHANGE_CREDENTIALS[exchange] = dict(credentials)
         return None
     if owner_id not in (None, identity):
         return "Another signed-in account owns the trading engine."
@@ -352,7 +444,27 @@ def activate_user_context(user_id):
     not rebuilt here: merely signing in must never contact an exchange or
     submit anything. The next Start/Test action initializes them deliberately.
     """
-    global wallet, feed, real_engine, active_symbols
+    global wallet, feed, real_engine, private_order_stream, active_symbols, risk_manager, execution_safety, market_intelligence
+    if private_order_stream is not None:
+        if private_order_stream.stop() is False:
+            raise RuntimeError(
+                "The previous owner's private order stream is still stopping; "
+                "account context was not switched.")
+        private_order_stream = None
+    if isinstance(user_id, int) and user_id > 0:
+        restored_credentials = load_encrypted_credentials(user_id)
+        if restored_credentials:
+            user_credentials[user_id] = restored_credentials
+    state["config"] = copy.deepcopy(DEFAULT_ACCOUNT_STATE["config"])
+    state["active_exchanges"] = list(DEFAULT_ACCOUNT_STATE["active_exchanges"])
+    state["active_symbols"] = list(DEFAULT_ACCOUNT_STATE["active_symbols"])
+    state["scan_count"] = 0
+    state["total_profit"] = 0.0
+    state["trades_count"] = 0
+    state["trades"] = []
+    state["recent"] = []
+    state["paper_profit_baseline"] = 0.0
+    state["signal_reports"] = {}
     payload = load_user_config(user_id)
     if payload:
         state["config"].update(payload.get("config") or {})
@@ -371,9 +483,58 @@ def activate_user_context(user_id):
     state["connection_verified_at"] = None
     state["connection_verification"] = None
     state["exchange_status"] = []
+    state["quotes"] = {}
+    state["mid_prices"] = {}
+    state["feed_health"] = {}
+    state["last_scan_started_at"] = None
+    state["last_scan_completed_at"] = None
+    state["last_scan_duration_seconds"] = None
+    state["last_scan_status"] = "paused"
+    state["last_scan_message"] = "Engine is paused."
     state["balances"] = {}
     state["balance_valuation"] = {"free_usdt": 0.0, "used_usdt": 0.0,
                                   "total_usdt": 0.0}
+    state["start_value"] = bot.PAPER_STARTING_BALANCE_USDT
+    state["paper_portfolio_value"] = bot.PAPER_STARTING_BALANCE_USDT
+    state["live_portfolio_value"] = None
+    state["portfolio_value"] = (bot.PAPER_STARTING_BALANCE_USDT
+                                if state["config"].get("execution_mode") == "paper"
+                                else None)
+    state["portfolio_source"] = ("paper_wallet"
+                                 if state["config"].get("execution_mode") == "paper"
+                                 else "exchange_balances")
+    state["unhedged_positions"] = load_persisted_recovery(user_id)
+    risk_manager = risk.RiskManager(risk_settings())
+    restored_risk = load_risk_state(user_id)
+    if restored_risk is not None:
+        try:
+            if restored_risk.get("_invalid_checkpoint"):
+                raise ValueError("risk checkpoint is not valid JSON")
+            if not risk_manager.restore_state(restored_risk):
+                raise ValueError("risk checkpoint has an invalid shape")
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            # A corrupt checkpoint must never be interpreted as an empty risk
+            # history. Halt and require an operator to investigate the ledger.
+            risk_manager = risk.RiskManager(risk_settings())
+            risk_manager.halt(
+                risk.HALT_RECONCILE,
+                f"Stored risk checkpoint could not be restored: {exc}")
+    else:
+        reconstruct_risk_from_history(risk_manager, user_id)
+    if restored_risk is None and state["unhedged_positions"]:
+        for position in state["unhedged_positions"]:
+            risk_manager.record_stranded(
+                position.get("recovery_exchange") or position.get("buy_exchange") or "",
+                bot.base_coin(position.get("symbol") or "UNKNOWN/USDT"),
+                position.get("quantity") or 0,
+                position.get("reason") or "persisted recovery position",
+            )
+    execution_safety = safety.ExecutionSafety()
+    market_intelligence = intelligence.OpportunityIntelligence()
+    state["risk"] = risk_manager.snapshot()
+    state["execution_safety"] = execution_safety.snapshot()
+    state["intelligence"] = market_intelligence.snapshot()
+    state["private_order_stream"] = {"running": False, "last_error": "not initialized"}
 
 
 def owner_read_error(user):
@@ -395,6 +556,16 @@ def db():
     """
     connection = sqlite3.connect(DB_FILE, timeout=10.0)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
+    # Set this before opening a transaction.  Doing it at the end of schema
+    # migration silently failed with "cannot change into wal mode from within
+    # a transaction", leaving dashboard reads able to block safety writes.
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        # Read-only/test filesystems may not permit sidecar WAL files.  The
+        # normal busy timeout still gives them deterministic behaviour.
+        pass
     try:
         with connection:
             yield connection
@@ -414,14 +585,36 @@ TRADE_COLUMNS = {
     "user_id": "INTEGER",
     "expected_profit_usdt": "REAL",
     "realized_slippage_usdt": "REAL",
+    "decision_confidence": "REAL",
+    "predicted_edge_pct": "REAL",
+    "adaptive_profit_floor_pct": "REAL",
+    "market_regime": "TEXT",
+    "data_mode": "TEXT",
+    "performance_mode": "TEXT DEFAULT 'legacy'",
 }
-RECOVERY_COLUMNS = {"user_id": "INTEGER"}
+RECOVERY_COLUMNS = {
+    "user_id": "INTEGER",
+    "status": "TEXT NOT NULL DEFAULT 'open'",
+    "updated_at": "TEXT",
+    "close_client_order_id": "TEXT",
+}
 BALANCE_COLUMNS = {"user_id": "INTEGER"}
 ORDER_INTENT_COLUMNS = {
     "exchange_order_id": "TEXT", "filled_quantity": "TEXT",
     "average_price": "TEXT", "fee_cost": "TEXT", "fee_currency": "TEXT",
-    "error": "TEXT", "details": "TEXT",
+    "error": "TEXT", "details": "TEXT", "route_id": "TEXT",
+    "terminal_at": "TEXT",
 }
+SOAK_RUN_COLUMNS = {
+    "confirmed_orders": "INTEGER NOT NULL DEFAULT 0",
+    "completed_routes": "INTEGER NOT NULL DEFAULT 0",
+    "reconciled_unknowns": "INTEGER NOT NULL DEFAULT 0",
+    "recovered_failures": "INTEGER NOT NULL DEFAULT 0",
+    "unresolved_intents": "INTEGER NOT NULL DEFAULT 0",
+    "config_fingerprint": "TEXT",
+    "code_fingerprint": "TEXT",
+}
+LEDGER_COLUMNS = {"amount_text": "TEXT"}
 
 
 def _add_missing_columns(connection, table, columns):
@@ -436,9 +629,53 @@ def _add_missing_columns(connection, table, columns):
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
 
+def performance_mode(cfg):
+    if cfg.get("strategy") == "signal_trend":
+        return "signal_paper"
+    if cfg.get("execution_mode") == "real":
+        return "testnet" if cfg.get("sandbox_mode") else "production"
+    return "paper" if cfg.get("mode") == "live" else "tutorial"
+
+
+def viewing_signal_history(user):
+    config = (state["config"] if state.get("owner_user_id") == user_identity(user)
+              else (load_user_config(user_identity(user)) or {}).get("config", {}))
+    return config.get("strategy") == "signal_trend"
+
+
+def load_paper_account(user_id, mode):
+    if not user_id:
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT payload FROM paper_accounts WHERE user_id=? AND mode=?",
+            (user_id, mode)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def save_paper_account(connection):
+    if not isinstance(wallet, PaperAccount) or not state.get("owner_user_id"):
+        return
+    if state["config"].get("execution_mode") == "real":
+        return
+    connection.execute(
+        "INSERT INTO paper_accounts(user_id,mode,payload,updated_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(user_id,mode) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at",
+        (state["owner_user_id"], performance_mode(state["config"]),
+         json.dumps(wallet.snapshot()), datetime.now().isoformat()))
+
+
 def initialize_database():
     with db() as connection:
         connection.executescript("""
+            CREATE TABLE IF NOT EXISTS paper_accounts (
+                user_id INTEGER NOT NULL, mode TEXT NOT NULL, payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL, PRIMARY KEY(user_id, mode)
+            );
+            CREATE TABLE IF NOT EXISTS account_preferences (
+                user_id INTEGER PRIMARY KEY, theme TEXT NOT NULL DEFAULT 'dark',
+                notifications TEXT NOT NULL DEFAULT 'all'
+            );
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 time TEXT NOT NULL,
@@ -580,6 +817,30 @@ def initialize_database():
                 used_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS risk_states (
+                user_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS order_events (
+                event_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                exchange TEXT NOT NULL,
+                client_order_id TEXT,
+                exchange_order_id TEXT,
+                event_type TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS worker_leases (
+                user_id INTEGER PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS trades_time ON trades (time);
             CREATE INDEX IF NOT EXISTS audit_events_time ON audit_events (created_at);
             CREATE INDEX IF NOT EXISTS auth_login_attempts_lookup
@@ -593,9 +854,12 @@ def initialize_database():
         _add_missing_columns(connection, "recovery_positions", RECOVERY_COLUMNS)
         _add_missing_columns(connection, "balance_snapshots", BALANCE_COLUMNS)
         _add_missing_columns(connection, "order_intents", ORDER_INTENT_COLUMNS)
+        _add_missing_columns(connection, "soak_runs", SOAK_RUN_COLUMNS)
+        _add_missing_columns(connection, "ledger_entries", LEDGER_COLUMNS)
         connection.execute("CREATE INDEX IF NOT EXISTS balance_snapshots_user_time ON balance_snapshots (user_id, created_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS order_intents_user_time ON order_intents (user_id, created_at)")
         connection.execute("CREATE INDEX IF NOT EXISTS soak_runs_user_time ON soak_runs (user_id, started_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS order_events_user_time ON order_events (user_id, event_time)")
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)",
             (datetime.now().isoformat(timespec="seconds"),),
@@ -623,8 +887,10 @@ def persist_trade(trade):
              profit_usdt, net_profit_pct, buy_order_id, middle_order_id,
              sell_order_id, status, buy_price, sell_price, execution_mode,
              strategy, filled_quantity, unsold_dust, user_id,
-             expected_profit_usdt, realized_slippage_usdt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             expected_profit_usdt, realized_slippage_usdt, decision_confidence,
+             predicted_edge_pct, adaptive_profit_floor_pct, market_regime,
+             data_mode, performance_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (trade["time"], trade["symbol"], trade["buy_exchange"],
              trade["sell_exchange"], trade["trade_size_usdt"],
              trade["profit_usdt"], trade["net_profit_pct"],
@@ -634,14 +900,19 @@ def persist_trade(trade):
              trade.get("execution_mode"), trade.get("strategy"),
              trade.get("filled_quantity"), trade.get("unsold_dust"),
              owner_id,
-             trade.get("expected_profit_usdt"), trade.get("realized_slippage_usdt")),
+             trade.get("expected_profit_usdt"), trade.get("realized_slippage_usdt"),
+             trade.get("decision_confidence"), trade.get("predicted_edge_pct"),
+             trade.get("adaptive_profit_floor_pct"), trade.get("market_regime"),
+             trade.get("data_mode"), trade.get("performance_mode", "legacy")),
         )
+        save_paper_account(connection)
         if owner_id is not None:
             connection.execute(
                 "INSERT INTO ledger_entries "
-                "(user_id, created_at, entry_type, asset, amount, reference, details) "
-                "VALUES (?, ?, 'realized_pnl', 'USDT', ?, ?, ?)",
+                "(user_id, created_at, entry_type, asset, amount, amount_text, reference, details) "
+                "VALUES (?, ?, 'realized_pnl', 'USDT', ?, ?, ?, ?)",
                 (owner_id, trade["time"], float(trade.get("profit_usdt") or 0),
+                 str(trade.get("profit_usdt") or 0),
                  f"trade:{cursor.lastrowid}", json.dumps({
                      "symbol": trade.get("symbol"), "status": trade.get("status"),
                      "execution_mode": trade.get("execution_mode"),
@@ -652,19 +923,42 @@ def persist_trade(trade):
 
 
 def persist_recovery(position):
+    owner = state.get("owner_user_id") if isinstance(state.get("owner_user_id"), int) else None
+    now = utc_now_iso()
     with db() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO recovery_positions "
-            "(buy_order_id, created_at, payload, user_id) VALUES (?, ?, ?, ?)",
-            (position.get("buy_order_id") or position["time"],
-             position["time"], json.dumps(position),
-             state.get("owner_user_id") if isinstance(state.get("owner_user_id"), int) else None),
+            "(buy_order_id, created_at, payload, user_id, status, updated_at) "
+            "VALUES (?, ?, ?, ?, 'open', ?)",
+            (position["buy_order_id"],
+             position["time"], json.dumps(position), owner, now),
         )
 
 
-def remove_persisted_recovery(order_id):
+def remove_persisted_recovery(order_id, user_id=None):
+    owner = state.get("owner_user_id") if user_id is None else user_id
     with db() as connection:
-        connection.execute("DELETE FROM recovery_positions WHERE buy_order_id = ?", (order_id,))
+        if isinstance(owner, int):
+            connection.execute(
+                "DELETE FROM recovery_positions WHERE buy_order_id = ? AND user_id = ?",
+                (order_id, owner))
+        else:
+            connection.execute(
+                "DELETE FROM recovery_positions WHERE buy_order_id = ? AND user_id IS NULL",
+                (order_id,))
+
+
+def update_persisted_recovery(order_id, position, status, close_client_order_id=None):
+    owner = state.get("owner_user_id")
+    with db() as connection:
+        if isinstance(owner, int):
+            connection.execute(
+                "UPDATE recovery_positions SET payload = ?, status = ?, updated_at = ?, "
+                "close_client_order_id = COALESCE(?, close_client_order_id) "
+                "WHERE buy_order_id = ? AND user_id = ?",
+                (json.dumps(position), status, utc_now_iso(), close_client_order_id,
+                 order_id, owner),
+            )
 
 
 def persist_balances(balances, valuation):
@@ -721,10 +1015,11 @@ def audit_event(action, outcome="ok", details=None, user=None):
         )
 
 
-def persist_encrypted_credentials(user_id, exchange, api_key, api_secret):
+def persist_encrypted_credentials(user_id, exchange, api_key, api_secret,
+                                  api_password=""):
     if not credential_vault.enabled:
         return False
-    ciphertext = credential_vault.encrypt(api_key, api_secret)
+    ciphertext = credential_vault.encrypt(api_key, api_secret, api_password)
     with db() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO exchange_credentials "
@@ -763,56 +1058,208 @@ def persist_user_config(user_id):
 
 
 def persist_order_intent(client_order_id, exchange, symbol, side, quantity):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = utc_now_iso()
     owner = state.get("owner_user_id")
     if not isinstance(owner, int):
         raise RuntimeError("A real order cannot be persisted without a user owner.")
     with db() as connection:
         connection.execute(
             "INSERT INTO order_intents "
-            "(client_order_id, user_id, exchange, symbol, side, quantity, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'intent', ?, ?)",
-            (client_order_id, owner, exchange, symbol, side, str(quantity), now, now),
+            "(client_order_id, user_id, exchange, symbol, side, quantity, status, "
+            "created_at, updated_at, route_id) VALUES (?, ?, ?, ?, ?, ?, 'intent', ?, ?, ?)",
+            (client_order_id, owner, exchange, symbol, side, str(quantity), now, now,
+             getattr(execution_context, "route_id", None)),
         )
 
 
 def update_order_intent(client_order_id, status, details=None):
     details = details if isinstance(details, dict) else {}
     fee = details.get("fee") if isinstance(details.get("fee"), dict) else {}
+    now = utc_now_iso()
+    normalized_status = str(status or "unknown").lower()
+    terminal = normalized_status in orders.TERMINAL_STATUSES or normalized_status == "filled"
     with db() as connection:
+        previous = connection.execute(
+            "SELECT user_id, status FROM order_intents WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if not previous:
+            return
+        previous_status = str(previous[1] or "").lower()
+        previous_terminal = (
+            previous_status in orders.TERMINAL_STATUSES
+            or previous_status in {"filled", "closed_no_fill", "accounted"})
+        event_payload = json.dumps(details, default=str, sort_keys=True)
+        event_key = hashlib.sha256(
+            f"{client_order_id}|{normalized_status}|{event_payload}".encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            "INSERT OR IGNORE INTO order_events "
+            "(event_key, user_id, exchange, client_order_id, exchange_order_id, "
+            "event_type, event_time, payload) "
+            "SELECT ?, user_id, exchange, client_order_id, ?, ?, ?, ? "
+            "FROM order_intents WHERE client_order_id = ?",
+            (event_key,
+             str(details.get("id") or details.get("order_id") or ""),
+             normalized_status, now, event_payload, client_order_id),
+        )
+        # WebSocket and REST acknowledgements race. Once an order is terminal,
+        # a delayed "open"/"reconciling" message must remain in the event log
+        # without regressing the durable state back to unresolved.
+        if previous_terminal and not terminal:
+            return
         connection.execute(
             "UPDATE order_intents SET status = ?, updated_at = ?, "
             "exchange_order_id = COALESCE(?, exchange_order_id), "
             "filled_quantity = COALESCE(?, filled_quantity), "
             "average_price = COALESCE(?, average_price), "
             "fee_cost = COALESCE(?, fee_cost), fee_currency = COALESCE(?, fee_currency), "
-            "error = COALESCE(?, error), details = COALESCE(?, details) "
+            "error = COALESCE(?, error), details = COALESCE(?, details), "
+            "terminal_at = CASE WHEN ? THEN COALESCE(terminal_at, ?) ELSE terminal_at END "
             "WHERE client_order_id = ?",
-            (status, datetime.now().isoformat(timespec="seconds"),
+            (normalized_status, now,
              str(details.get("id") or details.get("order_id")) if (details.get("id") or details.get("order_id")) is not None else None,
              str(details.get("filled", details.get("filled_quantity"))) if details.get("filled", details.get("filled_quantity")) is not None else None,
              str(details.get("average", details.get("average_price"))) if details.get("average", details.get("average_price")) is not None else None,
              str(fee.get("cost", details.get("fee_cost"))) if fee.get("cost", details.get("fee_cost")) is not None else None,
              str(fee.get("currency", details.get("fee_currency"))) if fee.get("currency", details.get("fee_currency")) is not None else None,
-             str(details.get("error")) if details.get("error") else None,
-             json.dumps(details, default=str) if details else None,
-             client_order_id),
+              str(details.get("error")) if details.get("error") else None,
+              json.dumps(details, default=str) if details else None,
+              int(terminal), now,
+              client_order_id),
         )
+        if (active_soak_run_id is not None and terminal
+                and not previous_terminal):
+            connection.execute(
+                "UPDATE soak_runs SET confirmed_orders = confirmed_orders + 1, "
+                "reconciled_unknowns = reconciled_unknowns + ? WHERE id = ?",
+                (int(previous_status == "ambiguous"), active_soak_run_id),
+            )
 
 
-def load_persisted_recovery():
+def load_persisted_recovery(user_id=None):
+    owner = state.get("owner_user_id") if user_id is None else user_id
+    with db() as connection:
+        if isinstance(owner, int):
+            rows = connection.execute(
+                "SELECT buy_order_id, payload FROM recovery_positions WHERE user_id = ? "
+                "AND COALESCE(status, 'open') != 'closed' ORDER BY created_at DESC",
+                (owner,)).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT buy_order_id, payload FROM recovery_positions WHERE user_id IS NULL "
+                "AND COALESCE(status, 'open') != 'closed' ORDER BY created_at DESC"
+            ).fetchall()
+    positions = []
+    for recovery_id, payload in rows:
+        try:
+            position = json.loads(payload)
+            if not isinstance(position, dict):
+                raise ValueError("recovery payload is not an object")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Do not let database damage erase evidence that inventory may be
+            # open. This synthetic record is deliberately non-closeable until
+            # an operator reconciles the exchange account.
+            position = {
+                "time": "",
+                "status": "manual_recovery_required",
+                "symbol": "UNKNOWN/USDT",
+                "recovery_exchange": "unknown",
+                "quantity": 0.0,
+                "quantity_confirmed": False,
+                "error": "Persisted recovery record is unreadable; reconcile manually.",
+            }
+        position["buy_order_id"] = str(
+            position.get("buy_order_id") or recovery_id)
+        positions.append(position)
+    return positions
+
+
+state["unhedged_positions"] = []
+
+
+def persist_risk_state(user_id=None):
+    """Durably checkpoint the active user's latching safety state."""
+    owner = state.get("owner_user_id") if user_id is None else user_id
+    if not isinstance(owner, int) or owner <= 0:
+        return False
+    payload = json.dumps(risk_manager.export_state(), sort_keys=True)
+    with db() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO risk_states (user_id, payload, updated_at) "
+            "VALUES (?, ?, ?)", (owner, payload, utc_now_iso()))
+    return True
+
+
+def load_risk_state(user_id):
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT payload FROM risk_states WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[0])
+        if not isinstance(payload, dict):
+            raise ValueError("risk checkpoint is not an object")
+        return payload
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.warning("Marking unreadable risk checkpoint unsafe for user %s", user_id)
+        return {"_invalid_checkpoint": True}
+
+
+def reconstruct_risk_from_history(manager, user_id):
+    """Fail-safe migration path for users created before durable risk state."""
+    if not isinstance(user_id, int) or user_id <= 0:
+        return manager
+    today = datetime.now(timezone.utc).date().isoformat()
+    with db() as connection:
+        profits = connection.execute(
+            "SELECT profit_usdt FROM trades WHERE user_id = ? AND substr(time, 1, 10) = ? "
+            "ORDER BY id", (user_id, today),
+        ).fetchall()
+        snapshots = connection.execute(
+            "SELECT payload FROM balance_snapshots WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    for (profit,) in profits:
+        manager.record_success(profit or 0)
+    for (payload,) in snapshots:
+        try:
+            total = (json.loads(payload).get("valuation") or {}).get("total_usdt")
+            if total is not None:
+                manager.update_equity(total)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return manager
+
+
+def unresolved_order_intents(user_id):
+    """Rows which cannot be ignored after a crash or process restart."""
+    if not isinstance(user_id, int) or user_id <= 0:
+        return []
+    terminal = tuple(sorted(
+        orders.TERMINAL_STATUSES | {"filled", "closed_no_fill", "accounted"}))
+    placeholders = ",".join("?" for _ in terminal)
     with db() as connection:
         rows = connection.execute(
-            "SELECT payload FROM recovery_positions ORDER BY created_at DESC"
+            "SELECT client_order_id, exchange, symbol, side, quantity, status, "
+            "exchange_order_id, details FROM order_intents WHERE user_id = ? "
+            f"AND LOWER(status) NOT IN ({placeholders}) ORDER BY created_at",
+            (user_id, *terminal),
         ).fetchall()
-    return [json.loads(row[0]) for row in rows]
-
-
-state["unhedged_positions"] = load_persisted_recovery()
+    return [{
+        "client_order_id": row[0], "exchange": row[1], "symbol": row[2],
+        "side": row[3], "quantity": row[4], "status": row[5],
+        "exchange_order_id": row[6], "detail": row[7] or "",
+    } for row in rows]
 
 wallet = None
 feed = None
 real_engine = None
+private_order_stream = None
 active_symbols = []
 
 _thread = None
@@ -827,29 +1274,90 @@ STOP_JOIN_TIMEOUT = 25.0   # a two-leg real trade can legitimately take this
                            # long to reconcile; a rebuild must wait it out
 CONNECTION_VERIFICATION_TTL_SECONDS = 300
 REQUIRED_TESTNET_CYCLES = int(os.environ.get("ARBICORE_REQUIRED_TESTNET_CYCLES", "100"))
+REQUIRED_TESTNET_RECOVERIES = int(os.environ.get("ARBICORE_REQUIRED_TESTNET_RECOVERIES", "1"))
 TESTNET_FAILURE_EVERY = int(os.environ.get("ARBICORE_TESTNET_FAILURE_EVERY", "0"))
 active_soak_run_id = None
 trade_times_hour = deque()
 
 
+def execution_symbols(config=None, selected=None):
+    """Symbols the order engine can actually touch for the selected strategy."""
+    config = config or state["config"]
+    selected = selected if selected is not None else state["active_symbols"]
+    if config.get("strategy") == "triangular":
+        # LiveFeed uses this as a hard route whitelist, so connection testing and
+        # readiness must test these legs rather than unrelated dashboard pairs.
+        return ["BTC/USDT", "ETH/BTC", "ETH/USDT"]
+    return list(selected or [])
+
+
+def qualification_fingerprints():
+    qualification_config = {
+        "strategy": state["config"].get("strategy"),
+        "exchanges": list(state.get("active_exchanges") or []),
+        "symbols": execution_symbols(),
+        "trade_size": state["config"].get("trade_size"),
+        "min_profit": state["config"].get("min_profit"),
+        "max_slippage": state["config"].get("max_slippage"),
+        "intelligence_enabled": state["config"].get("intelligence_enabled", True),
+        "min_model_confidence": state["config"].get("min_model_confidence", 0.65),
+        "max_daily_loss": state["config"].get("max_daily_loss"),
+        "max_position_notional": state["config"].get("max_position_notional"),
+    }
+    config_hash = hashlib.sha256(
+        json.dumps(qualification_config, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    digest = hashlib.sha256()
+    for name in ("server.py", "arbitrage_bot.py", "arbicore/orders.py",
+                 "arbicore/risk.py", "arbicore/reconcile.py",
+                 "arbicore/intelligence.py", "arbicore/signals.py",
+                 "arbicore/brackets.py", "arbicore/exchange_signals.py",
+                 "arbicore/okx_demo.py", "arbicore/bybit_demo.py"):
+        path = Path(__file__).with_name(name) if "/" not in name else Path(__file__).parent / name
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(name.encode("utf-8"))
+    return config_hash, digest.hexdigest()
+
+
 def production_soak_status(user_id):
     if not isinstance(user_id, int) or REQUIRED_TESTNET_CYCLES <= 0:
-        return {"required": REQUIRED_TESTNET_CYCLES, "completed": 0, "ready": app.testing}
+        return {"required": REQUIRED_TESTNET_CYCLES, "completed": 0,
+                "required_recoveries": REQUIRED_TESTNET_RECOVERIES,
+                "recovered_failures": 0, "confirmed_orders": 0,
+                "ready": app.testing}
+    config_hash, code_hash = qualification_fingerprints()
     with db() as connection:
-        completed = connection.execute(
-            "SELECT COALESCE(MAX(successful_cycles), 0) FROM soak_runs "
-            "WHERE user_id = ? AND status = 'completed'", (user_id,),
-        ).fetchone()[0]
-    return {"required": REQUIRED_TESTNET_CYCLES, "completed": int(completed),
-            "ready": int(completed) >= REQUIRED_TESTNET_CYCLES}
+        row = connection.execute(
+            "SELECT COALESCE(SUM(completed_routes), 0), "
+            "COALESCE(SUM(confirmed_orders), 0), "
+            "COALESCE(SUM(recovered_failures), 0), "
+            "COALESCE(SUM(unresolved_intents), 0) FROM soak_runs "
+            "WHERE user_id = ? AND status = 'completed' "
+            "AND config_fingerprint = ? AND code_fingerprint = ?",
+            (user_id, config_hash, code_hash),
+        ).fetchone()
+    completed, confirmed_orders, recovered, unresolved = map(int, row)
+    ready = (completed >= REQUIRED_TESTNET_CYCLES
+             and recovered >= REQUIRED_TESTNET_RECOVERIES
+             and unresolved == 0
+             and confirmed_orders >= completed * 2)
+    return {"required": REQUIRED_TESTNET_CYCLES, "completed": completed,
+            "required_recoveries": REQUIRED_TESTNET_RECOVERIES,
+            "recovered_failures": recovered, "confirmed_orders": confirmed_orders,
+            "unresolved_intents": unresolved, "config_fingerprint": config_hash,
+            "code_fingerprint": code_hash, "ready": ready}
 
 
 def increment_soak_cycle():
+    """Record one fully persisted, confirmed Testnet route (not a scan)."""
     if active_soak_run_id is None:
         return
     with db() as connection:
         connection.execute(
-            "UPDATE soak_runs SET successful_cycles = successful_cycles + 1 "
+            "UPDATE soak_runs SET successful_cycles = successful_cycles + 1, "
+            "completed_routes = completed_routes + 1 "
             "WHERE id = ?", (active_soak_run_id,),
         )
 
@@ -863,6 +1371,22 @@ def record_injected_soak_failure():
             (active_soak_run_id,),
         )
 
+
+def complete_soak_run():
+    """Finish the active run and persist whether any order remains unknown."""
+    global active_soak_run_id
+    if active_soak_run_id is None:
+        return
+    owner = state.get("owner_user_id")
+    unresolved = len(unresolved_order_intents(owner))
+    with db() as connection:
+        connection.execute(
+            "UPDATE soak_runs SET completed_at = ?, status = 'completed', "
+            "unresolved_intents = ? WHERE id = ?",
+            (utc_now_iso(), unresolved, active_soak_run_id),
+        )
+    active_soak_run_id = None
+
 # Config keys whose change can rebuild the feed, wallet or exchange clients.
 # A rebuild is only safe with the scan thread stopped and joined.
 REBUILD_KEYS = ("mode", "execution_mode", "strategy", "real_trading_enabled", "sandbox_mode",
@@ -875,6 +1399,7 @@ notifier = alerts.Notifier(
     min_severity=alerts.WARNING)
 risk_manager = risk.RiskManager(arbiconfig.Settings())
 execution_safety = safety.ExecutionSafety()
+market_intelligence = intelligence.OpportunityIntelligence()
 
 
 # Dashboard field name -> the Settings field holding the same quantity. The
@@ -992,6 +1517,7 @@ def validate_config_update(data):
         "max_consecutive_failures": lambda value: value >= 1,
         "max_orders_per_minute": lambda value: value >= 1,
         "max_trades_per_hour": lambda value: value >= 1,
+        "min_model_confidence": lambda value: 0.65 <= value <= 0.99,
     }
     for key, is_valid in limits.items():
         if key not in data:
@@ -1003,6 +1529,9 @@ def validate_config_update(data):
         if not math.isfinite(value) or not is_valid(value):
             return f"{key} has an invalid value."
     # Then the same values as one configuration, so the cross-field rules apply.
+    proposed = {**state["config"], **data}
+    if proposed.get("strategy") == "signal_trend" and proposed.get("execution_mode") != "paper":
+        return "Signal trend is paper-only. Real orders are not supported for this strategy."
     try:
         problems = proposed_settings(data).validate()
     except (KeyError, TypeError, ValueError) as exc:
@@ -1014,7 +1543,7 @@ def recommended_scan_interval(config=None, exchanges=None, symbols=None):
     """Conservative floor that keeps public REST requests below bursty rates."""
     config = config or state["config"]
     exchanges = exchanges or state["active_exchanges"]
-    symbols = symbols or state["active_symbols"]
+    symbols = execution_symbols(config, symbols)
     if os.environ.get("ARBICORE_STREAMING") == "1" and config.get("mode") == "live":
         return 0.5
     request_load = max(1, len(exchanges)) * max(1, len(symbols))
@@ -1024,8 +1553,10 @@ def recommended_scan_interval(config=None, exchanges=None, symbols=None):
 def get_readiness():
     """Return safe, non-secret startup status for the dashboard."""
     configured = []
+    credential_map = current_credential_map()
     for exchange in state["active_exchanges"]:
-        credentials = bot.resolve_credentials(exchange)
+        credentials = (bot._credentials_from_map(exchange, credential_map)
+                       if credential_map is not None else bot.resolve_credentials(exchange))
         configured.append({
             "exchange": exchange,
             "configured": credentials.complete,
@@ -1038,39 +1569,60 @@ def get_readiness():
     if not state["config"]["real_trading_enabled"]:
         return {"ready": False, "message": "Real trading is not explicitly enabled.",
                 "target": target, "credentials": configured}
-    validation = bot.validate_real_trading_config()
+    validation = bot.validate_real_trading_config(credential_map)
     verification = state.get("connection_verification") or {}
     expected_context = {
         "target": target,
         "exchanges": list(state["active_exchanges"]),
         "strategy": state["config"].get("strategy"),
+        "symbols": execution_symbols(),
+        "config_fingerprint": qualification_fingerprints()[0],
     }
     verified_at = verification.get("verified_at")
     verified = False
     if verified_at and all(verification.get(key) == value
                            for key, value in expected_context.items()):
         try:
-            age = (datetime.now() - datetime.fromisoformat(verified_at)).total_seconds()
+            age = time.time() - datetime.fromisoformat(verified_at).timestamp()
             verified = 0 <= age <= CONNECTION_VERIFICATION_TTL_SECONDS
         except (TypeError, ValueError):
             verified = False
     soak = production_soak_status(state.get("owner_user_id"))
     soak_ready = target != "production" or soak["ready"]
-    ready = validation["ok"] and verified and soak_ready
+    private_stream_ready = (target != "production" or (
+        private_order_stream is not None
+        and private_order_stream.health().get("running")))
+    unresolved = unresolved_order_intents(state.get("owner_user_id"))
+    recovery_open = bool(state.get("unhedged_positions"))
+    ready = (validation["ok"] and verified and soak_ready and private_stream_ready
+             and not unresolved
+             and not recovery_open and not risk_manager.halted)
     message = validation["message"]
     if validation["ok"] and target == "production" and not soak_ready:
         message = (f"Complete {soak['required']} successful Binance Testnet cycles first "
                    f"({soak['completed']} recorded).")
+    elif validation["ok"] and target == "production" and not private_stream_ready:
+        message = "Authenticated private order streaming is unavailable."
     elif validation["ok"] and not verified:
         failed_status = next((item for item in state.get("exchange_status", [])
                               if not item.get("ok") and item.get("error")), None)
         message = (f"Exchange test failed at {failed_status.get('stage', 'connection')}: "
                    f"{failed_status['error']}" if failed_status else
-                   "Configuration is valid; test authenticated exchange access before starting.")
+                    "Configuration is valid; test authenticated exchange access before starting.")
+    elif unresolved:
+        message = f"{len(unresolved)} unresolved order intent(s) require reconciliation."
+    elif recovery_open:
+        message = f"{len(state['unhedged_positions'])} recovery position(s) remain open."
+    elif risk_manager.halted:
+        message = f"Risk controls are halted: {risk_manager.halt_reason}"
     return {"ready": ready, "config_valid": validation["ok"], "message": message,
             "target": target, "credentials": configured,
             "connection_verified_at": verified_at if verified else None,
+            "unresolved_order_intents": len(unresolved),
+            "recovery_positions": len(state.get("unhedged_positions") or []),
             "testnet_soak": soak,
+            "private_order_stream": (private_order_stream.health()
+                                     if private_order_stream else state["private_order_stream"]),
             "connection_verification_ttl_seconds": CONNECTION_VERIFICATION_TTL_SECONDS}
 
 
@@ -1104,6 +1656,77 @@ def collect_live_balances(engine=None, exchanges=None, symbols=None):
     return refreshed, valuation
 
 
+def inventory_readiness(engine, config_snapshot, exchanges, symbols, balances):
+    """Return route-specific balance/filter blockers before Start is enabled."""
+    errors = []
+    trade_size = float(config_snapshot["trade_size"])
+    usable = {
+        exchange: values for exchange, values in (balances or {}).items()
+        if isinstance(values, dict) and "error" not in values
+    }
+
+    def free(exchange, currency):
+        values = usable.get(exchange, {}).get(currency, {})
+        return float(values.get("free", 0.0) if isinstance(values, dict) else 0.0)
+
+    if config_snapshot["strategy"] == "triangular":
+        exchange = exchanges[0]
+        free_usdt = free(exchange, "USDT")
+        required = trade_size * 1.02
+        if free_usdt < required:
+            errors.append(
+                f"{exchange} needs at least {required:.2f} free USDT for a "
+                f"{trade_size:.2f} USDT route plus fee/rounding headroom; "
+                f"only {free_usdt:.2f} is available.")
+    else:
+        for symbol in symbols:
+            base = bot.base_coin(symbol)
+            viable = []
+            reasons = []
+            for buy_exchange in exchanges:
+                if free(buy_exchange, "USDT") < trade_size * 1.02:
+                    continue
+                try:
+                    quote = engine.fetch_ticker(buy_exchange, symbol)
+                    ask = float(quote.get("ask") or 0.0)
+                    fee = engine.taker_fee(buy_exchange, symbol)
+                    amount = engine.plan_buy_quantity(
+                        buy_exchange, symbol, trade_size, ask, fee)
+                    engine.validate_order_constraints(
+                        buy_exchange, symbol, amount, ask)
+                except Exception as exc:
+                    reasons.append(f"{buy_exchange}: {exc}")
+                    continue
+                for sell_exchange in exchanges:
+                    if sell_exchange == buy_exchange:
+                        continue
+                    if free(sell_exchange, base) >= amount:
+                        viable.append((buy_exchange, sell_exchange))
+            if not viable:
+                detail = f" ({'; '.join(reasons[:2])})" if reasons else ""
+                errors.append(
+                    f"No prefunded {symbol} route is viable: the buy venue needs "
+                    f"USDT and a different sell venue needs enough {base}.{detail}")
+
+    free_usdt_total = sum(free(exchange, "USDT") for exchange in exchanges)
+    if free_usdt_total > 0:
+        if float(config_snapshot["max_position_notional"]) > free_usdt_total * 0.50:
+            errors.append(
+                "Maximum position must be no more than 50% of available free USDT.")
+        if float(config_snapshot["max_daily_loss"]) > free_usdt_total * 0.10:
+            errors.append(
+                "Maximum daily loss must be no more than 10% of available free USDT.")
+    return errors
+
+
+def exchange_taker_fee(engine, exchange, symbol):
+    """Call the symbol-aware fee API, retaining adapter compatibility."""
+    try:
+        return engine.taker_fee(exchange, symbol)
+    except TypeError:
+        return engine.taker_fee(exchange)
+
+
 def publish_live_balances(refreshed, valuation):
     """The state half. Call with `state_lock` held."""
     state["balances"] = refreshed
@@ -1118,6 +1741,11 @@ def refresh_live_balances():
     if refreshed is None:
         return
     publish_live_balances(refreshed, valuation)
+    if not any(isinstance(values, dict) and "error" in values
+               for values in refreshed.values()):
+        risk_manager.update_equity(valuation["total_usdt"])
+        state["risk"] = risk_manager.snapshot()
+        persist_risk_state()
     persist_balances(refreshed, valuation)
 
 
@@ -1125,18 +1753,36 @@ def refresh_live_balances():
 #  ENGINE  (thin wrapper around arbitrage_bot.py's own classes)
 # ------------------------------------------------------------------
 
+def handle_private_order_event(exchange, payload):
+    """Persist a deduplicated authenticated order update from the venue."""
+    client_order_id = str(
+        payload.get("clientOrderId")
+        or (payload.get("info") or {}).get("clientOrderId") or "")
+    if not client_order_id:
+        return
+    update_order_intent(
+        client_order_id, str(payload.get("status") or "order_update").lower(), payload)
+
+
 def init_engine():
     """(Re)builds the feed + paper wallet from the current config.
     Must be called with state_lock held."""
-    global wallet, feed, real_engine, active_symbols
+    global wallet, feed, real_engine, private_order_stream, active_symbols, market_intelligence
 
     previous_stream = getattr(feed, "stream", None) if feed is not None else None
     if previous_stream:
         previous_stream.stop()
+    if private_order_stream is not None:
+        if private_order_stream.stop() is False:
+            raise RuntimeError(
+                "The existing private order stream did not stop; engine rebuild refused.")
+        private_order_stream = None
 
     mode = state["config"]["mode"]
     execution_mode = state["config"]["execution_mode"]
     strategy = state["config"]["strategy"]
+    if strategy == "signal_trend" and state["config"].get("execution_mode") != "paper":
+        raise ValueError("Signal trend is paper-only")
     exchanges = state["active_exchanges"]
     symbols = state["active_symbols"]
 
@@ -1156,14 +1802,40 @@ def init_engine():
     bot.DEMO_GAP_CHANCE = state["config"]["gap_chance"]
     bot.REAL_TRADING_ENABLED = bool(state["config"].get("real_trading_enabled", bot.REAL_TRADING_ENABLED))
     bot.SANDBOX_MODE = bool(state["config"].get("sandbox_mode", bot.SANDBOX_MODE))
+    # A model trained on a different venue/symbol configuration is not valid
+    # evidence for the rebuilt engine.  Real execution warms up again and stays
+    # fail-closed until the new markets have enough observations.
+    market_intelligence = intelligence.OpportunityIntelligence()
+    state["intelligence"] = market_intelligence.snapshot()
 
     if execution_mode == "real":
         if mode != "live" or not bot.REAL_TRADING_ENABLED:
             raise ValueError("Real execution requires live mode and explicit real-trading enablement.")
-        validation = bot.validate_real_trading_config()
+        credential_map = current_credential_map()
+        validation = bot.validate_real_trading_config(credential_map)
         if not validation["ok"]:
             raise ValueError(validation["message"])
-        real_engine = bot.RealExecutionEngine(exchanges)
+        real_engine = bot.RealExecutionEngine(exchanges, credential_map)
+        try:
+            stream_credentials = credential_map or {
+                exchange: bot.resolve_credentials(exchange).ccxt_params()
+                for exchange in exchanges
+            }
+            private_order_stream = streaming.PrivateOrderStream(
+                exchanges, stream_credentials, sandbox=bot.SANDBOX_MODE,
+                on_event=handle_private_order_event)
+            if not private_order_stream.start():
+                raise RuntimeError(private_order_stream.last_error
+                                   or "private order stream did not start")
+            real_engine.order_stream = private_order_stream
+            state["private_order_stream"] = private_order_stream.health()
+        except Exception as exc:
+            private_order_stream = None
+            real_engine.order_stream = None
+            state["private_order_stream"] = {
+                "running": False,
+                "last_error": f"{type(exc).__name__}: {exc}",
+            }
     else:
         real_engine = None
 
@@ -1171,13 +1843,14 @@ def init_engine():
 
     if strategy == "triangular" and mode != "live":
         raise ValueError("Triangular strategy currently requires live market data.")
-    engine_symbols = ["BTC/USDT", "ETH/BTC", "ETH/USDT"] if strategy == "triangular" else symbols
+    engine_symbols = execution_symbols(state["config"], symbols)
     routes = []
     bot.SYMBOLS = engine_symbols
 
     try:
         if mode == "live":
             feed = bot.LiveFeed(exchanges, engine_symbols)
+            wallet_exchanges = list(feed.clients)
             if strategy == "triangular":
                 routes = feed.routes
                 engine_symbols = list(dict.fromkeys(
@@ -1191,15 +1864,21 @@ def init_engine():
                     start_prices[sym] = sum(prices) / len(prices)
         else:
             feed = bot.DemoFeed(exchanges, symbols)
+            wallet_exchanges = list(exchanges)
             start_prices = {s: bot.DEMO_START_PRICES[s] for s in symbols
                              if s in bot.DEMO_START_PRICES}
 
         active_symbols = [s for s in engine_symbols if s in start_prices]
         state["triangular_routes"] = routes
         state["config"]["triangular_routes"] = routes
-        state["feed_health"] = feed_health()
-        wallet = bot.PaperWallet(exchanges, active_symbols,
-                                  bot.START_CASH_PER_EXCHANGE, start_prices)
+        if mode == "live":
+            state["quotes"] = first
+        state["feed_health"] = feed_health(first if mode == "live" else None)
+        wallet = PaperAccount(
+            wallet_exchanges, active_symbols, bot.PAPER_STARTING_BALANCE_USDT,
+            start_prices, strategy,
+            snapshot=load_paper_account(state.get("owner_user_id"), performance_mode(state["config"]))
+            if execution_mode != "real" else None)
         if execution_mode == "real":
             expected_balances = load_expected_balances(state.get("owner_user_id"))
             refresh_live_balances()
@@ -1209,34 +1888,70 @@ def init_engine():
             run_startup_check(active_symbols, start_prices, expected_balances)
         else:
             state["startup_check"] = None
-            state["start_value"] = wallet.total_value(start_prices)
-            state["portfolio_value"] = state["start_value"]
-            state["paper_portfolio_value"] = state["start_value"]
+            state["start_value"] = wallet.initial
+            state["portfolio_value"] = wallet.total_value(start_prices)
+            state["paper_portfolio_value"] = state["portfolio_value"]
+            state["paper_profit_baseline"] = state["total_profit"]
             state["portfolio_source"] = "paper_wallet"
+            with db() as connection:
+                save_paper_account(connection)
         state["error"] = None
     except Exception as e:
+        stream_to_stop = private_order_stream
+        private_order_stream = None
+        if real_engine is not None:
+            real_engine.order_stream = None
+        if stream_to_stop is not None:
+            stream_to_stop.stop()
         state["error"] = f"engine init failed: {e}"
         raise
 
 
-def feed_health():
+def feed_health(quotes=None):
     """What the last quote pass actually managed to price."""
     if feed is None:
         return {}
+    current_quotes = (state.get("quotes") or {}) if quotes is None else (quotes or {})
+    required_venues = 1 if state["config"].get("strategy") in ("triangular", "signal_trend") else 2
+    usable_symbols = sum(
+        1 for venue_quotes in current_quotes.values()
+        if len(venue_quotes or {}) >= required_venues
+    )
+    total_quotes = sum(len(venue_quotes or {})
+                       for venue_quotes in current_quotes.values())
+    rejected = getattr(feed, "rejected_quotes", {}) or {}
+    if usable_symbols:
+        feed_status = "online" if not rejected else "degraded"
+    else:
+        feed_status = "offline" if rejected else "warming_up"
     health = {
         "symbols": len(getattr(feed, "symbols", []) or []),
+        "usable_symbols": usable_symbols,
+        "total_quotes": total_quotes,
         "routes": len(getattr(feed, "routes", []) or []),
         "route_candidates": getattr(feed, "route_candidates", 0),
         "fetch_seconds": round(getattr(feed, "last_fetch_seconds", 0.0), 3),
         "source": getattr(feed, "last_source", "unknown"),
+        "status": feed_status,
         "stream_error": getattr(feed, "stream_error", ""),
         "stream": (getattr(getattr(feed, "stream", None), "cache", None).health()
                    if getattr(feed, "stream", None) else None),
         "rejected": {name: len(reasons) for name, reasons
-                     in (getattr(feed, "rejected_quotes", {}) or {}).items()},
+                     in rejected.items()},
     }
     health["execution_guard"] = execution_safety.snapshot()
     return health
+
+
+def publish_scan_result(status, message, started_at):
+    """Publish an observable scan heartbeat without inventing a trade event."""
+    completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with state_lock:
+        state["last_scan_completed_at"] = completed
+        state["last_scan_duration_seconds"] = round(
+            max(0.0, time.perf_counter() - started_at), 3)
+        state["last_scan_status"] = status
+        state["last_scan_message"] = message
 
 
 def available_quote_balance(candidate):
@@ -1264,9 +1979,72 @@ def safe_candidate_size(cfg, candidate):
     remaining_loss = max(
         0.0, float(cfg.get("max_daily_loss", 0.0))
         + min(0.0, float(risk_manager.realized_today)))
+    legs = max(1, int(candidate.get("legs", 2)))
+    worst_case_loss_pct = (
+        2.0 + float(cfg.get("max_slippage", 0.25)) * legs
+        + float(cfg.get("fee", 0.001)) * 100.0 * legs)
     sized = execution_safety.dynamic_size(
-        configured, free_quote, remaining_loss)
+        configured, free_quote, remaining_loss,
+        volatility_pct=(candidate.get("intelligence") or {}).get(
+            "volatility_pct", 0.0),
+        worst_case_loss_pct=worst_case_loss_pct)
     return float(sized)
+
+
+def reconcile_persisted_order_intents(engine, user_id):
+    """Resolve crash-left order intents before any new route is allowed.
+
+    A confirmed zero-fill terminal order is safe to close.  Any positive fill
+    remains a blocking manual-accounting record because the process cannot know
+    which later legs or external trades occurred after it crashed.
+    """
+    pending = []
+    for record in unresolved_order_intents(user_id):
+        client = engine.clients.get(record["exchange"])
+        if client is None:
+            record["reason"] = "exchange client is unavailable for reconciliation"
+            pending.append(record)
+            continue
+        found = None
+        exchange_order_id = record.get("exchange_order_id")
+        if exchange_order_id and callable(getattr(client, "fetch_order", None)):
+            try:
+                found = client.fetch_order(exchange_order_id, record["symbol"])
+            except Exception:
+                found = None
+        if not found:
+            found = orders.find_by_client_id(
+                client, record["symbol"], record["client_order_id"])
+        if not found:
+            record["reason"] = (
+                "the exchange could not conclusively locate this submitted order")
+            pending.append(record)
+            continue
+        try:
+            fill = orders.reconcile_order(
+                client, record["exchange"], record["symbol"], record["side"],
+                record["quantity"], found)
+        except orders.OrderReconciliationError as exc:
+            update_order_intent(record["client_order_id"], "ambiguous", {
+                "id": exchange_order_id, "error": str(exc)})
+            record["reason"] = str(exc)
+            pending.append(record)
+            continue
+        details = fill.as_dict()
+        if fill.filled_quantity <= 0:
+            update_order_intent(
+                record["client_order_id"], fill.status or "closed_no_fill", details)
+            continue
+        update_order_intent(
+            record["client_order_id"], "manual_accounting_required", details)
+        record.update({
+            "reason": (f"crash recovery found a {float(fill.filled_quantity):.8f} "
+                       f"fill; reconcile account inventory manually"),
+            "filled_quantity": str(fill.filled_quantity),
+            "exchange_order_id": fill.order_id,
+        })
+        pending.append(record)
+    return pending
 
 
 def run_startup_check(symbols, prices, expected_balances=None):
@@ -1281,13 +2059,18 @@ def run_startup_check(symbols, prices, expected_balances=None):
         state["startup_check"] = None
         return None
 
+    owner = state.get("owner_user_id")
+    pending_intents = reconcile_persisted_order_intents(real_engine, owner)
     report = reconcile.startup_check(
         real_engine.clients, symbols,
         expected_balances=expected_balances,
         prices=prices,
-        pending_records=[p for p in state["unhedged_positions"]
-                         if p.get("status") == "manual_recovery_required"],
-        max_clock_skew_ms=getattr(bot, "MAX_CLOCK_SKEW_MS", 2000))
+        pending_records=(
+            [p for p in state["unhedged_positions"]
+             if p.get("status") == "manual_recovery_required"]
+            + pending_intents),
+        max_clock_skew_ms=getattr(bot, "MAX_CLOCK_SKEW_MS", 2000),
+        require_clock=True)
     payload = report.as_dict()
     state["startup_check"] = payload
     if report.blocking:
@@ -1296,6 +2079,7 @@ def run_startup_check(symbols, prices, expected_balances=None):
         notifier.send("Startup check blocked real trading", summary,
                       severity=alerts.CRITICAL, fingerprint="startup_check")
         state["error"] = f"Startup check blocked real trading: {summary}"
+        persist_risk_state()
     return payload
 
 
@@ -1303,16 +2087,25 @@ def reset_state():
     _emergency_stop.clear()
     with state_lock:
         state["scan_count"] = 0
+        state["last_scan_started_at"] = None
+        state["last_scan_completed_at"] = None
+        state["last_scan_duration_seconds"] = None
+        state["last_scan_status"] = "paused"
+        state["last_scan_message"] = "Engine is paused."
         state["trades_count"] = 0
         state["attempts_count"] = 0
         state["total_profit"] = 0.0
         state["recent"] = []
         state["trades"] = []
-        state["unhedged_positions"] = []
+        state["unhedged_positions"] = load_persisted_recovery(
+            state.get("owner_user_id"))
         state["balances"] = {}
         state["balance_valuation"] = {"free_usdt": 0.0, "used_usdt": 0.0, "total_usdt": 0.0}
         state["chart_series"] = []
         state["latest_cycle"] = None
+        state["quotes"] = {}
+        state["mid_prices"] = {}
+        state["feed_health"] = {}
         state["triangular_routes"] = []
         state["connection_verified_at"] = None
         state["connection_verification"] = None
@@ -1372,7 +2165,8 @@ def find_candidates(cfg, quotes, symbols, exchanges, scan_fee):
         if symbol not in quotes or len(quotes[symbol]) < 2:
             continue
         attempts += 1
-        opportunity = bot.find_opportunity(quotes[symbol])
+        opportunity = bot.find_opportunity(quotes[symbol], scan_fee, symbol,
+                                           min_profit=cfg["min_profit"])
         if not opportunity:
             continue
         buy_ex, sell_ex, ask, bid, net_pct = opportunity
@@ -1381,6 +2175,7 @@ def find_candidates(cfg, quotes, symbols, exchanges, scan_fee):
             "ask": ask, "bid": bid, "net_pct": net_pct, "cycle": None,
             "legs": 2,
         })
+    candidates.sort(key=lambda item: float(item.get("net_pct") or 0.0), reverse=True)
     return candidates, attempts, cycle
 
 
@@ -1394,6 +2189,13 @@ def execute_candidate(cfg, candidate, engine, paper):
     """
     size = cfg["trade_size"]
     real = cfg["execution_mode"] == "real"
+    if not real and isinstance(paper, PaperAccount):
+        try:
+            return paper.execute(cfg, candidate, feed)
+        except Exception:
+            with db() as connection:
+                save_paper_account(connection)
+            raise
 
     if cfg["strategy"] == "triangular":
         cycle = candidate["cycle"]
@@ -1429,6 +2231,7 @@ def build_trade_record(cfg, candidate, result, profit, now):
     real = cfg["execution_mode"] == "real"
     orders = result or {}
     expected_profit = float(cfg["trade_size"]) * float(candidate["net_pct"]) / 100
+    model = candidate.get("intelligence") or {}
     return {
         "time": now.isoformat(timespec="seconds"),
         "symbol": candidate["symbol"],
@@ -1441,6 +2244,12 @@ def build_trade_record(cfg, candidate, result, profit, now):
         "net_profit_pct": round(candidate["net_pct"], 3),
         "expected_profit_usdt": round(expected_profit, 6),
         "realized_slippage_usdt": round(float(profit) - expected_profit, 6),
+        "decision_confidence": model.get("confidence"),
+        "predicted_edge_pct": model.get("predicted_edge_pct"),
+        "adaptive_profit_floor_pct": model.get("adaptive_floor_pct"),
+        "market_regime": model.get("regime"),
+        "data_mode": cfg.get("mode"),
+        "performance_mode": performance_mode(cfg),
         "buy_order_id": (orders.get("buy_order") or {}).get("id") if real else None,
         "sell_order_id": (orders.get("sell_order") or {}).get("id") if real else None,
         "middle_order_id": ((orders.get("middle_order") or {}).get("id")
@@ -1497,6 +2306,12 @@ def handle_unhedged(exc, now):
     the order before anything is sold.
     """
     confirmed = getattr(exc, "quantity_confirmed", True)
+    source_order = exc.buy_order or {}
+    recovery_id = str(
+        source_order.get("id")
+        or source_order.get("clientOrderId")
+        or source_order.get("client_order_id")
+        or f"recovery-{uuid.uuid4().hex}")
     recovery = {
         "time": now.isoformat(timespec="seconds"),
         "status": "manual_recovery_required",
@@ -1506,7 +2321,9 @@ def handle_unhedged(exc, now):
         "recovery_exchange": exc.recovery_exchange,
         "quantity": exc.quantity,
         "quantity_confirmed": confirmed,
-        "buy_order_id": (exc.buy_order or {}).get("id"),
+        "buy_order_id": recovery_id,
+        "failed_order_id": getattr(exc.cause, "order_id", None),
+        "failed_client_order_id": getattr(exc.cause, "client_order_id", None),
         "error": str(exc.cause),
     }
     currency = bot.base_coin(exc.symbol)
@@ -1523,6 +2340,7 @@ def handle_unhedged(exc, now):
         state["unhedged_positions"].insert(0, recovery)
         state["unhedged_positions"] = state["unhedged_positions"][:20]
     persist_recovery(recovery)
+    persist_risk_state()
     return str(exc)
 
 
@@ -1537,27 +2355,102 @@ def scan_loop():
             # after stop_scan_thread() has joined this thread, so these cannot
             # be swapped mid-trade, and nothing below has to re-read a global.
             quote_feed, paper, engine = feed, wallet, real_engine
+            owner_id = state.get("owner_user_id")
+        if not heartbeat_worker_lease(owner_id):
+            reason = (
+                "This process lost the exclusive account worker lease. New "
+                "orders are blocked; verify that no second server is trading.")
+            risk_manager.halt(risk.HALT_MANUAL, reason)
+            persist_risk_state()
+            with state_lock:
+                state["error"] = reason
+                state["running"] = False
+                state["worker_status"] = "lease_lost"
+                state["risk"] = risk_manager.snapshot()
+            notifier.halted(risk.HALT_MANUAL, reason, risk_manager.snapshot())
+            _stop_flag.set()
+            break
 
-        interval = cfg["interval"]
+        interval = 5.0 if cfg.get("strategy") == "signal_trend" else cfg["interval"]
         real = cfg["execution_mode"] == "real"
+        scan_started = time.perf_counter()
+        scan_started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with state_lock:
+            state["scan_count"] += 1
+            scan_num = state["scan_count"]
+            state["last_scan_started_at"] = scan_started_iso
+            state["last_scan_status"] = "fetching"
+            state["last_scan_message"] = "Fetching current market prices."
 
         if quote_feed is None:
             with state_lock:
                 state["error"] = "engine is not built; reset before starting"
+            publish_scan_result(
+                "engine_error", "The market-data engine is not initialized.",
+                scan_started)
             time.sleep(interval)
             continue
 
         try:
             quotes = quote_feed.get_quotes()
         except Exception as exc:
+            if real:
+                decision = execution_safety.observe_feed({}, 0.0)
+                if execution_safety.halted:
+                    with state_lock:
+                        state["error"] = decision.reason
+                        state["running"] = False
+                        state["execution_safety"] = execution_safety.snapshot()
+                    publish_scan_result("safety_halt", decision.reason, scan_started)
+                    break
             with state_lock:
                 state["error"] = f"feed error: {exc}"
+            publish_scan_result(
+                "feed_unavailable", "Market-data request failed; retrying automatically.",
+                scan_started)
+            time.sleep(interval)
+            continue
+
+        required_venues = 1 if cfg.get("strategy") in ("triangular", "signal_trend") else 2
+        usable_symbols = [
+            symbol for symbol, venue_quotes in quotes.items()
+            if len(venue_quotes or {}) >= required_venues
+        ]
+        if not usable_symbols and not real:
+            health = feed_health(quotes)
+            selected = len(exchanges)
+            message = (
+                "No usable live quotes were returned by the selected exchanges; "
+                "the engine is still running and will retry automatically."
+                if cfg.get("mode") == "live" else
+                "No usable tutorial quotes were produced; retrying automatically."
+            )
+            with state_lock:
+                state["quotes"] = quotes
+                state["mid_prices"] = {}
+                state["feed_health"] = health
+                state["error"] = None
+                _add_recent({
+                    "type": "blocked",
+                    "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "limit": "market_data",
+                    "reason": message,
+                    "symbol": f"{selected} selected venue(s)",
+                })
+            publish_scan_result("feed_unavailable", message, scan_started)
             time.sleep(interval)
             continue
 
         if real:
+            required_routes = ([
+                {"exchange": exchanges[0], "symbols": route.get("symbols") or []}
+                for route in cfg.get("triangular_routes", [])
+            ] if cfg.get("strategy") == "triangular" else [
+                {"symbols": [symbol], "min_venues": 2} for symbol in symbols
+            ])
             feed_decision = execution_safety.observe_feed(
-                quotes, getattr(quote_feed, "last_fetch_seconds", 0.0))
+                quotes, getattr(quote_feed, "last_fetch_seconds", 0.0),
+                required_routes=required_routes)
             with state_lock:
                 state["execution_safety"] = execution_safety.snapshot()
             if not feed_decision:
@@ -1569,42 +2462,125 @@ def scan_loop():
                 if execution_safety.halted:
                     notifier.halted(feed_decision.limit, feed_decision.reason,
                                     execution_safety.snapshot())
+                    publish_scan_result(
+                        "safety_halt", f"Execution guard stopped the scan: {feed_decision.reason}",
+                        scan_started)
                     break
+                publish_scan_result(
+                    "safety_blocked", f"Execution guard skipped the scan: {feed_decision.reason}",
+                    scan_started)
                 time.sleep(interval)
                 continue
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         mid_prices = {}
         for symbol in symbols:
             if symbol in quotes and quotes[symbol]:
                 mids = [(q["bid"] + q["ask"]) / 2 for q in quotes[symbol].values()]
                 mid_prices[symbol] = sum(mids) / len(mids)
 
+        if cfg.get("strategy") == "signal_trend":
+            previous_paper = paper.snapshot() if isinstance(paper, PaperAccount) else None
+            saving_signal = False
+            signal_committed = False
+            try:
+                if real or not isinstance(paper, PaperAccount):
+                    raise ValueError("Signal trading requires the paper account")
+                position = paper.signal_state.get("position")
+                if position and position["exchange"] != exchanges[0]:
+                    raise ValueError("Restore the open position's original exchange before continuing")
+                reports, trade = signals.paper_tick(
+                    paper, quote_feed.clients[exchanges[0]], exchanges[0], symbols, quotes, cfg,
+                    cancelled=lambda: _stop_flag.is_set() or _emergency_stop.is_set())
+                saving_signal = True
+                if trade:
+                    persist_trade(trade)
+                else:
+                    with db() as connection:
+                        save_paper_account(connection)
+                signal_committed = True
+                value = paper.total_value(mid_prices)
+                with state_lock:
+                    state.update(signal_reports=reports, quotes=quotes, mid_prices=mid_prices,
+                                 feed_health=feed_health(quotes), portfolio_value=value,
+                                 paper_portfolio_value=value)
+                    if trade:
+                        state["trades"].insert(0, trade)
+                        state["trades"] = state["trades"][:500]
+                        state["trades_count"] += 1
+                        state["total_profit"] += trade["profit_usdt"]
+                    state["error"] = None
+                summary = "; ".join(f"{s}: {r['reason']}" for s, r in reports.items())
+                publish_scan_result("signal_monitoring", summary or "Waiting for usable signal markets", scan_started)
+            except Exception as exc:
+                if previous_paper is not None and not signal_committed:
+                    paper.restore(previous_paper)
+                if saving_signal:
+                    _stop_flag.set()
+                    with state_lock:
+                        state["running"] = False
+                with state_lock:
+                    state["error"] = (f"Signal update failed; engine stopped. Last committed paper state retained: {exc}"
+                                      if saving_signal else f"Signal scan blocked: {exc}")
+                publish_scan_result("signal_blocked", str(exc), scan_started)
+            _stop_flag.wait(max(1, interval))
+            continue
+
         scan_fee = cfg["fee"]
+        if not real and paper is not None and mid_prices:
+            paper_equity = paper.total_value(mid_prices)
+            initial_equity = float(state.get("start_value") or bot.PAPER_STARTING_BALANCE_USDT)
+            with state_lock:
+                state["paper_portfolio_value"] = paper_equity
+                state["portfolio_value"] = paper_equity
+            if initial_equity - paper_equity >= float(cfg["max_daily_loss"]):
+                message = (
+                    f"Paper equity loss reached {initial_equity - paper_equity:.2f} USDT "
+                    f"against the {float(cfg['max_daily_loss']):.2f} USDT loss limit. "
+                    "Trading is paused; the simulated coin holdings remain exposed to price changes.")
+                with state_lock:
+                    state["error"] = message
+                    state["running"] = False
+                publish_scan_result("safety_halt", message, scan_started)
+                _stop_flag.set()
+                break
         if real and engine:
             try:
-                scan_fee = engine.taker_fee(exchanges[0])
+                scan_fee = {
+                    (exchange, symbol): exchange_taker_fee(engine, exchange, symbol)
+                    for symbol, venue_quotes in quotes.items()
+                    for exchange in venue_quotes
+                }
             except Exception as exc:
                 # The configured fee is a guess; the venue's own fee is what the
                 # profit gate has to clear. Scanning on the guess is how an
                 # unprofitable spread looks tradable, so skip the scan instead.
                 with state_lock:
-                    state["error"] = f"could not read {exchanges[0]} taker fee: {exc}"
+                    state["error"] = f"could not read a symbol taker fee: {exc}"
+                publish_scan_result(
+                    "fee_error", "Exchange fee data was unavailable; retrying automatically.",
+                    scan_started)
                 time.sleep(interval)
                 continue
+        market_intelligence.observe(
+            quotes, getattr(quote_feed, "last_fetch_seconds", 0.0))
         candidates, attempts, cycle = find_candidates(
             cfg, quotes, symbols, exchanges, scan_fee)
+        for candidate in candidates:
+            candidate["intelligence"] = market_intelligence.evaluate(
+                candidate, cfg["min_profit"], cfg["max_slippage"],
+                cfg.get("min_model_confidence", 0.65)).as_dict()
 
         with state_lock:
-            state["scan_count"] += 1
-            scan_num = state["scan_count"]
             state["attempts_count"] += attempts
         if cfg.get("execution_mode") == "real" and cfg.get("sandbox_mode"):
-            increment_soak_cycle()
             if TESTNET_FAILURE_EVERY > 0 and scan_num % TESTNET_FAILURE_EVERY == 0:
                 record_injected_soak_failure()
                 with state_lock:
                     state["error"] = "Injected testnet soak failure; worker recovered."
+                publish_scan_result(
+                    "testnet_fault", "Injected testnet soak failure; the worker recovered.",
+                    scan_started)
                 time.sleep(interval)
                 continue
         with state_lock:
@@ -1618,13 +2594,32 @@ def scan_loop():
                 state["chart_label"] = "Market price"
             state["quotes"] = quotes
             state["mid_prices"] = mid_prices
-            state["feed_health"] = feed_health()
+            state["feed_health"] = feed_health(quotes)
+            state["intelligence"] = market_intelligence.snapshot()
 
         found = []
         halt_error = None
         vetoed = 0          # opportunities we found but chose not to take
 
         for candidate in candidates:
+            if _stop_flag.is_set() or _emergency_stop.is_set():
+                break
+            model_decision = candidate.get("intelligence") or {}
+            if (real and cfg.get("intelligence_enabled", True)
+                    and not model_decision.get("qualified", False)):
+                vetoed += 1
+                with state_lock:
+                    _add_recent({
+                        "type": "blocked",
+                        "time": now.isoformat(timespec="seconds"),
+                        "symbol": candidate["symbol"],
+                        "limit": "opportunity_confidence",
+                        "reason": model_decision.get(
+                            "reason", "the opportunity model did not qualify this route"),
+                        "confidence": model_decision.get("confidence"),
+                        "predicted_edge_pct": model_decision.get("predicted_edge_pct"),
+                    })
+                continue
             candidate_size = safe_candidate_size(cfg, candidate)
             if candidate_size < float(arbiconfig.DEFAULTS.min_notional_usdt):
                 vetoed += 1
@@ -1669,12 +2664,17 @@ def scan_loop():
                 # symbol, or the next scan, may well be allowed.
                 continue
 
-            # One tick per leg actually sent, so the per-minute cap counts the
-            # requests the venue sees rather than the opportunities we liked.
-            for _ in range(candidate.get("legs", 2)):
-                risk_manager.record_order()
+            reservation = risk_manager.reserve_orders(candidate.get("legs", 2))
+            if not reservation:
+                vetoed += 1
+                with state_lock:
+                    _add_recent({"type": "blocked", "time": now.isoformat(timespec="seconds"),
+                                 "symbol": candidate["symbol"], "limit": reservation.limit,
+                                 "reason": reservation.reason})
+                continue
 
             try:
+                execution_context.route_id = uuid.uuid4().hex
                 usdt, result = execute_candidate(candidate_cfg, candidate, engine, paper)
             except bot.UnhedgedPositionError as exc:
                 halt_error = handle_unhedged(exc, now)
@@ -1689,7 +2689,10 @@ def scan_loop():
                 else:
                     notifier.send("Trade failed", str(exc), alerts.WARNING,
                                   fingerprint=f"failure:{candidate['symbol']}")
+                persist_risk_state()
                 break
+            finally:
+                execution_context.route_id = None
 
             if usdt is None:
                 # The paper wallet declined for lack of balance. Nothing was
@@ -1721,6 +2724,9 @@ def scan_loop():
                     state["trades"].pop()
                 _add_recent({"type": "hit", **trade})
             persist_trade(trade)
+            if real and cfg.get("sandbox_mode"):
+                increment_soak_cycle()
+            persist_risk_state()
             trade_times_hour.append(time.monotonic())
             bot.log_trade([
                 trade["time"], trade["symbol"], trade["buy_exchange"],
@@ -1776,10 +2782,13 @@ def scan_loop():
                 with state_lock:
                     publish_live_balances(refreshed, valuation)
                 persist_balances(refreshed, valuation)
+                persist_risk_state()
 
         with state_lock:
             state["risk"] = risk_manager.snapshot()
             state["alerts"] = notifier.snapshot()
+            if private_order_stream is not None:
+                state["private_order_stream"] = private_order_stream.health()
             if halt_error:
                 # Kept, not cleared. The old loop wiped state["error"] at the end
                 # of the same scan that set it, so a bot that had just stranded a
@@ -1789,11 +2798,57 @@ def scan_loop():
             else:
                 state["error"] = None
 
+        if found:
+            scan_status = "trade_executed"
+            scan_message = f"Completed {len(found)} trade{'s' if len(found) != 1 else ''}."
+        elif vetoed:
+            scan_status = "opportunity_blocked"
+            scan_message = (
+                f"Found {vetoed} potential route{'s' if vetoed != 1 else ''}, "
+                "but safety or confidence rules rejected them."
+            )
+        else:
+            scan_status = "no_opportunity"
+            scan_message = (
+                f"Scan completed normally; no route cleared the "
+                f"{float(cfg['min_profit']):.3f}% net-profit threshold."
+            )
+        if halt_error:
+            scan_status = "safety_halt"
+            scan_message = halt_error
+        publish_scan_result(scan_status, scan_message, scan_started)
+
         if halt_error:
             _stop_flag.set()
             break
 
         time.sleep(interval)
+
+    with state_lock:
+        state["running"] = False
+        state["worker_status"] = (
+            "recovery_required" if state.get("unhedged_positions") else "paused")
+    release_worker_lease(owner_id if 'owner_id' in locals() else state.get("owner_user_id"))
+
+
+def supervised_scan_loop():
+    """Never leave the dashboard claiming a crashed worker is still running."""
+    try:
+        scan_loop()
+    except Exception as exc:
+        logger.exception("The trading scan worker crashed")
+        with state_lock:
+            owner_id = state.get("owner_user_id")
+            state["running"] = False
+            state["worker_status"] = "crashed"
+            state["error"] = f"scan worker crashed: {type(exc).__name__}: {exc}"
+            state["last_scan_completed_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds")
+            state["last_scan_status"] = "crashed"
+            state["last_scan_message"] = (
+                "The scan worker stopped unexpectedly. Review the error and restart it."
+            )
+        release_worker_lease(owner_id)
 
 
 # ------------------------------------------------------------------
@@ -1855,6 +2910,21 @@ def fontawesome_asset(filename):
 @app.route("/node_modules/chart.js/dist/chart.min.js")
 def chartjs_asset():
     return send_from_directory("node_modules/chart.js/dist", "chart.min.js")
+
+
+@app.route("/market-overview.js")
+def market_overview_javascript():
+    return send_from_directory(".", "market-overview.js", mimetype="application/javascript")
+
+
+@app.route("/assets/lightweight-charts.js")
+def market_chart_asset():
+    return send_from_directory("node_modules/lightweight-charts/dist", "lightweight-charts.standalone.production.js")
+
+
+@app.route("/assets/lightweight-charts-NOTICE")
+def market_chart_notice():
+    return Response("TradingView Lightweight Charts\u2122\nCopyright (c) 2025 TradingView, Inc.\nhttps://www.tradingview.com/\n", mimetype="text/plain")
 
 
 @app.route("/favicon.ico")
@@ -1956,6 +3026,9 @@ def auth_login():
         restored = load_encrypted_credentials(user["id"])
         if restored:
             user_credentials[user["id"]] = restored
+        if not state.get("running"):
+            state["owner_user_id"] = user["id"]
+            activate_user_context(user["id"])
     audit_event("auth.login", user=user)
     record_login_attempt(username, True)
     return jsonify({
@@ -2011,6 +3084,7 @@ def auth_logout():
                                 state.get("owner_user_id") == user_id)
         if not state.get("running") and state.get("owner_user_id") == user_id:
             state["owner_user_id"] = None
+            user_credentials.pop(user_id, None)
     session.clear()
     if session_id:
         with db() as connection:
@@ -2061,6 +3135,19 @@ def onboarding():
     if data.get("risk_accepted") is not True or data.get("terms_accepted") is not True:
         return jsonify({"ok": False, "error": "Risk disclosure and terms must both be accepted."}), 400
     now = datetime.now().isoformat(timespec="seconds")
+    with state_lock:
+        paper_live_config = dict(DEFAULT_ACCOUNT_STATE["config"])
+        paper_live_config.update({
+            "mode": "live",
+            "execution_mode": "paper",
+            "real_trading_enabled": False,
+            "sandbox_mode": False,
+        })
+        initial_user_config = json.dumps({
+            "config": paper_live_config,
+            "exchanges": list(DEFAULT_ACCOUNT_STATE["active_exchanges"]),
+            "symbols": list(DEFAULT_ACCOUNT_STATE["active_symbols"]),
+        }, sort_keys=True)
     with db() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO user_preferences "
@@ -2073,6 +3160,17 @@ def onboarding():
                 "(user_id, consent_type, version, accepted_at, ip_address) VALUES (?, ?, ?, ?, ?)",
                 (user["id"], consent_type, TERMS_VERSION, now, request.remote_addr),
             )
+        # Do not overwrite a configuration the trader already saved. For a new
+        # account, real public data plus a simulated wallet is the normal demo;
+        # the synthetic generator remains available as an offline tutorial.
+        connection.execute(
+            "INSERT OR IGNORE INTO user_configs (user_id, payload, updated_at) "
+            "VALUES (?, ?, ?)",
+            (user["id"], initial_user_config, now),
+        )
+    with state_lock:
+        if state.get("owner_user_id") == user["id"] and not state.get("running"):
+            activate_user_context(user["id"])
     audit_event("onboarding.complete", details={"experience_mode": experience_mode,
                                                 "terms_version": TERMS_VERSION}, user=user)
     return jsonify({"ok": True, "experience_mode": experience_mode,
@@ -2324,11 +3422,12 @@ def user_stats():
     user = request_user()
     if not user:
         return jsonify({"ok": False, "error": "Not logged in"}), 401
+    mode_filter = " AND performance_mode = 'signal_paper'" if viewing_signal_history(user) else ""
     with db() as connection:
         row = connection.execute(
             "SELECT COUNT(*), COALESCE(SUM(profit_usdt), 0), "
             "COALESCE(SUM(CASE WHEN profit_usdt > 0 THEN 1 ELSE 0 END), 0) "
-            "FROM trades WHERE user_id = ?", (user["id"],)
+            "FROM trades WHERE user_id = ?" + mode_filter, (user["id"],)
         ).fetchone()
     total_trades, total_profit, wins = int(row[0]), float(row[1]), int(row[2])
     with state_lock:
@@ -2346,9 +3445,28 @@ def user_stats():
     return jsonify({"ok": True, "stats": stats})
 
 
+@app.route("/api/account/preferences", methods=["GET", "POST"])
+def account_preferences():
+    user = request_user()
+    if not user:
+        return jsonify({"ok": False, "error": "Authentication required"}), 401
+    with db() as connection:
+        connection.execute("INSERT OR IGNORE INTO account_preferences(user_id) VALUES(?)", (user["id"],))
+        if request.method == "POST":
+            payload = request.get_json(silent=True) or {}
+            allowed = {"theme": {"dark", "light"}, "notifications": {"all", "important", "none"}}
+            if any(key not in allowed or not isinstance(value, str) or value not in allowed[key]
+                   for key, value in payload.items()):
+                return jsonify({"ok": False, "error": "Invalid preference"}), 400
+            for key, value in payload.items():
+                connection.execute(f"UPDATE account_preferences SET {key}=? WHERE user_id=?", (value, user["id"]))
+        row = connection.execute("SELECT theme,notifications FROM account_preferences WHERE user_id=?", (user["id"],)).fetchone()
+    return jsonify({"ok": True, "theme": row[0], "notifications": row[1]})
+
+
 @app.route("/api/user/api-keys", methods=["GET"])
 def get_user_api_keys():
-    """Return redacted process-memory credential status; never return a secret."""
+    """Return redacted status for every exchange supported by this build."""
     user = request_user()
     if not user:
         return jsonify({"ok": False, "error": "Not logged in"}), 401
@@ -2356,14 +3474,24 @@ def get_user_api_keys():
         owner_error = require_engine_owner(user)
         stored = user_credentials.get(user_identity(user), {})
         connected_exchanges = []
-        for exchange in ("binance",):
-            supplied = stored.get(exchange, {})
-            configured = bool(supplied.get("apiKey") and supplied.get("secret"))
+        active = set(state.get("active_exchanges") or [])
+        labels = {"binance": "Binance", "kucoin": "KuCoin",
+                  "okx": "OKX", "bybit": "Bybit"}
+        for exchange in dict.fromkeys(bot.EXCHANGES_MASTER):
+            memory_credentials = arbiconfig.Credentials.from_mapping(
+                exchange, stored.get(exchange, {}), source="process_memory")
+            environment_credentials = arbiconfig.Credentials.from_env(exchange)
+            credentials = (environment_credentials if environment_credentials.complete
+                           else memory_credentials)
             connected_exchanges.append({
                 "exchange": exchange,
-                "configured": configured,
-                "source": "process_memory" if configured else "unset",
-                "api_key": arbiconfig.Credentials._mask(supplied.get("apiKey", "")),
+                "label": labels.get(exchange, exchange.title()),
+                "configured": credentials.complete,
+                "source": credentials.source,
+                "api_key": arbiconfig.Credentials._mask(credentials.api_key),
+                "requires_password": credentials.requires_password,
+                "password_configured": bool(credentials.password),
+                "active": exchange in active,
                 "available": owner_error is None,
             })
     return jsonify({"ok": True, "exchanges": connected_exchanges})
@@ -2371,7 +3499,7 @@ def get_user_api_keys():
 
 @app.route("/api/user/api-keys", methods=["POST"])
 def save_user_api_keys():
-    """Install credentials in process memory only, for a local admin session."""
+    """Install credentials for any configured CCXT exchange without echoing them."""
     data = request.get_json() or {}
     user = request_user()
     if not user:
@@ -2387,25 +3515,33 @@ def save_user_api_keys():
     exchange = str(data.get("exchange") or "").strip().lower()
     api_key = str(data.get("api_key") or "").strip()
     api_secret = str(data.get("api_secret") or "").strip()
-    if exchange != "binance":
-        return jsonify({"ok": False, "error": "Only Binance setup is available here."}), 400
-    if not api_key or not api_secret:
-        return jsonify({"ok": False, "error": "Both Binance API key and secret are required."}), 400
-    if len(api_key) > 512 or len(api_secret) > 512:
+    api_password = str(data.get("password") or data.get("passphrase") or "").strip()
+    if exchange not in bot.EXCHANGES_MASTER:
+        return jsonify({"ok": False,
+                        "error": "Unsupported exchange. Choose one shown in the form."}), 400
+    credentials = arbiconfig.Credentials(
+        exchange, api_key, api_secret, api_password, "process_memory")
+    missing = credentials.missing()
+    if missing:
+        labels = {"api_key": "API key", "api_secret": "secret key",
+                  "password": "API passphrase"}
+        return jsonify({
+            "ok": False,
+            "error": f"{exchange.upper()} requires "
+                     + ", ".join(labels[item] for item in missing) + ".",
+        }), 400
+    if any(len(value) > 512 for value in (api_key, api_secret, api_password)):
         return jsonify({"ok": False, "error": "Credential value is unexpectedly long."}), 400
     env_credential = arbiconfig.Credentials.from_env(exchange)
     if env_credential.complete:
         return jsonify({"ok": False,
-                        "error": "Server environment credentials already control Binance. Remove them and restart before using the form."}), 409
+                        "error": f"Server environment credentials already control {exchange.upper()}. Remove them and restart before using the form."}), 409
 
     with state_lock:
         user_credentials.setdefault(user_identity(user), {})[exchange] = {
             "apiKey": api_key,
             "secret": api_secret,
-        }
-        bot.EXCHANGE_CREDENTIALS[exchange] = {
-            "apiKey": api_key,
-            "secret": api_secret,
+            **({"password": api_password} if api_password else {}),
         }
         state["connection_verified_at"] = None
         state["connection_verification"] = None
@@ -2417,13 +3553,14 @@ def save_user_api_keys():
             "api_key": arbiconfig.Credentials._mask(api_key),
         }
     persistent = persist_encrypted_credentials(
-        user["id"], exchange, api_key, api_secret) if user.get("id") else False
+        user["id"], exchange, api_key, api_secret,
+        api_password) if user.get("id") else False
     audit_event("credentials.rotate", details={"exchange": exchange,
                                                "persistent": persistent}, user=user)
     return jsonify({
         "ok": True,
-        "message": ("Binance credentials encrypted and saved." if persistent else
-                    "Binance credentials loaded into memory; configure ARBICORE_MASTER_KEY for encrypted persistence."),
+        "message": (f"{exchange.upper()} credentials encrypted and saved." if persistent else
+                    f"{exchange.upper()} credentials loaded into memory; configure ARBICORE_MASTER_KEY for encrypted persistence."),
         "exchange": exchange,
         "api_key": arbiconfig.Credentials._mask(api_key),
         "persistent": persistent,
@@ -2512,6 +3649,8 @@ def delete_user_api_key(exchange):
     user = request_user()
     if not user:
         return jsonify({"ok": False, "error": "Not logged in"}), 401
+    if exchange not in bot.EXCHANGES_MASTER:
+        return jsonify({"ok": False, "error": "Unsupported exchange."}), 400
     with state_lock:
         owner_error = require_engine_owner(user)
         if owner_error:
@@ -2522,7 +3661,6 @@ def delete_user_api_key(exchange):
         if arbiconfig.Credentials.from_env(exchange).complete:
             return jsonify({"ok": False,
                             "error": "Environment credentials must be removed from the server environment."}), 409
-        bot.EXCHANGE_CREDENTIALS[exchange] = {"apiKey": "", "secret": ""}
         user_credentials.get(user_identity(user), {}).pop(exchange, None)
         if not user_credentials.get(user_identity(user)):
             state["owner_user_id"] = None
@@ -2554,7 +3692,13 @@ def api_state():
         payload["current_user"] = user
         identity = user_identity(user)
         owner = state.get("owner_user_id")
-        if user.get("role") != "admin" and owner not in (None, identity):
+        if owner != identity:
+            payload = copy.deepcopy(DEFAULT_ACCOUNT_STATE)
+            saved = load_user_config(identity) or {}
+            payload["config"].update(saved.get("config") or {})
+            payload["active_exchanges"] = saved.get("exchanges") or payload["active_exchanges"]
+            payload["active_symbols"] = saved.get("symbols") or payload["active_symbols"]
+            payload["current_user"] = user
             payload.update({
                 "running": False,
                 "trades": [],
@@ -2567,14 +3711,16 @@ def api_state():
                 "connection_verification": None,
                 "unhedged_positions": [],
                 "total_profit": 0.0,
-                "portfolio_value": 0.0,
+                "portfolio_value": bot.PAPER_STARTING_BALANCE_USDT,
+                "paper_portfolio_value": bot.PAPER_STARTING_BALANCE_USDT,
                 "live_portfolio_value": None,
                 "access_message": "Another account owns the active trading worker.",
             })
-        payload["available_exchanges"] = ["binance", "kucoin", "okx", "bybit"]
+        payload["available_exchanges"] = list(dict.fromkeys(bot.EXCHANGES_MASTER))
         payload["available_symbols"] = list(bot.DEMO_START_PRICES)
-        payload["recommended_scan_interval"] = recommended_scan_interval()
-        if wallet is not None and state["config"]["execution_mode"] == "paper":
+        payload["recommended_scan_interval"] = recommended_scan_interval(
+            payload["config"], payload["active_exchanges"], payload["active_symbols"])
+        if owner == identity and wallet is not None and state["config"]["execution_mode"] == "paper":
             paper_balances = {}
             for exchange, symbols in wallet.usdt.items():
                 paper_balances[exchange] = {}
@@ -2587,8 +3733,98 @@ def api_state():
                         "source": "paper",
                     }
             payload["balances"] = paper_balances
-        payload["readiness"] = get_readiness()
+        payload["readiness"] = (get_readiness() if owner == identity else {
+            "ready": False, "message": "Your settings are saved separately. The shared worker must be available before starting.",
+            "credentials": [],
+        })
+        initial = float(payload.get("start_value") or bot.PAPER_STARTING_BALANCE_USDT)
+        equity = float(payload.get("paper_portfolio_value") or 0)
+        trade_profit = float(payload.get("total_profit") or 0) - float(payload.get("paper_profit_baseline") or 0)
+        if owner == identity and isinstance(wallet, PaperAccount):
+            trade_profit = wallet.profit
+            payload["signal_position"] = wallet.signal_state.get("position")
+        payload["signal_capabilities"] = signal_capabilities()
+        if owner != identity:
+            payload.pop("signal_reports", None)
+            payload.pop("signal_position", None)
+        payload["paper_performance"] = {
+            "initial_balance": initial, "equity": equity,
+            "trade_profit": trade_profit, "net_change": equity - initial,
+            "inventory_change": equity - initial - trade_profit,
+        }
         return jsonify(payload)
+
+
+def account_trading_overview(user):
+    """Own-account data only. Reading charts never claims or switches a worker."""
+    with state_lock:
+        identity = user_identity(user)
+        owned = state.get("owner_user_id") == identity
+        saved = load_user_config(identity) or {}
+        cfg = copy.deepcopy(state["config"] if owned else DEFAULT_ACCOUNT_STATE["config"])
+        if not owned:
+            cfg.update(saved.get("config") or {})
+        checkpoint = risk_manager.export_state() if owned else (load_risk_state(identity) or {})
+        readiness = (get_readiness() if owned else {"ready": False,
+            "message": "This account does not own an active worker. No order is authorized by this chart."})
+        signal_state = {}
+        if cfg.get("strategy") == "signal_trend" and cfg.get("execution_mode") == "paper":
+            if owned and isinstance(wallet, PaperAccount):
+                signal_state = copy.deepcopy(wallet.signal_state)
+            else:
+                paper = load_paper_account(identity, "signal_paper") or {}
+                signal_state = paper.get("signal_state") or {}
+        today = datetime.now(timezone.utc).date().isoformat()
+        invalid_risk = bool(checkpoint.get("_invalid_checkpoint"))
+        try:
+            source = signal_state or checkpoint
+            amount = source.get("day_pnl" if signal_state else "realized_today", 0)
+            realized = float(amount) if source.get("day") == today else 0.0
+            budget = float(cfg.get("max_daily_loss"))
+            invalid_risk = invalid_risk or isinstance(amount, bool) or not math.isfinite(realized) or not math.isfinite(budget) or budget <= 0
+        except (TypeError, ValueError, OverflowError):
+            invalid_risk = True
+        if invalid_risk:
+            realized, budget = None, None
+            readiness = {"ready": False, "message": "Invalid recorded risk state requires reconciliation"}
+        used = max(0.0, -realized) if realized is not None else None
+        return {"execution_mode": cfg.get("execution_mode"), "data_mode": cfg.get("mode"),
+                "target": "paper" if cfg.get("execution_mode") == "paper" else "testnet" if cfg.get("sandbox_mode") else "production",
+                "strategy": cfg.get("strategy"), "running": bool(owned and state.get("running")),
+                "position": signal_state.get("position"), "position_source": "paper" if signal_state else None,
+                "daily_loss_limit": budget, "daily_realized_pnl": realized,
+                "daily_loss_used": used, "daily_loss_remaining": max(0, budget - used) if used is not None else None,
+                "daily_loss_basis": "Recorded bot realized P&L; not exchange-wide account P&L",
+                "halted": bool(checkpoint.get("halted") or invalid_risk),
+                "halt_reason": checkpoint.get("halt_reason") or "",
+                "readiness": readiness, "signal_production_ready": False,
+                "signal_blocker": "Real-fund trend execution remains disabled pending native protection, dynamic-exit recovery and authenticated qualification.",
+                "capabilities": signal_capabilities()}
+
+
+@app.route("/api/market/overview")
+def api_market_overview():
+    user = request_user()
+    if not user:
+        return jsonify({"ok": False, "error": "Authentication required"}), 401
+    try:
+        snapshot = market_overview.snapshot(request.args.get("exchange", "binance"),
+            request.args.get("symbol", "BTC/USDT"), request.args.get("timeframe", "1m"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    snapshot["account"] = account_trading_overview(user)
+    position = snapshot["account"]["position"]
+    has_position = bool(position and position.get("symbol") == snapshot["symbol"]
+                        and position.get("exchange") == snapshot["exchange"])
+    raw_action = snapshot["signal"]["action"]
+    snapshot["suggestion"] = ("WAIT" if not snapshot.get("fresh") else
+        "EXIT" if raw_action == "sell" and has_position else
+        "HOLD" if has_position else "BUY CANDIDATE" if raw_action == "buy" else "WAIT")
+    snapshot["suggestion_note"] = ("Bearish signal, but no matching open trend position. Spot mode does not open a short."
+        if raw_action == "sell" and not has_position else snapshot["signal"]["reason"])
+    response = jsonify(snapshot)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @app.route("/api/readiness")
@@ -2601,14 +3837,26 @@ def api_readiness():
 def api_health():
     count = request_metrics["count"]
     with state_lock:
+        worker_alive = bool(_thread and _thread.is_alive())
+        feed_ok = state.get("last_scan_status") not in {
+            "feed_unavailable", "engine_error", "crashed",
+        }
         payload = {
-            "ok": state.get("error") is None,
+            "ok": state.get("error") is None and feed_ok
+                  and (not state.get("running") or worker_alive),
             "uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
             "requests": count,
             "errors": request_metrics["errors"],
             "average_response_ms": round(request_metrics["total_ms"] / count, 1) if count else 0.0,
             "engine_running": bool(state.get("running")),
-            "worker_alive": bool(_thread and _thread.is_alive()),
+            "worker_alive": worker_alive,
+            "worker_status": state.get("worker_status"),
+            "scan_count": state.get("scan_count", 0),
+            "last_scan_started_at": state.get("last_scan_started_at"),
+            "last_scan_completed_at": state.get("last_scan_completed_at"),
+            "last_scan_duration_seconds": state.get("last_scan_duration_seconds"),
+            "last_scan_status": state.get("last_scan_status"),
+            "last_scan_message": state.get("last_scan_message"),
             "feed": dict(state.get("feed_health") or {}),
             "exchange": list(state.get("exchange_status") or []),
             "risk": risk_manager.snapshot(),
@@ -2736,9 +3984,16 @@ def api_history():
         "sell_order_id", "status", "buy_price", "sell_price", "execution_mode",
         "strategy", "filled_quantity", "unsold_dust", "user_id",
         "expected_profit_usdt", "realized_slippage_usdt",
+        "decision_confidence", "predicted_edge_pct",
+        "adaptive_profit_floor_pct", "market_regime", "data_mode", "performance_mode",
     )
     with db() as connection:
-        if user.get("role") == "admin":
+        if viewing_signal_history(user):
+            trades = connection.execute(
+                f"SELECT {', '.join(trade_fields)} FROM trades "
+                "WHERE user_id = ? AND performance_mode = 'signal_paper' ORDER BY id DESC LIMIT 500",
+                (user["id"],)).fetchall()
+        elif user.get("role") == "admin":
             trades = connection.execute(
                 f"SELECT {', '.join(trade_fields)} FROM trades "
                 "ORDER BY id DESC LIMIT 500"
@@ -2762,6 +4017,34 @@ def api_history():
         "trades": [dict(zip(trade_fields, row)) for row in trades],
         "recovery": [json.loads(row[0]) for row in recovery],
     })
+
+
+@app.route("/api/intelligence")
+def api_intelligence():
+    """Current transparent forecast plus evidence-based strategy ranking."""
+    user = request_user()
+    if not user:
+        return jsonify({"ok": False, "error": "Authentication required"}), 401
+    clauses = ["data_mode = 'live'"]
+    params = ()
+    if user.get("role") != "admin":
+        clauses.append("user_id = ?")
+        params = (user["id"],)
+    where = " WHERE " + " AND ".join(clauses)
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT strategy, profit_usdt FROM trades" + where, params,
+        ).fetchall()
+    evidence = intelligence.strategy_evidence([
+        {"strategy": row[0], "profit_usdt": row[1]} for row in rows
+    ])
+    evidence["scope"] = "live market data outcomes only; historical evidence is not a profit guarantee"
+    with state_lock:
+        model = dict(state.get("intelligence") or market_intelligence.snapshot())
+        model["enabled"] = bool(state["config"].get("intelligence_enabled", True))
+        model["minimum_confidence"] = float(
+            state["config"].get("min_model_confidence", 0.65))
+    return jsonify({"ok": True, "model": model, "strategy_evidence": evidence})
 
 
 @app.route("/api/orders")
@@ -2851,21 +4134,22 @@ def accounting_summary():
 def api_test_connection():
     user = request_user()
     with state_lock:
-        owner_error = require_engine_owner(user)
+        owner_error = require_engine_owner(user, claim=True)
         if owner_error:
             return jsonify({"ok": False, "error": owner_error}), 409
         if state["config"]["execution_mode"] != "real":
             return jsonify({"ok": False, "error": "Select real execution before testing exchange access."}), 409
-        validation = bot.validate_real_trading_config()
+        credential_map = current_credential_map(user_identity(user))
+        validation = bot.validate_real_trading_config(credential_map)
         if not validation["ok"]:
             return jsonify({"ok": False, "error": validation["message"]}), 400
         exchanges = list(state["active_exchanges"])
-        symbols = list(state["active_symbols"])
         config_snapshot = dict(state["config"])
+        symbols = execution_symbols(config_snapshot, state["active_symbols"])
 
     try:
-        engine = bot.RealExecutionEngine(exchanges)
-        statuses = [engine.connection_status(exchange) for exchange in exchanges]
+        engine = bot.RealExecutionEngine(exchanges, credential_map)
+        statuses = [engine.connection_status(exchange, symbols) for exchange in exchanges]
     except Exception as exc:
         error = str(exc)
         statuses = [{
@@ -2893,23 +4177,13 @@ def api_test_connection():
 
     safety_errors = []
     if all(item["ok"] for item in statuses):
-        trade_size = float(config_snapshot["trade_size"])
-        if config_snapshot["strategy"] == "triangular":
-            exchange = exchanges[0]
-            free_usdt = engine.get_balance_usdt(exchange)
-            required = trade_size * 1.02
-            if free_usdt < required:
+        safety_errors.extend(inventory_readiness(
+            engine, config_snapshot, exchanges, symbols, refreshed_balances))
+        for status in statuses:
+            if status.get("trade_access") is None:
                 safety_errors.append(
-                    f"{exchange} needs at least {required:.2f} free USDT for a "
-                    f"{trade_size:.2f} USDT route plus a 2% fee/rounding buffer; "
-                    f"only {free_usdt:.2f} is available.")
-            if float(config_snapshot["max_position_notional"]) > free_usdt * 0.50:
-                safety_errors.append(
-                    "Maximum position must be no more than 50% of free USDT for "
-                    "a small production account.")
-            if float(config_snapshot["max_daily_loss"]) > free_usdt * 0.10:
-                safety_errors.append(
-                    "Maximum daily loss must be no more than 10% of free USDT.")
+                    f"{status['exchange']} does not have a non-executing trade-permission "
+                    "test implemented; it is blocked for real execution.")
     if not config_snapshot.get("sandbox_mode"):
         soak = production_soak_status(state.get("owner_user_id"))
         if not soak["ready"]:
@@ -2920,7 +4194,7 @@ def api_test_connection():
     with state_lock:
         if refreshed_balances is not None and refreshed_valuation is not None:
             publish_live_balances(refreshed_balances, refreshed_valuation)
-        verified_at = datetime.now().isoformat() if all_ok else None
+        verified_at = utc_now_iso() if all_ok else None
         state["exchange_status"] = statuses
         state["connection_verified_at"] = verified_at
         state["connection_verification"] = ({
@@ -2928,6 +4202,8 @@ def api_test_connection():
             "target": "sandbox" if state["config"].get("sandbox_mode") else "production",
             "exchanges": list(state["active_exchanges"]),
             "strategy": state["config"].get("strategy"),
+            "symbols": execution_symbols(),
+            "config_fingerprint": qualification_fingerprints()[0],
         } if all_ok else None)
     if refreshed_balances is not None and refreshed_valuation is not None:
         persist_balances(refreshed_balances, refreshed_valuation)
@@ -2954,6 +4230,11 @@ def api_recovery():
 
 @app.route("/api/recovery/close", methods=["POST"])
 def api_recovery_close():
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     data = request.get_json(force=True) or {}
     if data.get("confirmation") != "CLOSE_UNHEDGED_POSITION":
         return jsonify({"ok": False, "error": "Explicit recovery confirmation is required."}), 400
@@ -2978,13 +4259,49 @@ def api_recovery_close():
             }), 409
         engine = real_engine
 
+    exchange = position["recovery_exchange"]
+    symbol = position["symbol"]
+    quantity = (engine.normalize_amount(exchange, symbol, position["quantity"])
+                if callable(getattr(engine, "normalize_amount", None))
+                else float(position["quantity"]))
     try:
-        close_order = engine.place_market_sell(
-            position["recovery_exchange"], position["symbol"], position["quantity"])
+        if callable(getattr(engine, "fetch_ticker", None)):
+            quote = engine.fetch_ticker(exchange, symbol)
+            engine.check_order_book(exchange, symbol, "sell", quantity, quote["bid"])
+        close_order = engine.place_market_sell(exchange, symbol, quantity)
+        if callable(getattr(engine, "_confirm_fill", None)):
+            close_fill = engine._confirm_fill(
+                exchange, symbol, "sell", quantity, close_order)
+        else:
+            raise RuntimeError("Recovery engine cannot reconcile the close order.")
     except Exception as exc:
+        position["close_status"] = "ambiguous" if isinstance(
+            exc, orders.OrderReconciliationError) else "failed"
+        position["close_error"] = str(exc)
+        position["close_attempted_at"] = utc_now_iso()
+        close_id = (getattr(exc, "client_order_id", None)
+                    or (locals().get("close_order") or {}).get("clientOrderId"))
+        update_persisted_recovery(order_id, position, position["close_status"], close_id)
         with state_lock:
             state["error"] = f"Recovery close failed: {exc}"
         return jsonify({"ok": False, "error": str(exc)}), 502
+
+    filled = float(close_fill.filled_quantity)
+    residual = max(0.0, quantity - filled)
+    dust_tolerance = (engine._dust_tolerance(exchange, symbol, quantity)
+                      if callable(getattr(engine, "_dust_tolerance", None)) else 0.0)
+    if residual > dust_tolerance:
+        position["quantity"] = residual
+        position["close_status"] = "partial"
+        position["close_order_id"] = close_fill.order_id
+        position["close_fill"] = close_fill.as_dict()
+        update_persisted_recovery(
+            order_id, position, "partial", close_fill.client_order_id)
+        with state_lock:
+            state["error"] = (
+                f"Recovery close filled {filled:.8f}; {residual:.8f} remains open.")
+        return jsonify({"ok": False, "error": state["error"],
+                        "remaining_quantity": residual}), 409
 
     with state_lock:
         state["unhedged_positions"] = [
@@ -3003,7 +4320,47 @@ def api_recovery_close():
                 break
         state["risk"] = risk_manager.snapshot()
         state["error"] = None
-    return jsonify({"ok": True, "close_order_id": close_order.get("id")})
+    persist_risk_state()
+    if active_soak_run_id is not None:
+        with db() as connection:
+            connection.execute(
+                "UPDATE soak_runs SET recovered_failures = recovered_failures + 1 "
+                "WHERE id = ?", (active_soak_run_id,))
+    return jsonify({"ok": True, "close_order_id": close_fill.order_id,
+                    "filled_quantity": filled})
+
+
+@app.route("/api/recovery/intent/resolve", methods=["POST"])
+def api_recovery_intent_resolve():
+    """Acknowledge a crash-left fill after external account reconciliation."""
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
+    data = request.get_json(silent=True) or {}
+    if data.get("confirmation") != "ORDER_INTENT_ACCOUNTED":
+        return jsonify({"ok": False,
+                        "error": "Explicit accounting confirmation is required."}), 400
+    client_order_id = str(data.get("client_order_id") or "")
+    with db() as connection:
+        row = connection.execute(
+            "SELECT status FROM order_intents WHERE client_order_id = ? AND user_id = ?",
+            (client_order_id, user.get("id")),
+        ).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "Order intent was not found."}), 404
+        if str(row[0]).lower() != "manual_accounting_required":
+            return jsonify({"ok": False,
+                            "error": "Only a manual-accounting intent can be resolved."}), 409
+        connection.execute(
+            "UPDATE order_intents SET status = 'accounted', terminal_at = ?, "
+            "updated_at = ? WHERE client_order_id = ? AND user_id = ?",
+            (utc_now_iso(), utc_now_iso(), client_order_id, user.get("id")),
+        )
+    audit_event("recovery.intent_accounted", details={
+        "client_order_id": client_order_id}, user=user)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/risk")
@@ -3027,6 +4384,11 @@ def api_risk_resume():
     the bot is understood. The risk manager still refuses while the kill switch
     is engaged or a stranded position is open.
     """
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     data = request.get_json(silent=True) or {}
     if data.get("confirmation") != "RESUME_AFTER_HALT":
         return jsonify({"ok": False,
@@ -3042,6 +4404,7 @@ def api_risk_resume():
         snapshot = state["risk"]
     if ok:
         notifier.resumed()
+    persist_risk_state()
     return jsonify({"ok": ok, "message": message, "risk": snapshot}), \
         200 if ok else 409
 
@@ -3055,6 +4418,11 @@ def api_risk_clear_stranded():
     closed the position is how the next run trades around inventory it does not
     know it holds, so the confirmation string is required.
     """
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     data = request.get_json(silent=True) or {}
     if data.get("confirmation") != "STRANDED_POSITION_UNWOUND":
         return jsonify({
@@ -3062,11 +4430,34 @@ def api_risk_clear_stranded():
             "error": "Explicit confirmation that the position is closed is required.",
         }), 400
     index = data.get("index")
-    remaining = risk_manager.clear_stranded(
-        int(index) if index is not None else None)
+    try:
+        selected_index = int(index) if index is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Stranded position index is invalid."}), 400
+    if selected_index is not None and not (
+            0 <= selected_index < len(risk_manager.stranded)):
+        return jsonify({"ok": False, "error": "Stranded position was not found."}), 404
+    selected = (risk_manager.stranded[selected_index]
+                if selected_index is not None
+                and 0 <= selected_index < len(risk_manager.stranded) else None)
+    remaining = risk_manager.clear_stranded(selected_index)
     with state_lock:
+        if selected is None:
+            records = list(state["unhedged_positions"])
+            state["unhedged_positions"] = []
+        else:
+            records = [position for position in state["unhedged_positions"]
+                       if (position.get("recovery_exchange") == selected["exchange"]
+                           and bot.base_coin(position.get("symbol") or "")
+                           == selected["currency"])]
+            state["unhedged_positions"] = [
+                position for position in state["unhedged_positions"]
+                if position not in records]
         state["risk"] = risk_manager.snapshot()
         snapshot = state["risk"]
+    for position in records:
+        remove_persisted_recovery(position.get("buy_order_id"))
+    persist_risk_state()
     return jsonify({"ok": True, "remaining": remaining, "risk": snapshot})
 
 
@@ -3106,6 +4497,20 @@ def api_start():
             return jsonify({"ok": True})
         if state["config"]["execution_mode"] == "real":
             readiness = get_readiness()
+            # A restart intentionally discards network clients. After a fresh,
+            # context-bound exchange verification, rebuild them here so users do
+            # not have to toggle/reapply configuration merely to restore the
+            # private stream and startup reconciliation state.
+            if (readiness.get("connection_verified_at")
+                    and (real_engine is None or wallet is None)):
+                try:
+                    init_engine()
+                except Exception as exc:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"Real execution engine initialization failed: {exc}",
+                    }), 502
+                readiness = get_readiness()
             if not readiness["ready"]:
                 return jsonify({"ok": False, "error": readiness["message"],
                                 "readiness": readiness}), 409
@@ -3118,19 +4523,38 @@ def api_start():
                                 "Startup reconciliation found a blocking account condition.",
                                 "startup_check": startup}), 409
         if wallet is None:
-            init_engine()
+            try:
+                init_engine()
+            except Exception as exc:
+                live_data = state["config"].get("mode") == "live"
+                return jsonify({
+                    "ok": False,
+                    "error": (("Could not start the live-data paper engine: "
+                               f"{exc}. Check the internet connection or select "
+                               "Synthetic tutorial market.") if live_data else
+                              f"Could not start the tutorial engine: {exc}"),
+                }), 502
+        if not acquire_worker_lease(state.get("owner_user_id")):
+            return jsonify({"ok": False,
+                            "error": "Another supervised worker owns this account."}), 409
         if (state["config"]["execution_mode"] == "real"
                 and state["config"].get("sandbox_mode")
                 and isinstance(state.get("owner_user_id"), int)):
+            config_hash, code_hash = qualification_fingerprints()
             with db() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO soak_runs (user_id, started_at, status) VALUES (?, ?, 'running')",
-                    (state["owner_user_id"], datetime.now().isoformat(timespec="seconds")),
+                    "INSERT INTO soak_runs (user_id, started_at, status, "
+                    "config_fingerprint, code_fingerprint) VALUES (?, ?, 'running', ?, ?)",
+                    (state["owner_user_id"], utc_now_iso(), config_hash, code_hash),
                 )
                 active_soak_run_id = cursor.lastrowid
         state["running"] = True
+        state["worker_status"] = "running"
+        state["last_scan_status"] = "starting"
+        state["last_scan_message"] = "Starting the market-data scan worker."
     _stop_flag.clear()
-    _thread = threading.Thread(target=scan_loop, daemon=True)
+    _thread = threading.Thread(target=supervised_scan_loop, daemon=True,
+                               name=f"arbicore-scan-{state.get('owner_user_id')}")
     _thread.start()
     audit_event("engine.start", details={"execution_mode": state["config"]["execution_mode"],
                                          "sandbox": state["config"].get("sandbox_mode")}, user=user)
@@ -3145,20 +4569,22 @@ def api_pause():
     flight any more. Reporting "paused" while a real trade is still reconciling
     is how someone closes the terminal on a half-done position.
     """
-    global active_soak_run_id
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     stopped = stop_scan_thread()
     with state_lock:
         state["running"] = False
+        state["worker_status"] = "paused" if stopped else "stopping"
         if not stopped:
             state["error"] = ("Pause requested, but a trade is still being "
                               "reconciled. Do not close the process yet.")
-    if stopped and active_soak_run_id is not None:
-        with db() as connection:
-            connection.execute(
-                "UPDATE soak_runs SET completed_at = ?, status = 'completed' WHERE id = ?",
-                (datetime.now().isoformat(timespec="seconds"), active_soak_run_id),
-            )
-        active_soak_run_id = None
+    if stopped:
+        complete_soak_run()
+        persist_risk_state()
+        release_worker_lease(state.get("owner_user_id"))
     audit_event("engine.pause", outcome="ok" if stopped else "pending")
     return jsonify({"ok": True, "settled": stopped,
                     "error": None if stopped else state.get("error")})
@@ -3166,10 +4592,18 @@ def api_pause():
 
 @app.route("/api/emergency-stop", methods=["POST"])
 def api_emergency_stop():
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     _emergency_stop.set()
     _stop_flag.set()
+    risk_manager.kill("operator emergency stop")
+    persist_risk_state()
     with state_lock:
         state["running"] = False
+        state["worker_status"] = "stopping"
         state["error"] = "Emergency stop engaged. Reset is required before restarting."
     return jsonify({"ok": True, "message": state["error"]})
 
@@ -3180,6 +4614,11 @@ def api_reset():
     # loop is mid-trade would swap those objects out from under an order that is
     # still being reconciled, so the rebuild waits for the thread to leave and
     # refuses rather than races it.
+    user = request_user()
+    with state_lock:
+        owner_error = require_engine_owner(user)
+    if owner_error:
+        return jsonify({"ok": False, "error": owner_error}), 409
     settled = stop_scan_thread()
     with state_lock:
         state["running"] = False
@@ -3190,6 +4629,13 @@ def api_reset():
             message = state["error"]
         return jsonify({"ok": False, "error": message}), 409
     try:
+        risk_manager.killed = False
+        if risk_manager.halt_limit == risk.HALT_KILL:
+            risk_manager.halted = False
+            risk_manager.halt_limit = ""
+            risk_manager.halt_reason = ""
+            risk_manager.halted_at = None
+        persist_risk_state()
         reset_state()
     except Exception as e:
         with state_lock:
@@ -3205,6 +4651,76 @@ def api_config():
     first (the frontend pauses+resets automatically for those)."""
     data = request.get_json(force=True) or {}
     user = request_user()
+    saved_signal = load_paper_account(user_identity(user), "signal_paper") if user else None
+    saved_position = (saved_signal or {}).get("signal_state", {}).get("position")
+    if saved_position:
+        incompatible = (data.get("strategy", "signal_trend") != "signal_trend"
+                        or data.get("mode", "live") != "live"
+                        or data.get("execution_mode", "paper") != "paper"
+                        or data.get("exchanges", [saved_position["exchange"]]) != [saved_position["exchange"]]
+                        or saved_position["symbol"] not in data.get("symbols", [saved_position["symbol"]]))
+        if incompatible:
+            return jsonify({"ok": False, "error": "A persisted signal paper position is still open. Resume its original signal strategy and exchange until it exits."}), 409
+    with state_lock:
+        if (state.get("owner_user_id") == user_identity(user)
+                and isinstance(wallet, PaperAccount) and wallet.signal_state.get("position")):
+            current = {**state["config"], "exchanges": state["active_exchanges"], "symbols": state["active_symbols"]}
+            if any(key in data and data[key] != current.get(key)
+                   for key in ("strategy", "mode", "execution_mode", "exchanges", "symbols")):
+                return jsonify({"ok": False, "error": "An open signal paper position is still being managed. Keep its strategy, data mode, venue and symbols until it exits."}), 409
+    # Saving another account's preferences must never claim or alter the
+    # running account's worker, even when the viewer is an administrator.
+    with state_lock:
+        other_owner = (user and state.get("owner_user_id") not in
+                       (None, user_identity(user)))
+    if other_owner:
+        saved = load_user_config(user_identity(user)) or {
+            "config": copy.deepcopy(DEFAULT_ACCOUNT_STATE["config"]),
+            "exchanges": list(DEFAULT_ACCOUNT_STATE["active_exchanges"]),
+            "symbols": list(DEFAULT_ACCOUNT_STATE["active_symbols"]),
+        }
+        config = {**DEFAULT_ACCOUNT_STATE["config"], **saved["config"]}
+        acknowledgement = data.get("real_trading_ack")
+        if acknowledgement not in (None, arbiconfig.REAL_TRADING_ACK):
+            return jsonify({"ok": False, "error": "Invalid real-order acknowledgement."}), 400
+        for key in config:
+            if key in data:
+                config[key] = data[key]
+        if config.get("execution_mode") not in ("paper", "real"):
+            return jsonify({"ok": False, "error": "execution_mode must be paper or real."}), 400
+        exchanges = data.get("exchanges", saved["exchanges"])
+        symbols = data.get("symbols", saved["symbols"])
+        if (not isinstance(exchanges, list) or not exchanges
+                or any(x not in bot.EXCHANGES_MASTER for x in exchanges)
+                or not isinstance(symbols, list) or not symbols
+                or any(x not in bot.SYMBOLS_MASTER for x in symbols)):
+            return jsonify({"ok": False, "error": "Select supported exchanges and assets."}), 400
+        if config.get("execution_mode") == "real":
+            config["mode"] = "live"
+            if config.get("intelligence_enabled") is not True:
+                return jsonify({"ok": False, "error": "Decision intelligence is mandatory for real execution."}), 400
+        for key in ("intelligence_enabled", "real_trading_enabled", "sandbox_mode"):
+            if not isinstance(config.get(key), bool):
+                return jsonify({"ok": False, "error": f"{key} must be true or false."}), 400
+        error = validate_config_update({**config, "exchanges": exchanges, "symbols": symbols})
+        if error:
+            return jsonify({"ok": False, "error": error}), 400
+        for key in ("trade_size", "fee", "min_profit", "max_slippage", "interval",
+                    "gap_chance", "max_daily_loss", "max_position_notional",
+                    "min_model_confidence"):
+            config[key] = float(config[key])
+        for key in ("max_consecutive_failures", "max_orders_per_minute", "max_trades_per_hour"):
+            config[key] = int(float(config[key]))
+        config["interval"] = max(float(config["interval"]),
+                                 recommended_scan_interval(config, exchanges, symbols))
+        with db() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO user_configs (user_id, payload, updated_at) VALUES (?, ?, ?)",
+                (user["id"], json.dumps({"config": config, "exchanges": exchanges,
+                                        "symbols": symbols}), utc_now_iso()))
+        audit_event("engine.config", details={"saved_only": True}, user=user)
+        return jsonify({"ok": True, "saved_only": True, "needs_rebuild": False,
+                        "message": "Your settings were saved. The other account's engine is unchanged."})
     with state_lock:
         owner_error = require_engine_owner(user, claim=True)
     if owner_error:
@@ -3213,6 +4729,17 @@ def api_config():
     if acknowledgement is not None and acknowledgement != arbiconfig.REAL_TRADING_ACK:
         return jsonify({"ok": False,
                         "error": f"Type {arbiconfig.REAL_TRADING_ACK!r} exactly to enable real execution."}), 400
+    if "intelligence_enabled" in data and not isinstance(data["intelligence_enabled"], bool):
+        return jsonify({"ok": False, "error": "intelligence_enabled must be true or false."}), 400
+    requested_execution = data.get(
+        "execution_mode", state["config"].get("execution_mode"))
+    requested_intelligence = data.get(
+        "intelligence_enabled", state["config"].get("intelligence_enabled", True))
+    if requested_execution == "real" and not requested_intelligence:
+        return jsonify({
+            "ok": False,
+            "error": "Decision intelligence is mandatory for real execution.",
+        }), 400
     safe_adjustments = {}
     if "interval" in data:
         try:
@@ -3276,7 +4803,8 @@ def api_config():
             # is lost on restart and is never written to the database or HTML.
             bot.REAL_TRADING_ACK = acknowledgement
         for key in ("trade_size", "fee", "min_profit", "max_slippage", "interval",
-                    "gap_chance", "max_daily_loss", "max_position_notional"):
+                    "gap_chance", "max_daily_loss", "max_position_notional",
+                    "min_model_confidence"):
             if key in data:
                 state["config"][key] = float(data[key])
         # Counts, not amounts: a fractional "2.5 failures in a row" would never
@@ -3286,28 +4814,31 @@ def api_config():
             if key in data:
                 state["config"][key] = int(float(data[key]))
 
-        if "mode" in data and data["mode"] in ("demo", "live") and data["mode"] != state["config"]["mode"]:
+        if "intelligence_enabled" in data:
+            state["config"]["intelligence_enabled"] = data["intelligence_enabled"]
+
+        if "mode" in data and data["mode"] in ("demo", "live"):
+            needs_rebuild = needs_rebuild or data["mode"] != state["config"]["mode"]
             state["config"]["mode"] = data["mode"]
-            bot.MODE = state["config"]["mode"]
-            needs_rebuild = True
+            bot.MODE = data["mode"]
 
         if "execution_mode" in data:
             if data["execution_mode"] != state["config"]["execution_mode"]:
-                state["config"]["execution_mode"] = data["execution_mode"]
-                bot.EXECUTION_MODE = data["execution_mode"]
                 needs_rebuild = True
-                # Real execution requires live mode: auto-switch if needed
-                if data["execution_mode"] == "real" and state["config"]["mode"] != "live":
-                    state["config"]["mode"] = "live"
-                    bot.MODE = "live"
+            state["config"]["execution_mode"] = data["execution_mode"]
+            bot.EXECUTION_MODE = data["execution_mode"]
+            # Real execution requires live mode: auto-switch if needed
+            if data["execution_mode"] == "real" and state["config"]["mode"] != "live":
+                state["config"]["mode"] = "live"
+                bot.MODE = "live"
+                needs_rebuild = True
 
         if "strategy" in data:
-            if data["strategy"] not in ("cross_exchange", "triangular"):
-                return jsonify({"ok": False, "error": "strategy must be cross_exchange or triangular."}), 400
-            if data["strategy"] != state["config"]["strategy"]:
-                state["config"]["strategy"] = data["strategy"]
-                bot.TRADING_STRATEGY = data["strategy"]
-                needs_rebuild = True
+            if data["strategy"] not in ("cross_exchange", "triangular", "signal_trend"):
+                return jsonify({"ok": False, "error": "Select cross_exchange, triangular, or signal_trend."}), 400
+            needs_rebuild = needs_rebuild or data["strategy"] != state["config"]["strategy"]
+            state["config"]["strategy"] = data["strategy"]
+            bot.TRADING_STRATEGY = data["strategy"]
 
         if "real_trading_enabled" in data:
             state["config"]["real_trading_enabled"] = bool(data["real_trading_enabled"])
@@ -3398,7 +4929,8 @@ def api_csv():
         "time", "symbol", "buy_exchange", "sell_exchange", "buy_price",
         "sell_price", "trade_size_usdt", "profit_usdt", "net_profit_pct",
         "status", "execution_mode", "strategy", "expected_profit_usdt",
-        "realized_slippage_usdt",
+        "realized_slippage_usdt", "decision_confidence", "predicted_edge_pct",
+        "adaptive_profit_floor_pct", "market_regime", "data_mode",
     )
     query = f"SELECT {', '.join(fields)} FROM trades"
     parameters = ()
@@ -3462,7 +4994,24 @@ def bootstrap():
     bot.SYMBOLS_MASTER = list(bot.SYMBOLS_MASTER)
     bot.EXCHANGES_MASTER = list(bot.EXCHANGES_MASTER)
     with state_lock:
-        init_engine()
+        try:
+            init_engine()
+        except Exception as exc:
+            # The dashboard and synthetic tutorial must remain available during
+            # an exchange/network outage. A later Start request retries live
+            # initialization and reports the actionable failure to the user.
+            state["running"] = False
+            state["worker_status"] = "paused"
+            state["last_scan_status"] = "feed_unavailable"
+            state["last_scan_message"] = (
+                f"Live market data is unavailable: {exc}. Start will retry."
+            )
+            state["error"] = None
+            state["paper_portfolio_value"] = bot.PAPER_STARTING_BALANCE_USDT
+            state["portfolio_value"] = (
+                bot.PAPER_STARTING_BALANCE_USDT
+                if state["config"].get("execution_mode") == "paper" else None)
+            logger.warning("Live feed unavailable at startup: %s", exc)
 
 
 def pick_port(host=HOST, ports=None):

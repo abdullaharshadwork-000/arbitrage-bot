@@ -1,5 +1,6 @@
 """Role and dashboard API regressions for the professional UI."""
 
+import json
 import unittest
 import tempfile
 import time
@@ -73,6 +74,105 @@ class TestDashboardRoles(unittest.TestCase):
         finally:
             response.close()
 
+    def test_preferences_belong_to_each_account(self):
+        self.login(username="preferences-one")
+        response = self.client.post("/api/account/preferences", json={"theme": "light", "notifications": "none"})
+        self.assertEqual(response.status_code, 200)
+        second = server.app.test_client()
+        second.get("/").close()
+        second.post("/api/auth/register", json={"username": "preferences-two", "email": "two@localhost", "password": "local-demo-password"})
+        second.post("/api/auth/login", json={"username": "preferences-two", "password": "local-demo-password"})
+        self.assertEqual(second.get("/api/account/preferences").get_json()["theme"], "dark")
+        self.assertEqual(self.client.get("/api/account/preferences").get_json()["theme"], "light")
+        self.assertEqual(self.client.post("/api/account/preferences", json={"theme": "invalid"}).status_code, 400)
+
+    def test_signal_strategy_cannot_be_armed_with_real_funds(self):
+        self.login(username="signal-guard")
+        response = self.client.post("/api/config", json={
+            "strategy": "signal_trend", "mode": "live", "execution_mode": "real",
+            "exchanges": ["binance"],
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("paper", response.get_json()["error"].lower())
+
+    def test_signal_history_excludes_legacy_arbitrage_profit(self):
+        self.login(username="signal-history")
+        owner = server.state["owner_user_id"]
+        old_strategy = server.state["config"]["strategy"]
+        try:
+            server.state["config"]["strategy"] = "signal_trend"
+            with server.db() as connection:
+                for mode, profit in [("legacy", 100), ("signal_paper", -2)]:
+                    connection.execute("INSERT INTO trades(time,symbol,profit_usdt,user_id,performance_mode) VALUES(?,?,?,?,?)",
+                                       ("2026-09-07T00:00:00+00:00", "BTC/USDT", profit, owner, mode))
+            self.assertEqual(self.client.get("/api/user/stats").get_json()["stats"]["total_profit"], -2)
+            self.assertEqual(len(self.client.get("/api/history").get_json()["trades"]), 1)
+        finally:
+            server.state["config"]["strategy"] = old_strategy
+
+    def test_persisted_signal_position_locks_config_without_in_memory_wallet(self):
+        self.login(username="signal-restart")
+        owner = server.state["owner_user_id"]
+        with server.db() as connection:
+            connection.execute("INSERT INTO paper_accounts(user_id,mode,payload,updated_at) VALUES(?,?,?,?)",
+                               (owner, "signal_paper", json.dumps({"signal_state": {
+                                   "position": {"exchange": "binance", "symbol": "BTC/USDT"}}}), "2026-09-07"))
+        server.wallet = None  # Same state as after activating a restored session.
+        response = self.client.post("/api/config", json={"strategy": "cross_exchange"})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("persisted", response.get_json()["error"])
+
+    def test_paper_wallet_persistence_is_account_and_mode_scoped(self):
+        from arbicore.paper import PaperAccount
+        self.login(username="paper-owner")
+        owner = server.state["owner_user_id"]
+        server.state["config"]["execution_mode"] = "paper"
+        mode = server.performance_mode(server.state["config"])
+        server.wallet = PaperAccount(["binance"], ["BTC/USDT"], 20000, {"BTC/USDT": 100}, "triangular")
+        server.wallet.ledger.debit("binance", "USDT", 25)
+        with server.db() as connection:
+            server.save_paper_account(connection)
+        stored = server.load_paper_account(owner, mode)
+        self.assertEqual(stored["balances"]["binance"]["USDT"], "19975")
+        self.assertIsNone(server.load_paper_account(owner + 100, mode))
+        self.assertIsNone(server.load_paper_account(owner, "production"))
+
+    def test_admin_settings_are_isolated_from_running_trader(self):
+        self.login(username="isolated-trader")
+        trader_id = self.client.get("/api/state").get_json()["current_user"]["id"]
+        server.state["config"]["interval"] = 17.0
+        server.state["running"] = True
+        server.state["quotes"] = {"private-marker": {}}
+        try:
+            admin = server.app.test_client()
+            admin.get("/").close()
+            response = admin.post("/api/auth/login", json={
+                "username": server.DEFAULT_ADMIN_USERNAME,
+                "password": server.DEFAULT_ADMIN_PASSWORD,
+            })
+            self.assertEqual(response.status_code, 200)
+            shown = admin.get("/api/state").get_json()
+            self.assertNotEqual(shown["config"]["interval"], 17.0)
+            self.assertEqual(shown["quotes"], {})
+            self.assertEqual(shown["balances"], {})
+            result = admin.post("/api/config", json={"interval": 9.0})
+            self.assertEqual(result.status_code, 200, result.get_json())
+            self.assertTrue(result.get_json()["saved_only"])
+            self.assertEqual(admin.get("/api/state").get_json()["config"]["interval"], 9.0)
+            self.assertEqual(server.state["config"]["interval"], 17.0)
+            self.assertEqual(server.state["owner_user_id"], trader_id)
+            self.assertTrue(server.state["running"])
+        finally:
+            server.state["running"] = False
+
+    def test_new_account_does_not_inherit_previous_accounts_settings(self):
+        server.state["running"] = False
+        self.login(username="first-settings-user")
+        server.state["config"]["interval"] = 29.0
+        self.login(username="second-settings-user")
+        self.assertEqual(self.client.get("/api/state").get_json()["config"]["interval"],
+                         server.DEFAULT_ACCOUNT_STATE["config"]["interval"])
+
     def test_dashboard_javascript_is_served_as_a_non_inline_asset(self):
         response = self.client.get("/dashboard-pro.js")
         try:
@@ -80,6 +180,30 @@ class TestDashboardRoles(unittest.TestCase):
             self.assertIn(b"function refreshAll", response.data)
         finally:
             response.close()
+
+    def test_credential_api_supports_every_exchange_and_api_passphrases(self):
+        self.login()
+        status = self.client.get("/api/user/api-keys").get_json()
+        self.assertEqual(
+            {item["exchange"] for item in status["exchanges"]},
+            {"binance", "kucoin", "okx", "bybit"},
+        )
+        missing = self.client.post("/api/user/api-keys", json={
+            "exchange": "kucoin", "api_key": "key", "api_secret": "secret",
+        })
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("passphrase", missing.get_json()["error"].lower())
+
+        saved = self.client.post("/api/user/api-keys", json={
+            "exchange": "kucoin", "api_key": "key", "api_secret": "secret",
+            "password": "api-passphrase",
+        })
+        self.assertEqual(saved.status_code, 200)
+        user_id = server.state["owner_user_id"]
+        self.assertEqual(
+            server.user_credentials[user_id]["kucoin"]["password"],
+            "api-passphrase",
+        )
 
     def test_backend_source_files_are_not_public(self):
         self.assertEqual(self.client.get("/server.py").status_code, 404)
@@ -225,6 +349,16 @@ class TestDashboardRoles(unittest.TestCase):
         restored = self.client.get("/api/onboarding").get_json()
         self.assertTrue(restored["completed"])
         self.assertEqual(restored["experience_mode"], "beginner")
+        with server.db() as connection:
+            saved = connection.execute(
+                "SELECT user_configs.payload FROM user_configs "
+                "JOIN users ON users.id = user_configs.user_id "
+                "WHERE users.username = 'operator'"
+            ).fetchone()
+        paper_config = json.loads(saved[0])["config"]
+        self.assertEqual(paper_config["mode"], "live")
+        self.assertEqual(paper_config["execution_mode"], "paper")
+        self.assertFalse(paper_config["real_trading_enabled"])
 
     def test_admin_sees_real_session_count(self):
         self.assertEqual(self.login(username="admin").status_code, 200)

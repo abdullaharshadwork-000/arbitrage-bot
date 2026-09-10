@@ -1,3 +1,42 @@
+.market-overview { margin-bottom: 1.5rem; }
+.market-header { flex-wrap: wrap; gap: 1rem; }
+.market-header p { font-size: .82rem; margin-top: .5rem; }
+.market-selectors { display: flex; flex-wrap: wrap; gap: .65rem; }
+.market-selectors label { font-size: .75rem; color: var(--text-secondary); }
+.market-selectors select { display: block; min-width: 100px; margin-top: .35rem; padding: .6rem; background: var(--bg-dark); color: var(--text-primary); border: 1px solid var(--border); border-radius: 10px; }
+.market-selectors select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.light-mode #marketFreshness.text-success { color: #047857; }
+.market-price-row { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; margin-bottom: 1rem; }
+.market-price-row strong { font-size: 1.65rem; font-variant-numeric: tabular-nums; }
+#marketFreshness { font-size: .78rem; margin-left: auto; }
+.market-layout { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(230px, 1fr); gap: 1.5rem; }
+.market-visual { min-width: 0; }
+.market-legend { display: flex; gap: 1rem; flex-wrap: wrap; font-size: .72rem; color: var(--text-muted); }
+.market-fast { color: #a78bfa; } .market-slow { color: #f59e0b; }
+.light-mode .market-fast { color: #6d28d9; } .light-mode .market-slow { color: #92400e; }
+#marketChart { width: 100%; height: 360px; margin-top: .5rem; }
+#marketChart.market-stale { opacity: .42; }
+#marketChartMessage { font-size: .78rem; margin-top: .7rem; }
+.market-attribution { color: var(--text-muted); font-size: .65rem; margin-top: .8rem; line-height: 1.6; }
+.market-attribution a { color: var(--text-secondary); }
+.market-decision { border-left: 1px solid var(--glass-line); padding-left: 1.5rem; font-size: .85rem; }
+.market-suggestion { display: block; font-size: 1.65rem; margin: .8rem 0; color: var(--text-secondary); }
+.market-suggestion[data-action="BUY CANDIDATE"] { color: var(--success); }
+.market-suggestion[data-action="EXIT"] { color: var(--danger); }
+.light-mode .market-suggestion[data-action="BUY CANDIDATE"] { color: #047857; }
+.market-indicators { margin: 1.2rem 0; }
+.market-indicators div { display: flex; justify-content: space-between; gap: 1rem; padding: .55rem 0; border-bottom: 1px solid var(--glass-line); }
+.market-indicators dt { color: var(--text-muted); }
+.market-indicators dd { margin: 0; font-variant-numeric: tabular-nums; }
+.market-safety-note { padding: .85rem; margin-top: 1rem; font-size: .8rem; line-height: 1.6; border: 1px solid var(--glass-line); border-radius: 12px; background: var(--glass); }
+.market-risk { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; border-top: 1px solid var(--glass-line); margin-top: 1.25rem; padding-top: 1.25rem; }
+.market-risk span, .market-risk strong, .market-risk small { display: block; }
+.market-risk span { font-size: .76rem; }
+.market-risk strong { font-size: .95rem; margin: .55rem 0; }
+.market-risk small { color: var(--text-muted); font-size: .72rem; line-height: 1.5; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .market-layout { grid-template-columns: 1fr; } .market-decision { border-left: none; padding-left: 0; } .market-risk { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 520px) { .market-risk { grid-template-columns: 1fr; } #marketFreshness { margin-left: 0; } #marketChart { height: 300px; } }
+
 :root {
         /* Dark theme */
         --primary: #6366f1;

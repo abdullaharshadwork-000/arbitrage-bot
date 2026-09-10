@@ -35,7 +35,7 @@ EXECUTION_MODES = (EXECUTION_PAPER, EXECUTION_REAL)
 
 STRATEGY_CROSS = "cross_exchange"
 STRATEGY_TRIANGULAR = "triangular"
-STRATEGIES = (STRATEGY_CROSS, STRATEGY_TRIANGULAR)
+STRATEGIES = (STRATEGY_CROSS, STRATEGY_TRIANGULAR, "signal_trend")
 
 # Typing this exact string is the last gate before real orders. It exists so
 # that enabling live trading cannot happen by flipping one boolean that
@@ -47,6 +47,7 @@ REAL_TRADING_ACK = "I ACCEPT REAL LOSSES"
 ABSOLUTE_MAX_TRADE_SIZE_USDT = Decimal("5000")
 
 ENV_PREFIX = "ARBI"
+PASSPHRASE_EXCHANGES = frozenset({"kucoin", "okx"})
 
 
 def _env_name(exchange, suffix):
@@ -66,7 +67,12 @@ class Credentials:
 
     @property
     def complete(self):
-        return bool(self.api_key and self.api_secret)
+        return not self.missing()
+
+    @property
+    def requires_password(self):
+        """Whether CCXT needs an API passphrase in addition to key + secret."""
+        return self.exchange.lower() in PASSPHRASE_EXCHANGES
 
     def missing(self):
         gaps = []
@@ -74,6 +80,8 @@ class Credentials:
             gaps.append("api_key")
         if not self.api_secret:
             gaps.append("api_secret")
+        if self.requires_password and not self.password:
+            gaps.append("password")
         return gaps
 
     @staticmethod
@@ -113,7 +121,7 @@ class Credentials:
         key = env.get(_env_name(exchange, "API_KEY"), "").strip()
         secret = env.get(_env_name(exchange, "API_SECRET"), "").strip()
         password = env.get(_env_name(exchange, "PASSWORD"), "").strip()
-        source = "env" if (key or secret) else "unset"
+        source = "env" if (key or secret or password) else "unset"
         return cls(str(exchange), key, secret, password, source)
 
     @classmethod
@@ -123,7 +131,7 @@ class Credentials:
         secret = str(data.get("secret") or data.get("api_secret") or "").strip()
         password = str(data.get("password") or data.get("passphrase") or "").strip()
         return cls(str(exchange), key, secret, password,
-                   source if (key or secret) else "unset")
+                   source if (key or secret or password) else "unset")
 
 
 def load_credentials(exchanges, fallback=None, environ=None):
@@ -309,6 +317,13 @@ class Settings:
             problems.append("no exchanges configured")
         if self.strategy == STRATEGY_CROSS and len(self.exchanges) < 2:
             problems.append("cross-exchange arbitrage needs at least two exchanges")
+        if self.strategy == "signal_trend":
+            if self.execution_mode != EXECUTION_PAPER or self.mode != MODE_LIVE:
+                problems.append("Signal trend requires live-data paper execution; real orders are not supported")
+            if len(self.exchanges) != 1:
+                problems.append("Signal trend requires exactly one exchange")
+            if any(not symbol.endswith("/USDT") for symbol in self.symbols):
+                problems.append("Signal trend supports USDT spot pairs only")
         if not self.symbols:
             problems.append("no symbols configured")
 

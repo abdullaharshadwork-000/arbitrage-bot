@@ -193,6 +193,7 @@
                 $<span id="totalBalance">0.00</span>
               </div>
               <div class="metric-change balance-source" id="totalBalanceSource"><i class="fas fa-wallet"></i> Waiting for account data</div>
+              <div class="metric-change" id="paperPerformance"></div>
             </div>
             <div class="metric-card">
               <div class="metric-label">📈 Total Profit</div>
@@ -207,9 +208,9 @@
               <div class="metric-change">Calculated from recorded trades</div>
             </div>
             <div class="metric-card">
-              <div class="metric-label">🔄 Active Trades</div>
+              <div class="metric-label"><i class="fas fa-arrows-rotate"></i> Scans Completed</div>
               <div class="metric-value"><span id="activeTrades">0</span></div>
-              <div class="metric-change">Current scan-loop activity</div>
+              <div class="metric-change" id="scanProgressText">Engine is paused</div>
             </div>
           </div>
 
@@ -456,6 +457,51 @@
         <div class="page" id="trading">
           <h1 class="mb-4"><i class="fas fa-sync"></i> Trading Terminal</h1>
 
+          <section class="card market-overview" aria-labelledby="marketTitle">
+            <div class="card-header market-header">
+              <div>
+                <h2 class="card-title" id="marketTitle"><i class="fas fa-chart-line"></i> Live Market &amp; Decision</h2>
+                <p class="text-muted">Public spot prices · Analysis is not an order instruction</p>
+              </div>
+              <div class="market-selectors">
+                <label for="marketExchange">Exchange<select id="marketExchange" aria-label="Market exchange"></select></label>
+                <label for="marketSymbol">Market<select id="marketSymbol" aria-label="Market pair"></select></label>
+                <label for="marketTimeframe">Chart interval<select id="marketTimeframe"><option value="1m">1 minute</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option></select></label>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="market-price-row"><strong id="marketPrice">—</strong><span id="marketRegime">Waiting for market data</span><span id="marketFreshness" role="status">Not connected</span></div>
+              <div class="market-layout">
+                <div class="market-visual">
+                  <div class="market-legend"><span class="market-fast">EMA 9</span><span class="market-slow">EMA 21</span><span>Volume · chart time in UTC</span></div>
+                  <div id="marketChart" role="img" aria-label="Live spot candlesticks with EMA 9, EMA 21 and volume"></div>
+                  <p id="marketChartMessage" role="status" class="text-muted">Open the terminal to load current exchange candles.</p>
+                  <p class="market-attribution">TradingView Lightweight Charts™ · Copyright (c) 2025 TradingView, Inc. · <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a> · <a href="/assets/lightweight-charts-NOTICE" target="_blank" rel="noopener">Notice</a><br>Data comes from the selected exchange, not TradingView alerts. Updated every 5 seconds while visible.</p>
+                </div>
+                <div class="market-decision">
+                  <span class="text-muted">Closed 1-minute candle analysis</span>
+                  <strong id="marketSuggestion" class="market-suggestion">WAIT</strong>
+                  <p id="marketReason">Waiting for verified market data.</p>
+                  <dl class="market-indicators">
+                    <div><dt>RSI (14)</dt><dd id="marketRsi">—</dd></div>
+                    <div><dt>5-minute move</dt><dd id="marketMove5">—</dd></div>
+                    <div><dt>10-minute move</dt><dd id="marketMove10">—</dd></div>
+                    <div><dt>Volume / baseline</dt><dd id="marketVolumeRatio">—</dd></div>
+                  </dl>
+                  <p id="marketCandleTime" class="text-muted">No completed candle yet.</p>
+                  <p class="market-safety-note">Long-only spot analysis. WAIT is a valid outcome. A signal cannot guarantee profit or bypass execution safeguards.</p>
+                </div>
+              </div>
+              <section class="market-risk" aria-label="Saved account risk and execution status">
+                <div><span class="text-muted">Saved execution target</span><strong id="marketTarget">—</strong><small id="marketReadiness">Account checks pending</small></div>
+                <div><span class="text-muted">Daily realized P&amp;L (UTC)</span><strong id="marketDailyPnl">—</strong><small>Recorded bot trades only; excludes unrealized losses and other account activity.</small></div>
+                <div><span class="text-muted">Daily realized-loss budget left</span><strong id="marketLossRemaining">—</strong><small id="marketLossLimit">Risk status pending</small></div>
+                <div><span class="text-muted">Trend position protection</span><strong id="marketProtection">Not verified for real funds</strong><small id="marketPosition">No position data loaded</small></div>
+              </section>
+              <p id="marketExecutionBlocker" class="market-safety-note">Trend signals do not authorize real-money orders.</p>
+            </div>
+          </section>
+
           <div class="grid-2">
             <div class="card">
               <div class="card-header">
@@ -465,17 +511,18 @@
               </div>
               <div class="card-body">
                 <div class="form-group">
-                  <label class="form-label">Trading Mode</label>
+                  <label class="form-label">Market Data</label>
                   <select class="form-select" id="tradingMode">
-                    <option value="demo">Demo data / Paper execution</option>
-                    <option value="live">Live data / Paper execution</option>
+                    <option value="live">Real exchange order books (recommended)</option>
+                    <option value="demo">Synthetic tutorial market (offline)</option>
                   </select>
+                  <small class="text-muted">Real market data is public and needs no API key. This setting does not control whether real money is used.</small>
                 </div>
                 <div class="form-group">
                   <label class="form-label">Order Execution</label>
                   <select class="form-select" id="executionTarget">
-                    <option value="paper">Paper orders (safe)</option>
-                    <option value="testnet">Binance Spot Testnet</option>
+                    <option value="paper">Demo wallet / simulated orders (safe)</option>
+                    <option value="testnet">Exchange testnet / sandbox</option>
                     <option value="production">Real funds (production)</option>
                   </select>
                 </div>
@@ -484,7 +531,13 @@
                   <select class="form-select" id="tradingStrategy">
                     <option value="cross_exchange">Cross-exchange (2+ funded venues)</option>
                     <option value="triangular">Triangular (one venue)</option>
+                    <option value="signal_trend">Automatic trend signals (live-data paper)</option>
                   </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Trading Venues</label>
+                  <div id="tradingExchanges" class="flex gap-2" style="flex-wrap:wrap"></div>
+                  <small class="text-muted">Cross-exchange needs at least two venues. A triangular route uses one selected venue.</small>
                 </div>
                 <div class="form-group" id="realAcknowledgementGroup" style="display:none">
                   <label class="form-label">Real-order confirmation</label>
@@ -587,6 +640,33 @@
                     <span class="text-muted">Rejected orders:</span>
                     <span id="statusRejectedOrders">0</span>
                   </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Market regime:</span>
+                    <span id="statusModelRegime">Warming up</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Opportunity confidence:</span>
+                    <span id="statusModelConfidence">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Predicted net edge:</span>
+                    <span id="statusPredictedEdge">--</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-muted">Strategy evidence:</span>
+                    <span id="statusStrategyEvidence">Collecting paper results</span>
+                  </div>
+                  <div class="text-muted" id="intelligenceExplanation" style="font-size:.78rem;line-height:1.45;margin-top:.5rem">
+                    The model estimates whether an observed arbitrage edge can survive volatility and execution delay. It does not guarantee profit.
+                  </div>
+                  <section id="signalPanel" class="hidden" aria-live="polite">
+                    <h3>Automatic trend signals · Paper only</h3>
+                    <p class="text-muted">Closed 1-minute candles · 5/10-minute momentum · EMA 9/21 · RSI 14 · ATR sizing. One position at a time. Stops are simulated, not guaranteed prices. Pausing stops monitoring.</p>
+                    <div id="signalPosition">No open signal position.</div>
+                    <div id="signalReports">Waiting for the first candle scan.</div>
+                    <h4>Exchange qualification</h4>
+                    <div id="signalCapabilities">Loading exchange support…</div>
+                  </section>
                 </div>
               </div>
             </div>
@@ -696,7 +776,19 @@
                   <div class="form-group"><label class="form-label" for="settingsMaxSlippage">Maximum slippage (%)</label><input class="form-input" id="settingsMaxSlippage" type="number" min="0" max="5" step="0.01" required /></div>
                   <div class="form-group"><label class="form-label" for="settingsOrdersMinute">Maximum orders / minute</label><input class="form-input" id="settingsOrdersMinute" type="number" min="1" max="120" step="1" required /></div>
                   <div class="form-group"><label class="form-label" for="settingsTradesHour">Maximum trades / hour</label><input class="form-input" id="settingsTradesHour" type="number" min="1" max="500" step="1" required /></div>
+                  <div class="form-group">
+                    <label class="form-label" for="settingsIntelligence">Decision intelligence</label>
+                    <select class="form-select" id="settingsIntelligence">
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled for paper only</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="settingsModelConfidence">Minimum model confidence (%)</label>
+                    <input class="form-input" id="settingsModelConfidence" type="number" min="65" max="99" step="1" required />
+                  </div>
                 </div>
+                <div class="text-muted" style="font-size:.8rem;margin-bottom:.85rem">Real execution always requires the decision model. Higher confidence rejects more uncertain opportunities.</div>
                 <button class="btn btn-primary" type="submit" style="width:100%"><i class="fas fa-floppy-disk"></i> Save Trading Controls</button>
               </form>
             </div>
@@ -735,32 +827,48 @@
                 </div>
               </div>
               <div class="card-body">
-                <form id="binanceCredentialForm" autocomplete="off">
+                <form id="exchangeCredentialForm" autocomplete="off">
                   <div class="form-group">
-                    <label class="form-label" for="binanceApiKey">Binance API key</label>
-                    <input class="form-input" id="binanceApiKey" type="password"
+                    <label class="form-label" for="credentialExchange">Exchange</label>
+                    <select class="form-select" id="credentialExchange" required>
+                      <option value="binance">Binance</option>
+                      <option value="kucoin">KuCoin</option>
+                      <option value="okx">OKX</option>
+                      <option value="bybit">Bybit</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" id="credentialApiKeyLabel" for="credentialApiKey">Binance API key</label>
+                    <input class="form-input" id="credentialApiKey" type="password"
                       autocomplete="new-password" spellcheck="false" required />
                   </div>
                   <div class="form-group">
-                    <label class="form-label" for="binanceApiSecret">Binance secret key</label>
-                    <input class="form-input" id="binanceApiSecret" type="password"
+                    <label class="form-label" id="credentialApiSecretLabel" for="credentialApiSecret">Binance secret key</label>
+                    <input class="form-input" id="credentialApiSecret" type="password"
                       autocomplete="new-password" spellcheck="false" required />
+                  </div>
+                  <div class="form-group" id="credentialPassphraseGroup" style="display:none">
+                    <label class="form-label" id="credentialPassphraseLabel" for="credentialPassphrase">API passphrase</label>
+                    <input class="form-input" id="credentialPassphrase" type="password"
+                      autocomplete="new-password" spellcheck="false" />
+                    <div class="text-muted" style="font-size:.78rem;margin-top:.35rem">This is the API passphrase created at the exchange, not your ArbiCore or exchange login password.</div>
                   </div>
                   <div class="text-muted" style="font-size:.82rem;line-height:1.5;margin-bottom:.75rem">
-                    Keys stay in server memory and are erased when the server stops.
-                    Use a trade-only key with withdrawals disabled and an IP allowlist.
+                    Live market analysis uses public data and needs no key. Keys are used only for authenticated balance checks and real/testnet execution.
+                    Use trade-only credentials with withdrawals disabled and an IP allowlist.
                   </div>
-                  <div id="binanceCredentialStatus" class="text-muted" style="font-size:.84rem;margin-bottom:.75rem">
+                  <div id="exchangeCredentialStatus" class="text-muted" style="font-size:.84rem;margin-bottom:.75rem">
                     Binance is not connected.
                   </div>
                   <div class="flex gap-2">
-                    <button class="btn btn-primary" id="saveBinanceCredentials" type="submit" style="flex:1">
+                    <button class="btn btn-primary" id="saveExchangeCredentials" type="submit" style="flex:1">
                       <i class="fas fa-link"></i> Connect Binance
                     </button>
-                    <button class="btn btn-danger" id="disconnectBinance" type="button">
+                    <button class="btn btn-danger" id="disconnectExchange" type="button">
                       <i class="fas fa-link-slash"></i> Disconnect
                     </button>
                   </div>
+                  <div id="exchangeCredentialList" class="text-muted" style="font-size:.8rem;line-height:1.7;margin-top:.9rem"></div>
                 </form>
               </div>
             </div>
@@ -872,7 +980,7 @@
         </div>
         <div class="modal-body scroll-hidden">
           <div class="grid-3" style="margin-bottom:1.25rem">
-            <div class="metric-card"><div class="metric-label">1. Learn</div><strong>Use Paper mode first</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Practice with simulated funds and inspect every result.</p></div>
+            <div class="metric-card"><div class="metric-label">1. Learn</div><strong>Use live-data Paper mode</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Analyse current order books with simulated funds and inspect every result.</p></div>
             <div class="metric-card"><div class="metric-label">2. Verify</div><strong>Qualify on Testnet</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Complete the required safe cycles before production unlocks.</p></div>
             <div class="metric-card"><div class="metric-label">3. Protect</div><strong>Use restricted keys</strong><p class="text-muted" style="margin-top:.5rem;font-size:.82rem">Trading only, withdrawals disabled, trusted IPs enabled.</p></div>
           </div>
@@ -897,6 +1005,8 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="/assets/lightweight-charts.js" defer></script>
+    <script src="/market-overview.js" defer></script>
     <script src="/dashboard-pro.js" defer></script>
   </body>
 </html>

@@ -10,6 +10,7 @@ import asyncio
 import importlib
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 
@@ -144,5 +145,171 @@ class CcxtProStream:
             except Exception as exc:
                 self.cache.reconnects += 1
                 self.cache.last_error = f"{exchange} {symbol}: {type(exc).__name__}: {exc}"
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 15.0)
+
+
+class PrivateOrderStream:
+    """Authenticated order updates with an in-memory waitable cache.
+
+    Exchange events are the primary acknowledgement path; callers still use
+    REST reconciliation when the stream is unavailable or an event is missed.
+    The callback must be idempotent because reconnects may replay events.
+    """
+
+    def __init__(self, exchanges, credential_map, sandbox=False, on_event=None):
+        self.exchanges = list(exchanges)
+        self.credential_map = {
+            name: dict((credential_map or {}).get(name) or {})
+            for name in self.exchanges
+        }
+        self.sandbox = bool(sandbox)
+        self.on_event = on_event
+        self._stop = threading.Event()
+        self._thread = None
+        self._started = threading.Event()
+        self._loop = None
+        self._tasks = []
+        # A daemon may run for weeks.  Keep enough recent acknowledgements for
+        # REST fallbacks without retaining every order for the process lifetime.
+        self._events = OrderedDict()
+        self._max_events = 2000
+        self._conditions = {}
+        self._lock = threading.Lock()
+        self.running = False
+        self.reconnects = 0
+        self.last_event_at = None
+        self.last_error = ""
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return True
+        importlib.import_module("ccxt.pro")
+        self._stop.clear()
+        self._started.clear()
+        self._thread = threading.Thread(
+            target=self._thread_main, daemon=True, name="arbicore-private-orders")
+        self._thread.start()
+        self._started.wait(5.0)
+        return self.running
+
+    def stop(self, timeout=5.0):
+        self._stop.set()
+        loop = self._loop
+        tasks = list(self._tasks)
+        if loop and loop.is_running() and tasks:
+            def cancel_watchers():
+                for task in tasks:
+                    task.cancel()
+            loop.call_soon_threadsafe(cancel_watchers)
+        if self._thread:
+            self._thread.join(timeout)
+        stopped = not (self._thread and self._thread.is_alive())
+        if not stopped:
+            self.last_error = "private order stream did not stop within the timeout"
+        return stopped
+
+    def health(self):
+        return {"running": self.running, "reconnects": self.reconnects,
+                "last_event_at": self.last_event_at,
+                "last_error": self.last_error}
+
+    def publish(self, exchange, payload):
+        if not isinstance(payload, dict):
+            return False
+        client_id = str(
+            payload.get("clientOrderId")
+            or (payload.get("info") or {}).get("clientOrderId") or "")
+        if not client_id:
+            return False
+        normalized = dict(payload)
+        normalized["exchange"] = exchange
+        with self._lock:
+            self._events[client_id] = normalized
+            self._events.move_to_end(client_id)
+            while len(self._events) > self._max_events:
+                self._events.popitem(last=False)
+            condition = self._conditions.get(client_id)
+            if condition:
+                condition.notify_all()
+        self.last_event_at = time.time()
+        if self.on_event:
+            self.on_event(exchange, normalized)
+        return True
+
+    def wait_for(self, client_order_id, timeout=2.0):
+        if not client_order_id:
+            return None
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            condition = self._conditions.setdefault(
+                client_order_id, threading.Condition(self._lock))
+            while client_order_id not in self._events:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                condition.wait(remaining)
+            result = self._events.get(client_order_id)
+            self._conditions.pop(client_order_id, None)
+            return result
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run())
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.last_error = f"stream stopped: {type(exc).__name__}: {exc}"
+        finally:
+            self.running = False
+            self._started.set()
+
+    async def _run(self):
+        ccxtpro = importlib.import_module("ccxt.pro")
+        clients = {}
+        self._loop = asyncio.get_running_loop()
+        try:
+            for exchange in self.exchanges:
+                credentials = self.credential_map.get(exchange) or {}
+                config = {"enableRateLimit": True, **credentials}
+                if exchange == "binance":
+                    config["options"] = {"fetchCurrencies": False,
+                                         "adjustForTimeDifference": True,
+                                         "recvWindow": 5000}
+                client = getattr(ccxtpro, exchange)(config)
+                if self.sandbox:
+                    client.set_sandbox_mode(True)
+                clients[exchange] = client
+            self.running = True
+            self._started.set()
+            self._tasks = [
+                asyncio.create_task(self._watch_orders(client, exchange))
+                for exchange, client in clients.items()
+            ]
+            await asyncio.gather(*self._tasks)
+        finally:
+            for task in self._tasks:
+                if not task.done():
+                    task.cancel()
+            if self._tasks:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.gather(*(client.close() for client in clients.values()),
+                                 return_exceptions=True)
+            self._tasks = []
+            self._loop = None
+
+    async def _watch_orders(self, client, exchange):
+        delay = 0.25
+        while not self._stop.is_set():
+            try:
+                updates = await client.watch_orders()
+                if isinstance(updates, dict):
+                    updates = [updates]
+                for update in updates or []:
+                    self.publish(exchange, update)
+                delay = 0.25
+            except Exception as exc:
+                self.reconnects += 1
+                self.last_error = f"{exchange}: {type(exc).__name__}: {exc}"
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 15.0)

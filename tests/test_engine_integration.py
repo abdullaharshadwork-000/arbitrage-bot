@@ -54,6 +54,9 @@ class FakeExchange:
     def fetch_balance(self):
         return self.balances
 
+    def fetch_trading_fee(self, symbol):
+        return {"taker": bot.TAKER_FEE}
+
     def fetch_ticker(self, symbol):
         return self.tickers.get(symbol, {"bid": 0.0, "ask": 0.0})
 
