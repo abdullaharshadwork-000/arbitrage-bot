@@ -27,6 +27,7 @@ HOW TO RUN (see README.md for full instructions):
 import csv
 import importlib.util
 import inspect
+import math
 import os
 import random
 import time
@@ -642,17 +643,46 @@ class RealExecutionEngine:
         account = balance.get(currency, {})
         return float(account.get("free", 0.0) or 0.0)
 
-    def fetch_balances(self, exchange_name, currencies):
-        """Return non-secret free/used/total balances for selected currencies."""
+    def fetch_balances(self, exchange_name, currencies=None):
+        """Return normalized spot holdings; None includes all account assets."""
         balance = self.clients[exchange_name].fetch_balance()
+        if not isinstance(balance, dict):
+            raise ValueError("Invalid spot balance response")
+        if not (any(isinstance(balance.get(kind), dict) for kind in ("free", "used", "total"))
+                or any(isinstance(account, dict) and any(kind in account for kind in ("free", "used", "total"))
+                       for asset, account in balance.items() if asset != "info")):
+            raise ValueError("Spot balance response contains no normalized holdings")
+        if currencies is None:
+            currencies = {"USDT"}
+            for kind in ("free", "used", "total"):
+                currencies.update((balance.get(kind) or {}).keys())
+            currencies.update(asset for asset, account in balance.items()
+                              if isinstance(account, dict) and asset not in
+                              ("info", "free", "used", "total") and
+                              any(kind in account for kind in ("free", "used", "total")))
         result = {}
         for currency in currencies:
             account = balance.get(currency, {})
-            result[currency] = {
-                "free": float(account.get("free", 0.0) or 0.0),
-                "used": float(account.get("used", 0.0) or 0.0),
-                "total": float(account.get("total", 0.0) or 0.0),
-            }
+            values = {kind: account.get(kind, (balance.get(kind) or {}).get(currency))
+                      for kind in ("free", "used", "total")}
+            # Absent currencies are zero only when the normalized response
+            # contains no contradictory amount. Never hide locked holdings.
+            if all(value is None for value in values.values()):
+                values = dict.fromkeys(values, 0.0)
+            elif any(value is None for value in values.values()):
+                raise ValueError(f"Incomplete {currency} spot balance")
+            normalized = {}
+            for kind, value in values.items():
+                number = D(value, default=None)
+                if isinstance(value, bool) or number is None or not number.is_finite() or number < ZERO:
+                    raise ValueError(f"Invalid {currency} {kind} balance")
+                normalized[kind] = float(number)
+                if not math.isfinite(normalized[kind]):
+                    raise ValueError(f"Unsupported {currency} balance")
+            if not math.isclose(normalized["total"], normalized["free"] + normalized["used"],
+                                rel_tol=1e-12, abs_tol=0):
+                raise ValueError(f"Inconsistent {currency} spot balance")
+            result[currency] = normalized
         return result
 
     def value_balances_usdt(self, exchange_name, balances):
@@ -661,7 +691,9 @@ class RealExecutionEngine:
         total_free = 0.0
         total_used = 0.0
         for currency, values in balances.items():
-            if currency == "USDT":
+            if values["free"] == 0 and values["used"] == 0:
+                price = 0.0
+            elif currency == "USDT":
                 price = 1.0
             else:
                 direct = f"{currency}/USDT"
@@ -675,6 +707,8 @@ class RealExecutionEngine:
                     price = 1.0 / ask if ask > 0 else 0.0
                 else:
                     price = 0.0
+            if (values["free"] > 0 or values["used"] > 0) and (not math.isfinite(price) or price <= 0):
+                raise ValueError(f"Cannot value {currency} holdings on {exchange_name}; new entries blocked")
             values["value_free_usdt"] = values["free"] * price
             values["value_used_usdt"] = values["used"] * price
             total_free += values["value_free_usdt"]

@@ -349,13 +349,12 @@ class TestRiskManager(unittest.TestCase):
         self.assertEqual(risk.realized_today, ZERO)
         self.assertTrue(risk.halted)            # a broken venue is still broken
 
-    def test_a_drawdown_from_peak_equity_halts_at_the_next_check(self):
-        # update_equity only records; the latch happens on the next pre-trade
-        # check, which is always before an order goes out.
+    def test_a_drawdown_from_peak_equity_halts_on_the_mark_update(self):
+        # Unrealized drawdown must halt even with no opportunity to trade.
         risk, _clock = manager()
         risk.update_equity(Decimal("10000"))
         risk.update_equity(Decimal("9000"))     # 1000 below the peak
-        self.assertFalse(risk.halted)
+        self.assertTrue(risk.halted)
         decision = risk.check("200")
         self.assertFalse(decision)
         self.assertTrue(risk.halted)

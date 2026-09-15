@@ -103,7 +103,7 @@ class TestDashboardRoles(unittest.TestCase):
             server.state["config"]["strategy"] = "signal_trend"
             with server.db() as connection:
                 for mode, profit in [("legacy", 100), ("signal_paper", -2)]:
-                    connection.execute("INSERT INTO trades(time,symbol,profit_usdt,user_id,performance_mode) VALUES(?,?,?,?,?)",
+                    connection.execute("INSERT INTO trades(time,symbol,profit_usdt,user_id,performance_mode,status) VALUES(?,?,?,?,?,'filled')",
                                        ("2026-09-07T00:00:00+00:00", "BTC/USDT", profit, owner, mode))
             self.assertEqual(self.client.get("/api/user/stats").get_json()["stats"]["total_profit"], -2)
             self.assertEqual(len(self.client.get("/api/history").get_json()["trades"]), 1)
@@ -141,6 +141,7 @@ class TestDashboardRoles(unittest.TestCase):
         self.login(username="isolated-trader")
         trader_id = self.client.get("/api/state").get_json()["current_user"]["id"]
         server.state["config"]["interval"] = 17.0
+        server.state["config"]["max_inventory_exposure_pct"] = 35.0
         server.state["running"] = True
         server.state["quotes"] = {"private-marker": {}}
         try:
@@ -155,11 +156,13 @@ class TestDashboardRoles(unittest.TestCase):
             self.assertNotEqual(shown["config"]["interval"], 17.0)
             self.assertEqual(shown["quotes"], {})
             self.assertEqual(shown["balances"], {})
-            result = admin.post("/api/config", json={"interval": 9.0})
+            result = admin.post("/api/config", json={"interval": 9.0, "max_inventory_exposure_pct": 20.0})
             self.assertEqual(result.status_code, 200, result.get_json())
             self.assertTrue(result.get_json()["saved_only"])
             self.assertEqual(admin.get("/api/state").get_json()["config"]["interval"], 9.0)
             self.assertEqual(server.state["config"]["interval"], 17.0)
+            self.assertEqual(server.state["config"]["max_inventory_exposure_pct"], 35.0)
+            self.assertEqual(admin.get("/api/state").get_json()["config"]["max_inventory_exposure_pct"], 20.0)
             self.assertEqual(server.state["owner_user_id"], trader_id)
             self.assertTrue(server.state["running"])
         finally:
@@ -383,14 +386,51 @@ class TestDashboardRoles(unittest.TestCase):
         with server.db() as connection:
             for index, profit in enumerate((2.0, -1.0), start=1):
                 connection.execute(
-                    "INSERT INTO trades (time, symbol, profit_usdt, status, user_id) "
-                    "VALUES (?, 'BTC/USDT', ?, 'filled', ?)",
-                    (f"2026-01-01T00:00:0{index}", profit, user_id),
+                    "INSERT INTO trades (time, symbol, profit_usdt, status, user_id, performance_mode) "
+                    "VALUES (?, 'BTC/USDT', ?, 'filled', ?, ?)",
+                    (f"2026-01-01T00:00:0{index}", profit, user_id, server.user_performance_mode({"id": user_id})),
                 )
         stats = self.client.get("/api/user/stats").get_json()["stats"]
         self.assertEqual(stats["total_trades"], 2)
         self.assertEqual(stats["total_profit"], 1.0)
         self.assertEqual(stats["win_rate"], 50.0)
+
+    def test_daily_profit_and_losses_are_isolated_by_account_and_execution_mode(self):
+        from datetime import datetime, timezone, timedelta
+        self.login(username="daily-profit")
+        user_id = server.state["owner_user_id"]
+        today = datetime.now(timezone.utc).isoformat()
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with server.db() as connection:
+            for mode in ("tutorial", "paper", "signal_paper", "testnet", "production"):
+                for stamp, profit, status in [(today, 100, "filled"), (today, -16, "closed"),
+                                             (yesterday, -5, "filled"), (today, 999, "pending")]:
+                    connection.execute("INSERT INTO trades(time,profit_usdt,status,user_id,performance_mode,symbol) VALUES(?,?,?,?,?,'BTC/USDT')",
+                                       (stamp, profit, status, user_id, mode))
+            connection.execute("INSERT INTO trades(time,profit_usdt,status,user_id,performance_mode,symbol) VALUES(?,500,'filled',NULL,'production','BTC/USDT')", (today,))
+            connection.execute("INSERT INTO trades(time,profit_usdt,status,user_id,performance_mode,symbol) VALUES(?,999,'filled',?,'legacy','BTC/USDT')", (today, user_id))
+        old_config = dict(server.state["config"])
+        try:
+            for mode, config in [
+                ("tutorial", dict(mode="demo", execution_mode="paper", strategy="cross_exchange")),
+                ("paper", dict(mode="live", execution_mode="paper", strategy="cross_exchange")),
+                ("signal_paper", dict(mode="live", execution_mode="paper", strategy="signal_trend")),
+                ("testnet", dict(mode="live", execution_mode="real", sandbox_mode=True, strategy="triangular")),
+                ("production", dict(mode="live", execution_mode="real", sandbox_mode=False, strategy="triangular"))]:
+                server.state["config"].update(config)
+                response = self.client.get("/api/user/stats")
+                stats = response.get_json()["stats"]
+                self.assertEqual(stats["performance_mode"], mode)
+                self.assertEqual(stats["total_profit"], 79)
+                self.assertEqual(stats["today_profit"], 84)
+                self.assertEqual(stats["total_trades"], 3)
+                self.assertAlmostEqual(stats["win_rate"], 100 / 3)
+                self.assertEqual(stats["today_trades"], 2)
+                self.assertIn("no-store", response.headers["Cache-Control"])
+                history = self.client.get("/api/history?scope=current").get_json()["trades"]
+                self.assertEqual({t["performance_mode"] for t in history}, {mode})
+        finally:
+            server.state["config"].update(old_config)
 
     def test_state_publishes_real_paper_wallet_rows(self):
         self.login()

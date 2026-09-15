@@ -132,14 +132,17 @@ class ExecutionSafety:
         This only reduces the operator's configured size.  It can never raise
         it, and reserves 2% of free quote currency for fees and rounding.
         """
+        budget = D(remaining_loss_budget)
+        # An exhausted or unknown loss allowance must prevent new exposure;
+        # skipping this cap would restore the full size at the daily limit.
+        if not budget.is_finite() or budget <= ZERO:
+            return ZERO
         caps = [D(configured), D(free_quote) * Decimal("0.49")]
         if visible_depth is not None:
             caps.append(D(visible_depth) * Decimal("0.20"))
-        budget = D(remaining_loss_budget)
-        if budget > ZERO:
-            loss_fraction = max(
-                Decimal("0.0001"), D(worst_case_loss_pct) / Decimal("100"))
-            caps.append(budget / loss_fraction)
+        loss_fraction = max(
+            Decimal("0.0001"), D(worst_case_loss_pct) / Decimal("100"))
+        caps.append(budget / loss_fraction)
         volatility = max(ZERO, D(volatility_pct))
         volatility_factor = Decimal("1") / (Decimal("1") + volatility / Decimal("2"))
         return max(ZERO, min(caps) * volatility_factor)

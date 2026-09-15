@@ -58,13 +58,9 @@ let currentUser = null;
         const element = $(id);
         const target = Number(nextValue);
         if (!element || !Number.isFinite(target)) return;
-        const rendered = Number(element.dataset.metricValue);
+        const rendered = Number(element.dataset.metricDisplayed);
         const fallback = Number(String(element.textContent).replace(/,/g, ""));
         const start = Number.isFinite(rendered) ? rendered : (Number.isFinite(fallback) ? fallback : target);
-        if (Math.abs(start - target) < Math.pow(10, -digits) / 2) {
-          element.dataset.metricValue = String(target);
-          return;
-        }
         if (element.metricAnimation) cancelAnimationFrame(element.metricAnimation);
         const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
         const duration = reduceMotion ? 0 : 550;
@@ -72,10 +68,18 @@ let currentUser = null;
         const format = (value) => value.toLocaleString(undefined, {
           minimumFractionDigits: digits, maximumFractionDigits: digits,
         });
+        if (Math.abs(start - target) < Math.pow(10, -digits) / 2) {
+          element.textContent = format(target);
+          element.dataset.metricValue = element.dataset.metricDisplayed = String(target);
+          element.metricAnimation = null;
+          return;
+        }
         const frame = (now) => {
           const progress = duration ? Math.min(1, (now - started) / duration) : 1;
           const eased = 1 - Math.pow(1 - progress, 3);
-          element.textContent = format(start + (target - start) * eased);
+          const displayed = start + (target - start) * eased;
+          element.textContent = format(displayed);
+          element.dataset.metricDisplayed = String(displayed);
           if (progress < 1) element.metricAnimation = requestAnimationFrame(frame);
           else {
             element.dataset.metricValue = String(target);
@@ -300,16 +304,31 @@ let currentUser = null;
       }
 
       async function refreshUserStats() {
+        const userId = currentUser?.id;
         try {
-          const result = await api("/api/user/stats");
+          const result = await api("/api/user/stats", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+          if (!currentUser || currentUser.id !== userId) return;
           const stats = result.stats || {};
           animateMetric("totalProfit", stats.total_profit, 2);
+          animateMetric("todayProfit", stats.today_profit, 2);
           animateMetric("winRate", stats.win_rate, 1);
+          for (const [id, value] of [["totalProfit", stats.total_profit], ["todayProfit", stats.today_profit]]) {
+            $(id).parentElement.classList.toggle("text-success", Number(value) > 0);
+            $(id).parentElement.classList.toggle("text-danger", Number(value) < 0);
+          }
+          const scope = ({tutorial: "Tutorial", paper: "Live-data paper", signal_paper: "Signal paper", testnet: "Testnet", production: "Real funds"})[stats.performance_mode] || "Current mode";
+          $("profitScope").textContent = `${scope} · All-time net realized P&L. Excludes open-position price changes.`;
+          $("profitScope").title = "Modes are counted separately. Old trades without identifiable mode are excluded, not deleted. Profit already includes recorded trading costs.";
+          $("todayProfitScope").textContent = `${scope} · ${stats.day} (UTC) · ${stats.today_trades} closed trades`;
+          $("winRateBasis").textContent = `${stats.wins} wins / ${stats.total_trades} closed · ${stats.losses} losses · ${stats.breakeven} breakeven`;
           $("profileMemberSince").textContent = stats.member_since || "This session";
           $("profileTradeCount").textContent = Number(stats.total_trades || 0).toLocaleString();
           $("profileWinRate").textContent = `${Number(stats.win_rate || 0).toFixed(1)}%`;
           $("profileTotalProfit").textContent = `$${money(stats.total_profit)}`;
         } catch (error) {
+          if (!currentUser || currentUser.id !== userId) return;
+          $("profitScope").textContent = "Statistics unavailable — last successful values shown.";
+          $("todayProfitScope").textContent = "Update failed — values may be out of date.";
           notify(`User statistics failed: ${error.message}`, true);
         }
       }
@@ -416,8 +435,13 @@ let currentUser = null;
             $("tradeSize").value = engineState.config?.trade_size || 200;
             $("maxPosition").value = engineState.config?.max_position_notional || 10;
             $("maxDailyLoss").value = engineState.config?.max_daily_loss || 1;
+            $("maxInventoryExposure").value = engineState.config?.max_inventory_exposure_pct ?? 50;
             $("realAcknowledgementGroup").style.display = target === "production" ? "block" : "none";
           }
+          const exposure = engineState.live_exposure;
+          $("liveExposureStatus").textContent = target === "paper" ? "Not applied to the paper wallet." :
+            exposure?.checked_at ? `${exposure.exposure_pct == null ? "Unknown" : Number(exposure.exposure_pct).toFixed(2) + "%"} coin exposure. ${exposure.allowed ? "Within limit." : exposure.reason}` :
+            "Test exchange access to check holdings. Rechecked before every live entry.";
           if (!runtimeSettingsDirty && !document.activeElement?.closest("#runtimeSettingsForm")) {
             $("settingsScanInterval").value = engineState.config?.interval ?? 5;
             $("settingsMinProfit").value = engineState.config?.min_profit ?? 0.15;
@@ -426,7 +450,9 @@ let currentUser = null;
             $("settingsTradesHour").value = engineState.config?.max_trades_per_hour ?? 12;
             $("settingsIntelligence").value = engineState.config?.intelligence_enabled === false ? "disabled" : "enabled";
             $("settingsModelConfidence").value = Math.round(Number(engineState.config?.min_model_confidence ?? 0.65) * 100);
-            renderExchangeChoices(engineState.available_exchanges || [], engineState.active_exchanges || []);
+            if (!tradingConfigDirty) {
+              renderExchangeChoices(engineState.available_exchanges || [], engineState.active_exchanges || []);
+            }
           }
           const readiness = engineState.readiness || {};
           const paperExecution = engineState.config?.execution_mode !== "real";
@@ -538,11 +564,13 @@ let currentUser = null;
         const tradeSize = Number($("tradeSize").value);
         const maxPosition = Number($("maxPosition").value);
         const maxDailyLoss = Number($("maxDailyLoss").value);
+        const maxInventoryExposure = Number($("maxInventoryExposure").value);
         const exchanges = [...document.querySelectorAll('input[name="tradingExchange"]:checked')]
           .map((input) => input.value);
         if (!Number.isFinite(tradeSize) || tradeSize < 10) throw new Error("Trade size must be at least 10 USDT.");
         if (!Number.isFinite(maxPosition) || maxPosition < tradeSize) throw new Error("Maximum position must be at least the trade size.");
         if (!Number.isFinite(maxDailyLoss) || maxDailyLoss <= 0) throw new Error("Maximum daily loss must be greater than zero.");
+        if (!Number.isFinite(maxInventoryExposure) || maxInventoryExposure <= 0 || maxInventoryExposure > 100) throw new Error("Live coin exposure must be greater than 0 and at most 100 percent.");
         if (!exchanges.length) throw new Error("Select at least one trading venue.");
         if (strategy === "cross_exchange" && exchanges.length < 2) throw new Error("Cross-exchange trading needs at least two venues.");
         if (strategy === "triangular" && exchanges.length !== 1) throw new Error("Triangular trading needs exactly one venue.");
@@ -554,6 +582,7 @@ let currentUser = null;
           trade_size: tradeSize,
           max_position_notional: maxPosition,
           max_daily_loss: maxDailyLoss,
+          max_inventory_exposure_pct: maxInventoryExposure,
           exchanges,
         };
         if (executionMode === "real") {
@@ -644,10 +673,11 @@ let currentUser = null;
       $("tradeSize").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
       $("maxPosition").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
       $("maxDailyLoss").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
+      $("maxInventoryExposure").addEventListener("input", () => { tradingConfigDirty = true; lastConnectionTestResult = null; });
 
       async function refreshHistory() {
         try {
-          const result = await api("/api/history");
+          const result = await api(currentUser?.role === "admin" ? "/api/history" : "/api/history?scope=current");
           allTrades = result.trades || [];
           renderTradeTables(allTrades);
           renderCharts(allTrades);

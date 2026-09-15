@@ -93,6 +93,24 @@ const fs = require("fs");
   await page.click("#themeToggle");
   const lightMode = await page.locator("body").evaluate((body) => body.classList.contains("light-mode"));
 
+  let profitFixture = { total_profit: 100, today_profit: 100, win_rate: 100, wins: 1, losses: 0, breakeven: 0, total_trades: 1, today_trades: 1, day: "2026-09-13", performance_mode: "production" };
+  await page.route("**/api/user/stats", (route) => route.fulfill({ json: { ok: true, stats: profitFixture } }));
+  await page.evaluate(() => refreshUserStats());
+  await page.waitForFunction(() => document.querySelector("#totalProfit").textContent === "100.00");
+  profitFixture = { ...profitFixture, total_profit: 84, today_profit: 84, win_rate: 50, losses: 1, total_trades: 2, today_trades: 2 };
+  await page.evaluate(() => refreshUserStats());
+  await page.waitForFunction(() => document.querySelector("#totalProfit").textContent === "84.00" && document.querySelector("#todayProfit").textContent === "84.00" && document.querySelector("#winRate").textContent === "50.0");
+  if (!await page.textContent("#todayProfitScope").then((value) => value.includes("Real funds"))) throw new Error("Daily profit mode label missing");
+  profitFixture = { ...profitFixture, total_profit: -10, today_profit: -10 };
+  await page.evaluate(() => refreshUserStats());
+  await page.waitForFunction(() => document.querySelector("#todayProfit").textContent === "-10.00" && document.querySelector("#todayProfit").parentElement.classList.contains("text-danger"));
+  // Reversing an in-flight animation must not leave an older value stuck.
+  await page.evaluate(() => { animateMetric("totalProfit", 100); animateMetric("totalProfit", -10); });
+  await page.waitForTimeout(650);
+  if (await page.textContent("#totalProfit") !== "-10.00") throw new Error("Canceled metric animation overwrote latest profit");
+  await page.unroute("**/api/user/stats");
+  await page.evaluate(() => refreshUserStats());
+
   await page.click('[data-page="trading"]');
   await page.waitForFunction(() => document.querySelector("#marketSuggestion").textContent === "BUY CANDIDATE");
   const marketCanvas = await page.locator("#marketChart canvas").first().elementHandle();
@@ -138,6 +156,7 @@ const fs = require("fs");
     throw new Error("Pending trading configuration was overwritten by dashboard refresh");
   }
   await page.selectOption("#tradingStrategy", "signal_trend");
+  await page.evaluate(() => refreshState());
   const signalSetup = await page.evaluate(() => ({
     mode: document.querySelector("#tradingMode").value,
     target: document.querySelector("#executionTarget").value,

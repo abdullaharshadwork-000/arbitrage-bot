@@ -50,8 +50,10 @@ from arbicore import alerts, auth as auth_security, config as arbiconfig, intell
 from arbicore.vault import CredentialVault
 from arbicore.paper import PaperAccount
 from arbicore import signals
+from arbicore import exposure
 from arbicore.exchange_signals import capabilities as signal_capabilities
 from arbicore.market import MarketOverview
+from arbicore.performance import summarize as summarize_performance, scope_sql as performance_scope_sql
 
 market_overview = MarketOverview(bot.EXCHANGES_MASTER, bot.DEMO_START_PRICES)
 
@@ -253,6 +255,7 @@ state = {
         # config, not decoration.
         "max_daily_loss": bot.MAX_DAILY_LOSS_USDT,
         "max_position_notional": bot.MAX_POSITION_NOTIONAL_USDT,
+        "max_inventory_exposure_pct": 50.0,
         "max_consecutive_failures": bot.MAX_CONSECUTIVE_FAILURES,
         "max_orders_per_minute": bot.MAX_ORDERS_PER_MINUTE,
         "max_trades_per_hour": int(os.environ.get("ARBICORE_MAX_TRADES_PER_HOUR", "12")),
@@ -262,6 +265,7 @@ state = {
     "active_exchanges": list(bot.EXCHANGES),
     "active_symbols": list(bot.SYMBOLS),
     "risk": {},
+    "live_exposure": {},
     "alerts": {},
     "startup_check": None,
     "feed_health": {},
@@ -492,6 +496,7 @@ def activate_user_context(user_id):
     state["last_scan_status"] = "paused"
     state["last_scan_message"] = "Engine is paused."
     state["balances"] = {}
+    state["live_exposure"] = {}
     state["balance_valuation"] = {"free_usdt": 0.0, "used_usdt": 0.0,
                                   "total_usdt": 0.0}
     state["start_value"] = bot.PAPER_STARTING_BALANCE_USDT
@@ -641,6 +646,16 @@ def viewing_signal_history(user):
     config = (state["config"] if state.get("owner_user_id") == user_identity(user)
               else (load_user_config(user_identity(user)) or {}).get("config", {}))
     return config.get("strategy") == "signal_trend"
+
+
+def user_performance_mode(user):
+    with state_lock:
+        if state.get("owner_user_id") == user_identity(user):
+            config = dict(state["config"])
+        else:
+            config = {**DEFAULT_ACCOUNT_STATE["config"],
+                      **((load_user_config(user_identity(user)) or {}).get("config") or {})}
+    return performance_mode(config)
 
 
 def load_paper_account(user_id, mode):
@@ -1303,13 +1318,14 @@ def qualification_fingerprints():
         "min_model_confidence": state["config"].get("min_model_confidence", 0.65),
         "max_daily_loss": state["config"].get("max_daily_loss"),
         "max_position_notional": state["config"].get("max_position_notional"),
+        "max_inventory_exposure_pct": state["config"].get("max_inventory_exposure_pct", 50.0),
     }
     config_hash = hashlib.sha256(
         json.dumps(qualification_config, sort_keys=True).encode("utf-8")
     ).hexdigest()
     digest = hashlib.sha256()
     for name in ("server.py", "arbitrage_bot.py", "arbicore/orders.py",
-                 "arbicore/risk.py", "arbicore/reconcile.py",
+                 "arbicore/risk.py", "arbicore/reconcile.py", "arbicore/exposure.py",
                  "arbicore/intelligence.py", "arbicore/signals.py",
                  "arbicore/brackets.py", "arbicore/exchange_signals.py",
                  "arbicore/okx_demo.py", "arbicore/bybit_demo.py"):
@@ -1513,6 +1529,7 @@ def validate_config_update(data):
         "interval": lambda value: value > 0,
         "gap_chance": lambda value: 0 <= value <= 1,
         "max_daily_loss": lambda value: value > 0,
+        "max_inventory_exposure_pct": lambda value: 0 < value <= 100,
         "max_position_notional": lambda value: value > 0,
         "max_consecutive_failures": lambda value: value >= 1,
         "max_orders_per_minute": lambda value: value >= 1,
@@ -1615,6 +1632,10 @@ def get_readiness():
         message = f"{len(state['unhedged_positions'])} recovery position(s) remain open."
     elif risk_manager.halted:
         message = f"Risk controls are halted: {risk_manager.halt_reason}"
+    account_guard = state.get("live_exposure") or {}
+    if account_guard and not account_guard.get("allowed"):
+        ready = False
+        message = account_guard["reason"]
     return {"ready": ready, "config_valid": validation["ok"], "message": message,
             "target": target, "credentials": configured,
             "connection_verified_at": verified_at if verified else None,
@@ -1634,19 +1655,16 @@ def collect_live_balances(engine=None, exchanges=None, symbols=None):
     and blocking every dashboard poll and the emergency stop behind it.
 
     Returns (balances, valuation), or (None, None) with no real engine. Never
-    exposes API credentials: only the currencies actually traded are read back.
+    exposes API credentials. Includes all spot holdings, not just traded coins.
     """
     engine = engine or real_engine
     if not engine:
         return None, None
-    currencies = {"USDT"}
-    for symbol in (symbols if symbols is not None else active_symbols):
-        currencies.add(bot.base_coin(symbol))
     refreshed = {}
     valuation = {"free_usdt": 0.0, "used_usdt": 0.0, "total_usdt": 0.0}
     for exchange in (exchanges if exchanges is not None else state["active_exchanges"]):
         try:
-            balances = engine.fetch_balances(exchange, sorted(currencies))
+            balances = engine.fetch_balances(exchange, None)
             refreshed[exchange] = balances
             values = engine.value_balances_usdt(exchange, balances)
             for key in valuation:
@@ -1654,6 +1672,38 @@ def collect_live_balances(engine=None, exchanges=None, symbols=None):
         except Exception as exc:
             refreshed[exchange] = {"error": str(exc)}
     return refreshed, valuation
+
+
+def refresh_live_risk(engine, config, exchanges, symbols):
+    """Fresh, complete account marks before live entries; no orders or sales.
+
+    Unknown/slow snapshots must never look like zero equity or spare capacity.
+    A valid over-cap snapshot still updates equity so losses cannot be hidden.
+    """
+    started = time.monotonic()
+    balances, valuation = collect_live_balances(engine, exchanges, symbols)
+    report = exposure.snapshot(
+        balances, valuation, config.get("max_inventory_exposure_pct", 50.0),
+        expected_exchanges=exchanges)
+    complete = exposure.snapshot(balances, valuation, 100,
+                                 expected_exchanges=exchanges)
+    valid = complete["total_equity_usdt"] is not None
+    if time.monotonic() - started > 30:
+        valid = False
+        report.update(allowed=False, reason="Account valuation took over 30 seconds; new entries blocked.")
+    if valid:
+        risk_manager.update_equity(complete["total_equity_usdt"])
+        with state_lock:
+            publish_live_balances(balances, valuation)
+        persist_balances(balances, valuation)
+        persist_risk_state()
+    if risk_manager.halted:
+        report.update(allowed=False, reason=risk_manager.halt_reason)
+    report["checked_at"] = utc_now_iso()
+    with state_lock:
+        state["live_exposure"] = report
+        state["risk"] = risk_manager.snapshot()
+    return report
 
 
 def inventory_readiness(engine, config_snapshot, exchanges, symbols, balances):
@@ -1737,16 +1787,8 @@ def publish_live_balances(refreshed, valuation):
 
 def refresh_live_balances():
     """Fetch and publish account balances. Call with `state_lock` held."""
-    refreshed, valuation = collect_live_balances()
-    if refreshed is None:
-        return
-    publish_live_balances(refreshed, valuation)
-    if not any(isinstance(values, dict) and "error" in values
-               for values in refreshed.values()):
-        risk_manager.update_equity(valuation["total_usdt"])
-        state["risk"] = risk_manager.snapshot()
-        persist_risk_state()
-    persist_balances(refreshed, valuation)
+    if real_engine is not None:
+        refresh_live_risk(real_engine, state["config"], state["active_exchanges"], active_symbols)
 
 
 # ------------------------------------------------------------------
@@ -1965,20 +2007,39 @@ def available_quote_balance(candidate):
             if isinstance(usdt, dict) else None)
 
 
-def safe_candidate_size(cfg, candidate):
+def safe_candidate_size(cfg, candidate, exposure_report=None):
     """Reduce a real order to the safest current cap; never increase it."""
     configured = float(cfg["trade_size"])
     if cfg.get("execution_mode") != "real":
         return configured
+    try:
+        limit = float(cfg.get("max_daily_loss", 0.0))
+        realized = float(risk_manager.realized_today)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(limit) or not math.isfinite(realized):
+        return 0.0
+    remaining_loss = max(0.0, limit + min(0.0, realized))
+    try:
+        drawdown = max(0.0, float(risk_manager.peak_equity - risk_manager.equity))
+        remaining_loss = min(remaining_loss, max(0.0, limit - drawdown))
+    except (TypeError, ValueError, ArithmeticError):
+        return 0.0
+    if exposure_report is not None:
+        if not exposure_report.get("allowed"):
+            return 0.0
+        # Reserve a full buy leg plus fee/slippage headroom, even if the next
+        # leg is intended to sell. Never assume that later leg will succeed.
+        reserve = 1 + float(cfg.get("fee", .001)) + float(cfg.get("max_slippage", .25)) / 100
+        configured = min(configured, float(exposure_report["headroom_usdt"]) / reserve)
+    if not math.isfinite(remaining_loss) or remaining_loss <= 0:
+        return 0.0
     free_quote = available_quote_balance(candidate)
     # The execution engine performs an authoritative balance preflight.  If a
     # dashboard snapshot is unavailable, do not convert "unknown" to zero;
     # doing that hides recovery/error paths and falsely reports a low balance.
     if free_quote is None:
         return configured
-    remaining_loss = max(
-        0.0, float(cfg.get("max_daily_loss", 0.0))
-        + min(0.0, float(risk_manager.realized_today)))
     legs = max(1, int(candidate.get("legs", 2)))
     worst_case_loss_pct = (
         2.0 + float(cfg.get("max_slippage", 0.25)) * legs
@@ -2382,6 +2443,19 @@ def scan_loop():
             state["last_scan_status"] = "fetching"
             state["last_scan_message"] = "Fetching current market prices."
 
+        if real:
+            account_guard = refresh_live_risk(engine, cfg, exchanges, symbols)
+            if not account_guard["allowed"]:
+                with state_lock:
+                    state["error"] = account_guard["reason"]
+                    if risk_manager.halted:
+                        state["running"] = False
+                publish_scan_result("account_risk_blocked", account_guard["reason"], scan_started)
+                if risk_manager.halted:
+                    break
+                time.sleep(interval)
+                continue
+
         if quote_feed is None:
             with state_lock:
                 state["error"] = "engine is not built; reset before starting"
@@ -2620,7 +2694,21 @@ def scan_loop():
                         "predicted_edge_pct": model_decision.get("predicted_edge_pct"),
                     })
                 continue
-            candidate_size = safe_candidate_size(cfg, candidate)
+            account_guard = None
+            if real:
+                account_guard = refresh_live_risk(engine, cfg, exchanges, symbols)
+                if _stop_flag.is_set() or _emergency_stop.is_set():
+                    break
+                if not account_guard["allowed"]:
+                    vetoed += 1
+                    with state_lock:
+                        _add_recent({"type": "blocked", "time": now.isoformat(timespec="seconds"),
+                                     "symbol": candidate["symbol"], "limit": "live_account_risk",
+                                     "reason": account_guard["reason"]})
+                    if risk_manager.halted:
+                        halt_error = account_guard["reason"]
+                    break
+            candidate_size = safe_candidate_size(cfg, candidate, account_guard)
             if candidate_size < float(arbiconfig.DEFAULTS.min_notional_usdt):
                 vetoed += 1
                 with state_lock:
@@ -2772,17 +2860,10 @@ def scan_loop():
                 state["portfolio_value"] = value
                 state["paper_portfolio_value"] = value
 
-        if real and engine and scan_num % 5 == 0:
-            refreshed, valuation = collect_live_balances(engine, exchanges, symbols)
-            if refreshed is not None:
-                # Only real equity feeds the drawdown limit. A paper book is
-                # seeded with coin, so its value moves with the market and would
-                # trip the limit on a price dip it never traded on.
-                risk_manager.update_equity(valuation["total_usdt"])
-                with state_lock:
-                    publish_live_balances(refreshed, valuation)
-                persist_balances(refreshed, valuation)
-                persist_risk_state()
+        if real and engine and found:
+            account_guard = refresh_live_risk(engine, cfg, exchanges, symbols)
+            if risk_manager.halted:
+                halt_error = account_guard["reason"]
 
         with state_lock:
             state["risk"] = risk_manager.snapshot()
@@ -3422,27 +3503,26 @@ def user_stats():
     user = request_user()
     if not user:
         return jsonify({"ok": False, "error": "Not logged in"}), 401
-    mode_filter = " AND performance_mode = 'signal_paper'" if viewing_signal_history(user) else ""
+    mode = user_performance_mode(user)
+    where, parameters = performance_scope_sql(mode)
     with db() as connection:
-        row = connection.execute(
-            "SELECT COUNT(*), COALESCE(SUM(profit_usdt), 0), "
-            "COALESCE(SUM(CASE WHEN profit_usdt > 0 THEN 1 ELSE 0 END), 0) "
-            "FROM trades WHERE user_id = ?" + mode_filter, (user["id"],)
-        ).fetchone()
-    total_trades, total_profit, wins = int(row[0]), float(row[1]), int(row[2])
+        rows = connection.execute("SELECT time, profit_usdt, status FROM trades WHERE user_id = ? AND " + where,
+                                  [user["id"], *parameters])
+        performance = summarize_performance(rows)
     with state_lock:
         owns_worker = state.get("owner_user_id") == user_identity(user)
         stats = {
+            **performance,
+            "performance_mode": mode,
             "username": user.get("username"),
             "total_balance": state.get("portfolio_value", 0.0) if owns_worker else 0.0,
-            "total_profit": total_profit,
-            "win_rate": (wins / total_trades * 100) if total_trades else 0.0,
             "active_trades": 1 if owns_worker and state.get("running") else 0,
-            "total_trades": total_trades,
             "member_since": user.get("created_at", "")[:10]
         }
 
-    return jsonify({"ok": True, "stats": stats})
+    response = jsonify({"ok": True, "stats": stats})
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @app.route("/api/account/preferences", methods=["GET", "POST"])
@@ -3988,7 +4068,12 @@ def api_history():
         "adaptive_profit_floor_pct", "market_regime", "data_mode", "performance_mode",
     )
     with db() as connection:
-        if viewing_signal_history(user):
+        if request.args.get("scope") == "current":
+            where, parameters = performance_scope_sql(user_performance_mode(user))
+            trades = connection.execute(
+                f"SELECT {', '.join(trade_fields)} FROM trades WHERE user_id = ? AND "
+                + where + " ORDER BY id DESC LIMIT 500", [user["id"], *parameters]).fetchall()
+        elif viewing_signal_history(user):
             trades = connection.execute(
                 f"SELECT {', '.join(trade_fields)} FROM trades "
                 "WHERE user_id = ? AND performance_mode = 'signal_paper' ORDER BY id DESC LIMIT 500",
@@ -4177,6 +4262,15 @@ def api_test_connection():
 
     safety_errors = []
     if all(item["ok"] for item in statuses):
+        account_guard = exposure.snapshot(
+            refreshed_balances, refreshed_valuation,
+            config_snapshot.get("max_inventory_exposure_pct", 50.0),
+            expected_exchanges=exchanges)
+        account_guard["checked_at"] = utc_now_iso()
+        with state_lock:
+            state["live_exposure"] = account_guard
+        if not account_guard["allowed"]:
+            safety_errors.append(account_guard["reason"])
         safety_errors.extend(inventory_readiness(
             engine, config_snapshot, exchanges, symbols, refreshed_balances))
         for status in statuses:
@@ -4192,7 +4286,9 @@ def api_test_connection():
                 f"before production ({soak['completed']} recorded).")
     all_ok = all(item["ok"] for item in statuses) and not safety_errors
     with state_lock:
-        if refreshed_balances is not None and refreshed_valuation is not None:
+        if (refreshed_balances is not None and refreshed_valuation is not None
+                and exposure.snapshot(refreshed_balances, refreshed_valuation, 100,
+                                      expected_exchanges=exchanges)["total_equity_usdt"] is not None):
             publish_live_balances(refreshed_balances, refreshed_valuation)
         verified_at = utc_now_iso() if all_ok else None
         state["exchange_status"] = statuses
@@ -4205,7 +4301,9 @@ def api_test_connection():
             "symbols": execution_symbols(),
             "config_fingerprint": qualification_fingerprints()[0],
         } if all_ok else None)
-    if refreshed_balances is not None and refreshed_valuation is not None:
+    if (refreshed_balances is not None and refreshed_valuation is not None
+            and exposure.snapshot(refreshed_balances, refreshed_valuation, 100,
+                                  expected_exchanges=exchanges)["total_equity_usdt"] is not None):
         persist_balances(refreshed_balances, refreshed_valuation)
     error = "; ".join(safety_errors) if safety_errors else next(
         (item.get("error") for item in statuses if not item.get("ok")),
@@ -4707,7 +4805,7 @@ def api_config():
             return jsonify({"ok": False, "error": error}), 400
         for key in ("trade_size", "fee", "min_profit", "max_slippage", "interval",
                     "gap_chance", "max_daily_loss", "max_position_notional",
-                    "min_model_confidence"):
+                    "min_model_confidence", "max_inventory_exposure_pct"):
             config[key] = float(config[key])
         for key in ("max_consecutive_failures", "max_orders_per_minute", "max_trades_per_hour"):
             config[key] = int(float(config[key]))
@@ -4804,7 +4902,7 @@ def api_config():
             bot.REAL_TRADING_ACK = acknowledgement
         for key in ("trade_size", "fee", "min_profit", "max_slippage", "interval",
                     "gap_chance", "max_daily_loss", "max_position_notional",
-                    "min_model_confidence"):
+                    "min_model_confidence", "max_inventory_exposure_pct"):
             if key in data:
                 state["config"][key] = float(data[key])
         # Counts, not amounts: a fractional "2.5 failures in a row" would never

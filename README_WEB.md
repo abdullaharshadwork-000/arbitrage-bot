@@ -62,6 +62,18 @@ the market UI using deterministic fixtures, not authenticated live execution.
 
 ## Access control
 
+Dashboard profit and win rate use closed trades for the signed-in account's
+saved mode; tutorial, live-data paper, signal paper, testnet and real funds are
+not mixed. Today's Profit uses UTC midnight. A +100 gain followed by a -16 loss
+produces 84 net profit. A second +84 gain instead produces 184. Breakeven trades
+count in the denominator but are not wins. Pending/partial/invalid records do
+not inflate performance. Older records without identifiable mode are preserved
+in history but excluded from scoped metrics. Open inventory price movement is
+separate from realized trade profit; it is not silently relabeled as a closed
+trade loss or gain. The realized-loss sizing guard refuses new exposure when
+its remaining budget is exhausted or invalid; this cannot guarantee profits
+or prevent losses beyond a limit during market gaps or exchange failures.
+
 On a new or migrated database, startup idempotently creates the administrator
 configured privately with `ARBICORE_ADMIN_USERNAME`,
 `ARBICORE_ADMIN_PASSWORD`, and `ARBICORE_ADMIN_EMAIL`. Never publish those
@@ -155,6 +167,30 @@ Set `ARBICORE_DB` to point the database somewhere else — useful for a second
 instance or a test run, so it cannot touch your real history.
 
 ## Notes
+
+### Live account exposure guard
+
+Real execution (production and sandbox) checks authenticated spot balances on
+every scan and again before each new route. It includes locked funds and coins
+outside the selected trading symbols on the selected venues. Missing venues,
+unpriced holdings, invalid balances, or a valuation taking over 30 seconds block
+entries; they never replace the last valid equity with a misleading zero.
+
+The per-user **Maximum Live Coin Exposure (%)** setting defaults to 50%. New
+orders are sized within remaining non-USDT inventory capacity, reserving a full
+buy leg plus fee/slippage headroom without assuming the sell leg succeeds.
+Exposure above the limit blocks entries, but does not liquidate existing coins
+or block the separate manual recovery workflow.
+
+The existing equity peak drawdown guard includes unrealized losses and now
+latches on balance updates even without trade opportunities. Remaining drawdown
+room also reduces new order sizing. Peak equity persists across restarts; gains
+do not automatically clear a halt. Withdrawals or other external account changes
+can trigger this guard and require reconciliation. It does not guarantee exit
+prices or prevent losses on inventory still held, especially while paused or
+disconnected. This covers spot wallets, not futures, margin, or Earn balances.
+Authenticated exchange qualification and existing production restrictions remain
+required; these changes do not enable production trend-signal orders.
 
 - Demo mode uses synthetic prices and no network. Live mode reads real public
   order books through `ccxt`. Neither of those places an order: real execution

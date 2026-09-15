@@ -169,12 +169,9 @@ class RiskManager:
                 f"{self.consecutive_failures} trades in a row failed; something "
                 f"is wrong with the venue or the feed, not with the spread")
 
-        drawdown = self.peak_equity - self.equity
-        if self.peak_equity > ZERO and drawdown >= settings.max_daily_loss_usdt:
-            return self.halt(
-                HALT_DRAWDOWN,
-                f"equity is {float(drawdown):.2f} USDT below its peak of "
-                f"{float(self.peak_equity):.2f}")
+        equity_decision = self.check_equity()
+        if not equity_decision:
+            return equity_decision
 
         size = D(notional)
         if size <= ZERO:
@@ -284,14 +281,31 @@ class RiskManager:
         return len(self.stranded)
 
     def update_equity(self, value):
-        """Feed total portfolio value in quote terms; tracks the peak."""
-        self.equity = D(value)
+        """Track marked equity and latch drawdown even without a new trade."""
+        number = D(value, default=None)
+        if isinstance(value, bool) or number is None or not number.is_finite() or number < ZERO:
+            raise ValueError("Equity must be a finite nonnegative amount.")
+        self.equity = number
         if self.equity > self.peak_equity:
             self.peak_equity = self.equity
+        self.check_equity()
         return self.equity
+
+    def check_equity(self):
+        if self.halted:
+            return RiskDecision(False, self.halt_reason, self.halt_limit)
+        drawdown = self.peak_equity - self.equity
+        if self.peak_equity > ZERO and drawdown >= self.settings.max_daily_loss_usdt:
+            return self.halt(HALT_DRAWDOWN,
+                             f"equity is {float(drawdown):.2f} USDT below its peak of "
+                             f"{float(self.peak_equity):.2f}")
+        return ALLOWED
 
     def check_after(self):
         """Re-evaluate the latching limits once a trade has been booked."""
+        decision = self.check_equity()
+        if not decision:
+            return decision
         settings = self.settings
         loss = -self.realized_today
         if loss >= settings.max_daily_loss_usdt:

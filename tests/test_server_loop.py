@@ -107,6 +107,17 @@ class FakeEngine:
     def taker_fee(self, exchange):
         return 0.001
 
+    def fetch_balances(self, exchange, currencies=None):
+        return {"USDT": {"free": 1000, "used": 0, "total": 1000},
+                "BTC": {"free": 1, "used": 0, "total": 1}}
+
+    def value_balances_usdt(self, exchange, balances):
+        for coin, values in balances.items():
+            price = 1 if coin == "USDT" else 100
+            values["value_free_usdt"] = values["free"] * price
+            values["value_used_usdt"] = values["used"] * price
+        return {"free_usdt": 1100, "used_usdt": 0, "total_usdt": 1100}
+
     def execute_arbitrage(self, *args, **kwargs):
         raise self.error
 
@@ -159,6 +170,7 @@ class ServerTestCase(unittest.TestCase):
             "trades": [], "unhedged_positions": [], "error": None,
             "chart_series": [], "latest_cycle": None, "quotes": {},
             "mid_prices": {}, "risk": {}, "alerts": {}, "startup_check": None,
+            "live_exposure": {},
             "last_scan_started_at": None, "last_scan_completed_at": None,
             "last_scan_duration_seconds": None, "last_scan_status": "paused",
             "last_scan_message": "Engine is paused.",
@@ -169,6 +181,7 @@ class ServerTestCase(unittest.TestCase):
             "trade_size": 200.0, "fee": 0.001, "min_profit": 0.15,
             "max_slippage": 0.25, "interval": 0.0, "gap_chance": 0.0,
             "max_daily_loss": 50.0, "max_position_notional": 400.0,
+            "max_inventory_exposure_pct": 50.0,
             "max_consecutive_failures": 3, "max_orders_per_minute": 20,
             "intelligence_enabled": True, "min_model_confidence": 0.65,
             "triangular_routes": [],
@@ -255,7 +268,7 @@ class TestScanLoopLocking(ServerTestCase):
         guard = server.safety.ExecutionSafety()
         with mock.patch.object(server, "execution_safety", guard):
             for _ in range(3):
-                self.run_one_scan(feed=FakeFeed(quotes={}))
+                self.run_one_scan(feed=FakeFeed(quotes={}), engine=FakeEngine(None))
             self.assertTrue(guard.halted)
             self.assertEqual(server.state["last_scan_status"], "safety_halt")
             self.assertFalse(server.state["running"])
