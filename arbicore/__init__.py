@@ -38,4 +38,5 @@ __all__ = [
     "simulator",
     "strategy_registry",
     "streaming",
+    "validation",
 ]
