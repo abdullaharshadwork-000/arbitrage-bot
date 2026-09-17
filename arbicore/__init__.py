@@ -20,6 +20,7 @@ touch real money live here, in small testable units:
     guards       explicit live-mode / real-trading gates (Phase 1)
     memory       experience + rich audit persistence (Phase 2)
     features     unified timestamp-safe feature engine (Phase 3)
+    regime       market regime detector (Phase 4)
 """
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "orders",
     "rebalance",
     "reconcile",
+    "regime",
     "safety",
     "risk",
     "simulator",
