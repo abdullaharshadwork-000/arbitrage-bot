@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -65,7 +64,7 @@ class PaperExecResult:
 class PaperExecutor:
     """Simulate fills for approved proposals only."""
 
-    def __init(
+    def __init__(
         self,
         *,
         fee_pct: float = 0.10,
@@ -88,21 +87,22 @@ class PaperExecutor:
         *,
         last_price: Optional[float] = None,
     ) -> PaperExecResult:
-        # Hard gates – no exceptions
         if critique.result == "REJECT":
             return PaperExecResult(False, reject_reason="critic REJECT")
         if critique.result == "WARN":
-            # Conservative: WARN does not auto-execute in paper adapter either
-            # unless you deliberately loosen this later.
-            return PaperExecResult(False, reject_reason="critic WARN – paper adapter requires APPROVE")
+            return PaperExecResult(
+                False, reject_reason="critic WARN – paper adapter requires APPROVE"
+            )
         if proposal.action in ("NO_TRADE", "HOLD"):
             return PaperExecResult(False, reject_reason="no position change requested")
         if proposal.action not in ("BUY", "SELL"):
             return PaperExecResult(False, reject_reason=f"unsupported action {proposal.action}")
 
-        price = float(last_price if last_price is not None else (
-            float(proposal.entry_price) if proposal.entry_price is not None else 0.0
-        ))
+        price = float(
+            last_price
+            if last_price is not None
+            else (float(proposal.entry_price) if proposal.entry_price is not None else 0.0)
+        )
         if price <= 0:
             return PaperExecResult(False, reject_reason="invalid price")
 
