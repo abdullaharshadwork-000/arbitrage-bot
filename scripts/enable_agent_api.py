@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Idempotent patch: register read-only agent API routes in server.py.
+"""Idempotent patches for optional agent integration in server.py.
+
+1) Register read-only GET /api/agent routes
+2) Call notify_agent_mid after each scan's mid_prices
 
 Safe to run multiple times. Does not enable trading.
+Flags still control runtime:
+  ARBICORE_AGENT_LOOP=1
+  ARBICORE_AGENT_PAPER_EXEC=1
 """
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "server.py"
 
-IMPORTS = """from arbicore.agent_loop import AgentObservationLoop
+API_IMPORTS = """from arbicore.agent_loop import AgentObservationLoop
 from arbicore.agent_api import create_agent_blueprint
 from arbicore.strategy_registry import StrategyRegistry
 """
 
-BLOCK = """
+SCAN_IMPORT = "from arbicore.scan_hook import notify_agent_mid\n"
+
+API_BLOCK = """
 # Optional agent observation API (read-only). Disabled unless ARBICORE_AGENT_LOOP=1
 # and never places orders. Failure here must not break the main bot.
 try:
@@ -25,12 +33,34 @@ except Exception as _agent_exc:  # pragma: no cover - defensive
     _logging.getLogger("arbicore").warning("agent API not registered: %s", _agent_exc)
 """
 
+SCAN_OLD = """            state["quotes"] = quotes
+            state["mid_prices"] = mid_prices
+            state["feed_health"] = feed_health(quotes)
+            state["intelligence"] = market_intelligence.snapshot()
+
+        found = []
+"""
+
+SCAN_NEW = """            state["quotes"] = quotes
+            state["mid_prices"] = mid_prices
+            state["feed_health"] = feed_health(quotes)
+            state["intelligence"] = market_intelligence.snapshot()
+
+        # Optional agent observation (no-op unless ARBICORE_AGENT_LOOP=1; never raises)
+        try:
+            for _sym, _mid in (mid_prices or {}).items():
+                notify_agent_mid(_sym, _mid)
+        except Exception:
+            pass
+
+        found = []
+"""
+
 
 def main():
     text = SERVER.read_text()
-    if "create_agent_blueprint" in text:
-        print("agent API already registered in server.py")
-        return 0
+    changed = False
+
     anchor_import = (
         "from arbicore.performance import summarize as summarize_performance, "
         "scope_sql as performance_scope_sql\n"
@@ -38,14 +68,37 @@ def main():
     if anchor_import not in text:
         print("import anchor not found; abort")
         return 1
-    text = text.replace(anchor_import, anchor_import + IMPORTS, 1)
-    app_anchor = "app = Flask(__name__, static_folder=None)\n"
-    if app_anchor not in text:
-        print("app anchor not found; abort")
-        return 1
-    text = text.replace(app_anchor, app_anchor + BLOCK, 1)
-    SERVER.write_text(text)
-    print("patched server.py – restart server to load GET /api/agent")
+
+    if "create_agent_blueprint" not in text:
+        text = text.replace(anchor_import, anchor_import + API_IMPORTS, 1)
+        app_anchor = "app = Flask(__name__, static_folder=None)\n"
+        if app_anchor not in text:
+            print("app anchor not found; abort")
+            return 1
+        text = text.replace(app_anchor, app_anchor + API_BLOCK, 1)
+        changed = True
+        print("registered agent API blueprint")
+    else:
+        print("agent API already registered")
+
+    if "notify_agent_mid" not in text:
+        # ensure scan import near performance import
+        if SCAN_IMPORT not in text:
+            text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
+        if SCAN_OLD not in text:
+            print("scan_loop anchor not found; abort")
+            return 1
+        text = text.replace(SCAN_OLD, SCAN_NEW, 1)
+        changed = True
+        print("wired notify_agent_mid into scan_loop")
+    else:
+        print("scan_loop agent hook already present")
+
+    if changed:
+        SERVER.write_text(text)
+        print("server.py updated – restart the server")
+    else:
+        print("no changes needed")
     return 0
 
 
