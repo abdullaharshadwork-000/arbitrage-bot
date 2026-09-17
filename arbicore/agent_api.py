@@ -155,7 +155,7 @@ def create_agent_blueprint(
     try:
         from flask import Blueprint, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exp
+        raise RuntimeError("Flask is required to create the agent blueprint") from exc
 
     bp = Blueprint("arbicore_agent", __name__)
 
