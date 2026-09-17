@@ -1,6 +1,6 @@
-"""ArbiCore — production support modules for the arbitrage engine.
+"""ArbiCore — production support + agentic foundation (Phases 1–26).
 
-Agentic foundation (Phases 1–24+) never bypasses the Risk Kernel or LiveModeGuard.
+Never bypasses the Risk Kernel or LiveModeGuard.
 """
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "auth",
     "backtest",
     "books",
+    "bootstrap",
     "config",
     "critic",
     "domain",
