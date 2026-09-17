@@ -3,16 +3,17 @@
 Phase 28 foundation.
 
 Compares recent experience metrics against a baseline window.
-Flags degradation so the operator (or promotion engine) can demote
-or pause a strategy. Research / observation only – never places orders.
+Research / observation only – never places orders.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Sequence
+from typing import Any, Sequence, Union
 
 from .domain import Experience
+
+Row = Union[Experience, dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,7 @@ class DriftReport:
     win_rate_delta: float
     pnl_delta: float
     drifted: bool
-    severity: str  # none | mild | severe
+    severity: str
     reason: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -35,9 +36,31 @@ class DriftReport:
         return asdict(self)
 
 
-class DriftMonitor:
-    """Simple rolling-window drift detector over Experience records."""
+def _sid(row: Row) -> Optional[str]:
+    if isinstance(row, Experience):
+        return row.strategy_id
+    return row.get("strategy_id")
 
+
+def _pnl(row: Row) -> Optional[float]:
+    if isinstance(row, Experience):
+        if row.realized_pnl is None:
+            return None
+        return float(row.realized_pnl)
+    val = row.get("realized_pnl")
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+# fix forward ref
+from typing import Optional  # noqa: E402
+
+
+class DriftMonitor:
     def __init__(
         self,
         *,
@@ -51,12 +74,10 @@ class DriftMonitor:
         self.win_rate_drop = float(win_rate_drop)
         self.pnl_drop = float(pnl_drop)
 
-    def evaluate(
-        self,
-        strategy_id: str,
-        experiences: Sequence[Experience],
-    ) -> DriftReport:
-        rows = [e for e in experiences if e.strategy_id == strategy_id]
+    def evaluate(self, strategy_id: str, experiences: Sequence[Row]) -> DriftReport:
+        rows = [e for e in experiences if _sid(e) == strategy_id]
+        # chronological: memory returns DESC; reverse for time order
+        rows = list(reversed(rows))
         n = len(rows)
         need = self.baseline_size + self.recent_size
         if n < need:
@@ -78,11 +99,8 @@ class DriftMonitor:
         baseline = rows[-(need):-self.recent_size]
         recent = rows[-self.recent_size:]
 
-        def _stats(chunk: Sequence[Experience]) -> tuple[float, float]:
-            pnls: list[float] = []
-            for e in chunk:
-                if e.realized_pnl is not None:
-                    pnls.append(float(e.realized_pnl))
+        def _stats(chunk: Sequence[Row]) -> tuple[float, float]:
+            pnls = [p for p in (_pnl(e) for e in chunk) if p is not None]
             if not pnls:
                 return 0.0, 0.0
             wins = sum(1 for p in pnls if p > 0)
@@ -95,11 +113,9 @@ class DriftMonitor:
 
         drifted = wr_delta <= -self.win_rate_drop or pnl_delta < self.pnl_drop
         if not drifted:
-            severity = "none"
-            reason = "within tolerance"
+            severity, reason = "none", "within tolerance"
         elif wr_delta <= -self.win_rate_drop * 2:
-            severity = "severe"
-            reason = f"win-rate drop {wr_delta:.1%}"
+            severity, reason = "severe", f"win-rate drop {wr_delta:.1%}"
         else:
             severity = "mild"
             reason = f"win-rate delta {wr_delta:.1%}, pnl delta {pnl_delta:.4f}"
@@ -117,10 +133,7 @@ class DriftMonitor:
             drifted=drifted,
             severity=severity,
             reason=reason,
-            meta={
-                "baseline_size": self.baseline_size,
-                "recent_size": self.recent_size,
-            },
+            meta={"baseline_size": self.baseline_size, "recent_size": self.recent_size},
         )
 
 
