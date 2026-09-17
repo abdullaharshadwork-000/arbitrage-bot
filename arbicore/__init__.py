@@ -34,6 +34,7 @@ __all__ = [
     "risk",
     "safety",
     "selection",
+    "shadow",
     "simulator",
     "strategy_registry",
     "streaming",
