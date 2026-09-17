@@ -49,7 +49,7 @@ class RegimeDecision:
 class RegimeDetector:
     """Deterministic regime classifier driven by FeatureSnapshot."""
 
-    def __init(
+    def __init__(
         self,
         *,
         vol_high: float = 0.012,
