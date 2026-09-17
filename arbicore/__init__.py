@@ -25,6 +25,7 @@ __all__ = [
     "money",
     "orders",
     "orchestrator",
+    "pipeline",
     "promotion",
     "rebalance",
     "reconcile",
