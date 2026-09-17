@@ -18,6 +18,7 @@ touch real money live here, in small testable units:
     alerts       outbound notifications for unattended operation
     domain       foundational typed models for the agentic platform (Phase 1)
     guards       explicit live-mode / real-trading gates (Phase 1)
+    memory       experience + rich audit persistence (Phase 2)
 """
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "feed",
     "guards",
     "ledger",
+    "memory",
     "money",
     "orders",
     "rebalance",
