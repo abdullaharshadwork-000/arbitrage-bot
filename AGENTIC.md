@@ -29,29 +29,23 @@ Runs the orchestrator on price updates. **Never places orders.**
 
 ## Read-only agent API (Phase 22)
 
-Helpers in `arbicore/agent_api.py`:
+Helpers: `arbicore/agent_api.py`
 
-* `build_agent_snapshot(loop)` – cycles, last regime/action, recent history
-* `build_registry_snapshot(registry)` – strategy versions
-* `create_agent_blueprint(loop, registry)` – optional Flask routes:
-  * `GET /api/agent`
-  * `GET /api/agent/strategies`
+Routes (after registration):
 
-### Optional registration in `server.py`
+* `GET /api/agent` – observation loop snapshot
+* `GET /api/agent/strategies` – strategy registry
 
-Add only when you want the endpoints (does not enable trading):
+### Enable routes in server.py (one-time, safe)
 
-```python
-from arbicore.agent_loop import AgentObservationLoop
-from arbicore.agent_api import create_agent_blueprint
-from arbicore.strategy_registry import StrategyRegistry
-
-_agent_registry = StrategyRegistry()
-_agent_loop = AgentObservationLoop(registry=_agent_registry)  # respects env flag
-app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))
+```bash
+python scripts/enable_agent_api.py
+# restart server
+python server.py
 ```
 
-Until registered, the main dashboard and trading paths are unchanged.
+The script is idempotent. It wraps registration in try/except so a failure
+never prevents the main bot from starting. No trading behaviour changes.
 
 ## Module map
 
