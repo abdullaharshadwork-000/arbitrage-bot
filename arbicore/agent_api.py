@@ -1,6 +1,6 @@
 """Read-only agent API helpers.
 
-Phases 22 + 27.
+Phases 22 + 27–29.
 """
 
 from __future__ import annotations
@@ -12,26 +12,13 @@ from .strategy_registry import StrategyRegistry
 
 
 def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
-    """Pure snapshot for GET /api/agent."""
-    # Prefer process-wide scan_hook loop if present
     if loop is None:
         try:
-            from .scan_hook import agent_snapshot as hook_snapshot, get_agent_loop
+            from .scan_hook import get_agent_loop
 
-            hook_loop = get_agent_loop()
-            if hook_loop is not None:
-                loop = hook_loop
-            else:
-                base = hook_snapshot()
-                return {
-                    "ok": True,
-                    "agent_loop_enabled": agent_loop_enabled(),
-                    "paper_exec_enabled": paper_exec_enabled(),
-                    "state": base,
-                    "recent": [],
-                }
+            loop = get_agent_loop()
         except Exception:
-            pass
+            loop = None
 
     if loop is None:
         return {
@@ -83,12 +70,63 @@ def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict
     }
 
 
+def build_research_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
+    """Hypotheses / experiments if a ResearchLab is attached later."""
+    lab = None
+    if loop is not None and hasattr(loop, "lab"):
+        lab = getattr(loop, "lab", None)
+    if lab is None:
+        return {
+            "ok": True,
+            "hypotheses": [],
+            "experiments": [],
+            "message": "research lab not attached to observation loop",
+        }
+    hyps = [h.as_dict() for h in getattr(lab, "hypotheses", lambda: [])()]
+    exps = [e.as_dict() for e in getattr(lab, "experiments", lambda: [])()]
+    return {"ok": True, "hypotheses": hyps, "experiments": exps}
+
+
+def build_drift_snapshot(
+    strategy_id: Optional[str] = None,
+    loop: Optional[AgentObservationLoop] = None,
+) -> dict[str, Any]:
+    from .drift import DriftMonitor
+
+    memory = None
+    if loop is not None:
+        memory = loop.memory
+    if memory is None:
+        return {
+            "ok": True,
+            "reports": [],
+            "message": "no experience memory attached",
+        }
+
+    try:
+        experiences = memory.list_experiences(limit=500)
+    except Exception:
+        experiences = []
+
+    monitor = DriftMonitor()
+    strategy_ids = set()
+    if strategy_id:
+        strategy_ids.add(strategy_id)
+    else:
+        for e in experiences:
+            if e.strategy_id:
+                strategy_ids.add(e.strategy_id)
+
+    reports = [monitor.evaluate(sid, experiences).as_dict() for sid in sorted(strategy_ids)]
+    return {"ok": True, "reports": reports, "experience_count": len(experiences)}
+
+
 def create_agent_blueprint(
     loop: Optional[AgentObservationLoop] = None,
     registry: Optional[StrategyRegistry] = None,
 ):
     try:
-        from flask import Blueprint, jsonify
+        from flask import Blueprint, jsonify, request
     except ImportError as exc:
         raise RuntimeError("Flask is required to create the agent blueprint") from exc
 
@@ -102,11 +140,22 @@ def create_agent_blueprint(
     def api_agent_strategies():
         return jsonify(build_registry_snapshot(registry)), 200
 
+    @bp.route("/api/agent/research", methods=["GET"])
+    def api_agent_research():
+        return jsonify(build_research_snapshot(loop)), 200
+
+    @bp.route("/api/agent/drift", methods=["GET"])
+    def api_agent_drift():
+        sid = request.args.get("strategy_id")
+        return jsonify(build_drift_snapshot(strategy_id=sid, loop=loop)), 200
+
     return bp
 
 
 __all__ = [
     "build_agent_snapshot",
     "build_registry_snapshot",
+    "build_research_snapshot",
+    "build_drift_snapshot",
     "create_agent_blueprint",
 ]
