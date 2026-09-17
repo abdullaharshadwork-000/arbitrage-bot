@@ -14,14 +14,11 @@ Rules:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 from .domain import StrategyVersion
 from .features import FeatureEngine
 from .regime import RegimeDetector
-from .selection import StrategySelector
-from .strategy_registry import StrategyRegistry
 
 
 @dataclass(frozen=True)
@@ -74,7 +71,7 @@ class Backtester:
     evaluation path that uses the same features/regime code as live.
     """
 
-    def __init(
+    def __init__(
         self,
         config: Optional[BacktestConfig] = None,
         feature_engine: Optional[FeatureEngine] = None,
@@ -110,7 +107,6 @@ class Backtester:
         returns: list[float] = []
         position = 0.0
         entry_price = 0.0
-        entry_bar = 0
         entry_regime = ""
 
         fee = self.config.fee_pct / 100.0
@@ -123,35 +119,27 @@ class Backtester:
             regime = self.regime.classify(snap)
             price = prices[i]
 
-            # Exit logic: simple mean-reversion / momentum placeholder
-            # A real strategy would supply its own signal function.
-            # Here we use a transparent momentum rule for demonstration.
             mom = snap.get("momentum_10", 0.0)
 
             if position == 0:
-                # Entry: only if regime is directional and momentum agrees
                 if regime.regime in ("STRONG_BULL_TREND", "WEAK_BULL_TREND") and mom > 0.01:
                     cost = price * (1 + fee + slip)
                     risk_capital = equity * self.config.risk_fraction
                     position = risk_capital / cost if cost > 0 else 0
                     entry_price = cost
-                    entry_bar = i
                     entry_regime = regime.regime
                 elif regime.regime in ("STRONG_BEAR_TREND", "WEAK_BEAR_TREND") and mom < -0.01:
                     cost = price * (1 - fee - slip)
                     risk_capital = equity * self.config.risk_fraction
                     position = -(risk_capital / cost) if cost > 0 else 0
                     entry_price = cost
-                    entry_bar = i
                     entry_regime = regime.regime
             else:
-                # Exit: momentum fades or opposite regime
                 exit_signal = False
                 if position > 0 and (mom < 0 or "BEAR" in regime.regime):
                     exit_signal = True
                 if position < 0 and (mom > 0 or "BULL" in regime.regime):
                     exit_signal = True
-                # Force exit near end
                 if i == n - 1:
                     exit_signal = True
 
@@ -187,7 +175,6 @@ class Backtester:
         pf = (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
         win_rate = len(wins) / len(trades) if trades else 0.0
 
-        # Sharpe proxy: mean return / std of per-trade returns
         sharpe = 0.0
         if len(returns) > 1:
             mean_r = sum(returns) / len(returns)
