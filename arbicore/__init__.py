@@ -5,11 +5,12 @@
 dashboard and the existing test suite keep working. The hard parts that
 touch real money live here, in small testable units.
 
-Agentic foundation (Phases 1–21+) lives alongside the original modules and
+Agentic foundation (Phases 1–22+) lives alongside the original modules and
 never bypasses the Risk Kernel or LiveModeGuard.
 """
 
 __all__ = [
+    "agent_api",
     "agent_loop",
     "alerts",
     "auth",
