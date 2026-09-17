@@ -1,4 +1,4 @@
-# ArbiCore Agentic Foundation (Phases 1–27)
+# ArbiCore Agentic Foundation (Phases 1–29)
 
 **Risk Kernel + LiveModeGuard remain highest authority. No agent path places live orders.**
 
@@ -6,32 +6,37 @@
 
 ```
 Scan mid prices → notify_agent_mid (optional)
-    → Features → Regime → Select → Signal → Critic
-                              APPROVE + paper flag → PaperExecutor
-                                                   → Experience → Reflection
+  → Features → Regime → Select → Signal → Critic
+        APPROVE + paper flag → PaperExecutor → Experience → Reflection
+                                              → DriftMonitor (API)
 ```
 
-## Enable (one script, flags still required)
+## Enable (Windows PowerShell)
 
-```bash
-python scripts/enable_agent_api.py   # patches server.py (API + scan hook)
-export ARBICORE_AGENT_LOOP=1
-export ARBICORE_AGENT_PAPER_EXEC=1   # optional paper fills
+```powershell
+git pull origin main
+python scripts\enable_agent_api.py
+$env:ARBICORE_AGENT_LOOP = "1"
+$env:ARBICORE_AGENT_PAPER_EXEC = "1"   # optional
 python server.py
 ```
 
-Then:
+## API routes (after enable script)
 
-* Each scan pushes mid prices into the agent loop (no-op if flags off)
-* `GET /api/agent` – status, cycles, paper fills, reflections
-* `GET /api/agent/strategies` – registry (demo strategy seeded)
+| Route | Purpose |
+|-------|---------|
+| `GET /api/agent` | Observation cycles, paper fills, reflections |
+| `GET /api/agent/strategies` | Strategy registry |
+| `GET /api/agent/research` | Hypotheses / experiments (when lab attached) |
+| `GET /api/agent/drift` | Drift reports per strategy |
 
 ## Safety
 
-* `notify_agent_mid` never raises into the scanner
+* Hooks never raise into the scanner
 * Loop / PaperExecutor refuse LIVE mode
-* Existing arbitrage execution path unchanged until you change Risk / Live gates yourself
+* Drift is read-only analytics
 
-```bash
-pip install -r requirements.txt && python server.py
+```powershell
+pip install -r requirements.txt
+python server.py
 ```
