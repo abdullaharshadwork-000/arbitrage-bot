@@ -16,6 +16,7 @@ touch real money live here, in small testable units:
     risk         kill switches and circuit breakers
     reconcile    restart-time state recovery against the exchange
     alerts       outbound notifications for unattended operation
+    domain       foundational typed models for the agentic platform (Phase 1)
 """
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "auth",
     "books",
     "config",
+    "domain",
     "feed",
     "ledger",
     "money",
