@@ -7,67 +7,71 @@ Agentic / self-improving layers on top of the original arbitrage engine.
 
 ```
 Market prices
-    → FeatureEngine
-    → RegimeDetector
-    → StrategySelector          (or NO_TRADE)
-    → TradeProposal             (structured only)
-    → CriticAgent               (APPROVE / WARN / REJECT)
-    → [existing RiskManager]    (final authority)
-    → [existing Execution]      (only if LiveModeGuard allows)
+    → FeatureEngine → RegimeDetector → StrategySelector
+    → TradeProposal → CriticAgent
+    → [RiskManager] → [Execution only if LiveModeGuard allows]
 ```
 
-## Research / improvement loop
+## Research loop
 
 ```
 Experience → Reflection → Hypothesis → Experiment
-  → Backtest → Walk-forward → Stress → Shadow → Promotion (human by default)
+  → Backtest → Walk-forward → Stress → Shadow → Promotion (human default)
 ```
 
-## Optional observation loop (Phase 21)
+## Optional observation loop
 
 ```bash
-export ARBICORE_AGENT_LOOP=1   # default is off
+export ARBICORE_AGENT_LOOP=1   # default off
 ```
 
-When enabled, `AgentObservationLoop` runs the orchestrator on price updates,
-records regimes / selections / critiques, and **never places orders**.
-Existing scan + execution behaviour is unchanged.
+Runs the orchestrator on price updates. **Never places orders.**
 
-## Modules
+## Read-only agent API (Phase 22)
+
+Helpers in `arbicore/agent_api.py`:
+
+* `build_agent_snapshot(loop)` – cycles, last regime/action, recent history
+* `build_registry_snapshot(registry)` – strategy versions
+* `create_agent_blueprint(loop, registry)` – optional Flask routes:
+  * `GET /api/agent`
+  * `GET /api/agent/strategies`
+
+### Optional registration in `server.py`
+
+Add only when you want the endpoints (does not enable trading):
+
+```python
+from arbicore.agent_loop import AgentObservationLoop
+from arbicore.agent_api import create_agent_blueprint
+from arbicore.strategy_registry import StrategyRegistry
+
+_agent_registry = StrategyRegistry()
+_agent_loop = AgentObservationLoop(registry=_agent_registry)  # respects env flag
+app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))
+```
+
+Until registered, the main dashboard and trading paths are unchanged.
+
+## Module map
 
 | Module | Phase | Role |
 |--------|-------|------|
-| `domain` / `guards` | 1 | Models + LiveModeGuard |
-| `memory` | 2 | Experience + audit persistence |
-| `features` | 3 | FeatureEngine |
-| `regime` | 4 | RegimeDetector |
-| `strategy_registry` | 5 | Versioned strategies |
-| `selection` | 6 | Strategy selection |
-| `critic` | 7 | CriticAgent |
-| `reflection` | 8 | ReflectionAgent |
-| `research` | 9–10 | Hypothesis + Experiment |
-| `backtest` | 11 | Backtest harness |
-| `validation` | 12–13 | Walk-forward + stress |
-| `shadow` | 14–15 | Shadow portfolio |
-| `promotion` | 16–17 | Champion / Challenger |
-| `pipeline` | 18 | Research evaluation pipeline |
-| `orchestrator` | 20 | Decision cycle wiring |
-| `agent_loop` | 21 | Feature-flagged observation (no execution) |
+| domain / guards | 1 | Models + LiveModeGuard |
+| memory | 2 | Experience + audit |
+| features / regime | 3–4 | Features + regime |
+| strategy_registry / selection / critic | 5–7 | Strategies + critique |
+| reflection / research | 8–10 | Learning loop |
+| backtest / validation | 11–13 | Evaluation + stress |
+| shadow / promotion / pipeline | 14–18 | Challenger + research pipeline |
+| orchestrator / agent_loop / agent_api | 20–22 | Decision cycle + observation + API |
 
-## Safety (unchanged)
+## Safety
 
-* RiskManager is the final pre-trade gate.
-* Real orders need live mode + real execution + exact ack + credentials.
-* Agents never call the exchange.
-* Agents never raise risk limits.
-* Observation loop defaults **off** and only emits NO_TRADE proposals.
-
-## Not done yet
-
-* Dashboard Strategy Lab / Research Lab UI
-* Wiring a real entry-signal engine into TradeProposal (still NO_TRADE)
-* Live canary capital allocation
-* ML / RL
+* RiskManager remains final pre-trade gate.
+* Real orders need live + real + exact ack + credentials.
+* Agents never call the exchange or raise risk limits.
+* Agent loop and API are observation-only by default.
 
 ## Run the original bot
 
