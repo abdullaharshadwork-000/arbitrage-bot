@@ -16,9 +16,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 from uuid import uuid4
 
-from .domain import StrategyVersion
-from .features import FeatureEngine, FeatureSnapshot
-from .regime import RegimeDecision, RegimeDetector
+from .features import FeatureEngine
+from .regime import RegimeDetector
 
 
 def _utc_now() -> datetime:
@@ -76,7 +75,7 @@ class ShadowPortfolio:
 class ShadowRunner:
     """Update a ShadowPortfolio from the latest price / feature / regime."""
 
-    def __init(
+    def __init__(
         self,
         portfolio: ShadowPortfolio,
         *,
@@ -109,7 +108,6 @@ class ShadowRunner:
         event: dict[str, Any] = {"event": "hold", "price": price, "regime": regime.regime}
 
         if p.open_position is None:
-            # Entry rules (same transparent placeholder as backtester)
             action = None
             if regime.regime in ("STRONG_BULL_TREND", "WEAK_BULL_TREND") and mom > 0.01:
                 action = "BUY"
