@@ -1,69 +1,75 @@
 # ArbiCore Agentic Foundation
 
-This document describes the agentic / self-improving layers added on top of the
-original arbitrage engine. **Nothing here replaces or weakens the existing Risk
-Kernel, LiveModeGuard, or real-trading gates.**
+Agentic / self-improving layers on top of the original arbitrage engine.
+**Nothing here replaces or weakens the existing Risk Kernel, LiveModeGuard, or real-trading gates.**
 
-## Pipeline (current)
+## Live decision pipeline
 
 ```
 Market prices
-    → FeatureEngine          (timestamp-safe features)
-    → RegimeDetector         (deterministic regime + confidence)
-    → StrategySelector       (APPROVED strategies or NO_TRADE)
-    → TradeProposal          (structured only – never raw NL)
-    → CriticAgent            (APPROVE / WARN / REJECT)
-    → [existing RiskManager] (final authority – unchanged)
-    → [existing Execution]   (only if LiveModeGuard allows)
+    → FeatureEngine
+    → RegimeDetector
+    → StrategySelector          (or NO_TRADE)
+    → TradeProposal             (structured only)
+    → CriticAgent               (APPROVE / WARN / REJECT)
+    → [existing RiskManager]    (final authority)
+    → [existing Execution]      (only if LiveModeGuard allows)
 ```
 
-Research / improvement loop:
+## Research / improvement loop
 
 ```
 Experience → Reflection → Hypothesis → Experiment
-    → Backtester → WalkForward → Stress → Shadow → Promotion (human by default)
+  → Backtest → Walk-forward → Stress → Shadow → Promotion (human by default)
 ```
 
-## Modules added
+## Optional observation loop (Phase 21)
+
+```bash
+export ARBICORE_AGENT_LOOP=1   # default is off
+```
+
+When enabled, `AgentObservationLoop` runs the orchestrator on price updates,
+records regimes / selections / critiques, and **never places orders**.
+Existing scan + execution behaviour is unchanged.
+
+## Modules
 
 | Module | Phase | Role |
 |--------|-------|------|
-| `domain.py` | 1 | OperatingMode, StrategyVersion, AuditEvent, Experience, TradeProposal |
-| `guards.py` | 1 | LiveModeGuard – LIVE cannot be enabled silently |
-| `memory.py` | 2 | Experience + rich audit persistence |
-| `features.py` | 3 | Unified FeatureEngine |
-| `regime.py` | 4 | RegimeDetector |
-| `strategy_registry.py` | 5 | Versioned strategies + genealogy |
-| `selection.py` | 6 | StrategySelector (NO_TRADE is valid) |
-| `critic.py` | 7 | CriticAgent |
-| `reflection.py` | 8 | ReflectionAgent (decision quality ≠ outcome) |
-| `research.py` | 9–10 | Hypothesis + Experiment lab |
-| `backtest.py` | 11 | Research-only backtest harness |
-| `validation.py` | 12–13 | Walk-forward + stress checks |
-| `shadow.py` | 14–15 | Shadow portfolio for challengers |
-| `promotion.py` | 16–17 | Champion/Challenger + Promotion (default HUMAN_APPROVAL) |
-| `orchestrator.py` | 20 | Wires observe → select → propose → critique |
+| `domain` / `guards` | 1 | Models + LiveModeGuard |
+| `memory` | 2 | Experience + audit persistence |
+| `features` | 3 | FeatureEngine |
+| `regime` | 4 | RegimeDetector |
+| `strategy_registry` | 5 | Versioned strategies |
+| `selection` | 6 | Strategy selection |
+| `critic` | 7 | CriticAgent |
+| `reflection` | 8 | ReflectionAgent |
+| `research` | 9–10 | Hypothesis + Experiment |
+| `backtest` | 11 | Backtest harness |
+| `validation` | 12–13 | Walk-forward + stress |
+| `shadow` | 14–15 | Shadow portfolio |
+| `promotion` | 16–17 | Champion / Challenger |
+| `pipeline` | 18 | Research evaluation pipeline |
+| `orchestrator` | 20 | Decision cycle wiring |
+| `agent_loop` | 21 | Feature-flagged observation (no execution) |
 
-## Hard safety boundaries (unchanged)
+## Safety (unchanged)
 
-* RiskManager is still the final pre-trade gate.
-* Real orders still require mode=live, execution_mode=real, exact ack string, complete credentials.
-* Agents never call the exchange directly.
-* Agents never raise hard risk limits.
-* Orchestrator currently emits NO_TRADE until a concrete signal engine is wired.
-* Promotion defaults to human approval; auto-promote only reaches LIVE_CANARY.
-* Backtest / walk-forward / stress / shadow are research-only.
+* RiskManager is the final pre-trade gate.
+* Real orders need live mode + real execution + exact ack + credentials.
+* Agents never call the exchange.
+* Agents never raise risk limits.
+* Observation loop defaults **off** and only emits NO_TRADE proposals.
 
-## What is deliberately NOT done yet
+## Not done yet
 
-* Automatic wiring of the orchestrator into the main scan loop
 * Dashboard Strategy Lab / Research Lab UI
-* ML / RL models
-* Live canary capital allocation with real size limits
+* Wiring a real entry-signal engine into TradeProposal (still NO_TRADE)
+* Live canary capital allocation
+* ML / RL
 
-## Running the existing bot
-
-Unchanged:
+## Run the original bot
 
 ```bash
 pip install -r requirements.txt
