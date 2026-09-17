@@ -17,6 +17,7 @@ touch real money live here, in small testable units:
     reconcile    restart-time state recovery against the exchange
     alerts       outbound notifications for unattended operation
     domain       foundational typed models for the agentic platform (Phase 1)
+    guards       explicit live-mode / real-trading gates (Phase 1)
 """
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "config",
     "domain",
     "feed",
+    "guards",
     "ledger",
     "money",
     "orders",
