@@ -20,7 +20,7 @@ Market prices
 After a trade (or decision):
 
 ```
-Experience → ReflectionAgent → Hypothesis → Experiment → PromotionEngine
+Experience → ReflectionAgent → Hypothesis → Experiment → Backtester → PromotionEngine
 ```
 
 ## Modules added
@@ -37,6 +37,7 @@ Experience → ReflectionAgent → Hypothesis → Experiment → PromotionEngine
 | `critic.py` | 7 | CriticAgent |
 | `reflection.py` | 8 | ReflectionAgent (decision quality ≠ outcome) |
 | `research.py` | 9–10 | Hypothesis + Experiment lab |
+| `backtest.py` | 11 | Research-only backtest / evaluation harness |
 | `promotion.py` | 16–17 | Champion/Challenger + Promotion (default HUMAN_APPROVAL) |
 | `orchestrator.py` | 20 | Wires observe → select → propose → critique |
 
@@ -53,10 +54,11 @@ Experience → ReflectionAgent → Hypothesis → Experiment → PromotionEngine
 * Orchestrator currently emits `NO_TRADE` proposals until a concrete signal
   engine is deliberately wired.
 * Promotion defaults to human approval; auto-promote only reaches LIVE_CANARY.
+* Backtester is research-only and never touches live execution.
 
 ## What is deliberately NOT done yet
 
-* Full backtester / walk-forward / stress harness
+* Walk-forward and stress-test harnesses
 * Shadow & persistent paper portfolio for challengers
 * Live canary capital allocation
 * ML / RL models
