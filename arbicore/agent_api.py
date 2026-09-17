@@ -1,47 +1,68 @@
 """Read-only agent API helpers.
 
-Phase 22.
-
-Provides:
-* snapshot payloads for the observation loop and research modules
-* an optional Flask blueprint that can be registered on the existing app
-
-Default behaviour of the main bot is unchanged until the blueprint is
-explicitly registered and the agent loop is enabled.
+Phases 22 + 27.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from .agent_loop import AgentObservationLoop, agent_loop_enabled
+from .agent_loop import AgentObservationLoop, agent_loop_enabled, paper_exec_enabled
 from .strategy_registry import StrategyRegistry
 
 
 def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
-    """Pure snapshot for GET /api/agent (or equivalent)."""
-    enabled = agent_loop_enabled()
+    """Pure snapshot for GET /api/agent."""
+    # Prefer process-wide scan_hook loop if present
+    if loop is None:
+        try:
+            from .scan_hook import agent_snapshot as hook_snapshot, get_agent_loop
+
+            hook_loop = get_agent_loop()
+            if hook_loop is not None:
+                loop = hook_loop
+            else:
+                base = hook_snapshot()
+                return {
+                    "ok": True,
+                    "agent_loop_enabled": agent_loop_enabled(),
+                    "paper_exec_enabled": paper_exec_enabled(),
+                    "state": base,
+                    "recent": [],
+                }
+        except Exception:
+            pass
+
     if loop is None:
         return {
             "ok": True,
-            "agent_loop_enabled": enabled,
-            "message": (
-                "observation loop not attached; set ARBICORE_AGENT_LOOP=1 and "
-                "register AgentObservationLoop to collect live cycles"
-            ),
-            "state": {"enabled": enabled, "cycles": 0},
+            "agent_loop_enabled": agent_loop_enabled(),
+            "paper_exec_enabled": paper_exec_enabled(),
+            "message": "observation loop not attached",
+            "state": {"enabled": False, "cycles": 0},
+            "recent": [],
         }
+
     snap = loop.state.snapshot()
     return {
         "ok": True,
         "agent_loop_enabled": loop.state.enabled,
+        "paper_exec_enabled": loop.state.paper_exec_enabled,
         "state": snap,
         "recent": list(loop.state.history[-20:]),
     }
 
 
 def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict[str, Any]:
-    """List registered strategy versions (read-only)."""
+    if registry is None:
+        try:
+            from .scan_hook import get_agent_loop
+
+            loop = get_agent_loop()
+            if loop is not None:
+                registry = loop.registry
+        except Exception:
+            registry = None
     if registry is None:
         return {"ok": True, "strategies": [], "count": 0}
     versions = registry.all_versions()
@@ -62,9 +83,10 @@ def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict
     }
 
 
-def create_agent_blueprint(loop: Optional[AgentObservationLoop] = None,
-                           registry: Optional[StrategyRegistry] = None):
-    """Optional Flask blueprint. Import only when Flask is available."""
+def create_agent_blueprint(
+    loop: Optional[AgentObservationLoop] = None,
+    registry: Optional[StrategyRegistry] = None,
+):
     try:
         from flask import Blueprint, jsonify
     except ImportError as exc:
