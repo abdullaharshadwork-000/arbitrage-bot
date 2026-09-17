@@ -43,7 +43,7 @@ class AgentLoopState:
     last_result: Optional[PipelineResult] = None
     last_error: str = ""
     last_run_at: Optional[datetime] = None
-    history: list = field(default_factory=list)  # recent PipelineResult summaries
+    history: list = field(default_factory=list)
     max_history: int = 50
 
     def snapshot(self) -> dict[str, Any]:
@@ -74,7 +74,7 @@ class AgentObservationLoop:
     wires a signal engine and execution path (still behind Risk Kernel).
     """
 
-    def __init(
+    def __init__(
         self,
         registry: Optional[StrategyRegistry] = None,
         *,
@@ -114,7 +114,6 @@ class AgentObservationLoop:
             self.state.last_error = ""
             self.state.last_run_at = _utc_now()
 
-            # Keep a short history of summaries (not full feature vectors)
             summary = {
                 "at": self.state.last_run_at.isoformat(),
                 "symbol": symbol,
@@ -127,7 +126,6 @@ class AgentObservationLoop:
             if len(self.state.history) > self.state.max_history:
                 self.state.history = self.state.history[-self.state.max_history :]
 
-            # Optional: persist a domain audit event via memory if configured
             if self.memory and result.critique:
                 from .domain import AuditCategory, AuditEvent
 
