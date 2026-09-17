@@ -12,9 +12,8 @@ layer (still gated by RiskManager + LiveModeGuard) may act on.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any, Optional, Sequence
 from uuid import uuid4
 
@@ -57,7 +56,7 @@ class PipelineResult:
 class AgentOrchestrator:
     """Run one observe → understand → select → propose → critique cycle."""
 
-    def __init(
+    def __init__(
         self,
         registry: StrategyRegistry,
         *,
@@ -92,13 +91,12 @@ class AgentOrchestrator:
         candidates = self.registry.all_versions()
         selection = self.selector.select(candidates, regime, symbol=symbol)
 
-        # 4. Proposal (very simple – later phases will enrich)
-        proposal: Optional[TradeProposal] = None
+        # 4. Proposal (safe default – does not invent entries)
         if selection.action == "USE_STRATEGY" and selection.strategy_id:
             proposal = TradeProposal(
                 id=f"prop_{uuid4().hex[:12]}",
                 symbol=symbol,
-                action="NO_TRADE",  # safe default until a real signal engine is wired
+                action="NO_TRADE",
                 strategy_id=selection.strategy_id,
                 strategy_version=selection.strategy_version or "",
                 market_regime=regime.regime,
