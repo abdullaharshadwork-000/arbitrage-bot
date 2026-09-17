@@ -1,9 +1,9 @@
 """Agent Orchestrator – wires the decision pipeline.
 
-Phase 20 foundation.
+Phases 20 + 23.
 
 Pipeline:
-  Features → Regime → Selection → TradeProposal → Critic
+  Features → Regime → Selection → SignalEngine → TradeProposal → Critic
 
 This orchestrator NEVER calls the exchange and NEVER bypasses the Risk Kernel.
 It only produces structured proposals and critiques that a later execution
@@ -15,13 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
-from uuid import uuid4
 
 from .critic import CriticAgent, CriticDecision
 from .domain import OperatingMode, TradeProposal
 from .features import FeatureEngine, FeatureSnapshot
 from .regime import RegimeDecision, RegimeDetector
 from .selection import SelectionResult, StrategySelector
+from .signals_agent import SignalEngine
 from .strategy_registry import StrategyRegistry
 
 
@@ -54,7 +54,7 @@ class PipelineResult:
 
 
 class AgentOrchestrator:
-    """Run one observe → understand → select → propose → critique cycle."""
+    """Run one observe → understand → select → signal → critique cycle."""
 
     def __init__(
         self,
@@ -63,6 +63,7 @@ class AgentOrchestrator:
         feature_engine: Optional[FeatureEngine] = None,
         regime_detector: Optional[RegimeDetector] = None,
         selector: Optional[StrategySelector] = None,
+        signal_engine: Optional[SignalEngine] = None,
         critic: Optional[CriticAgent] = None,
         mode: OperatingMode = OperatingMode.PAPER,
     ):
@@ -70,6 +71,7 @@ class AgentOrchestrator:
         self.features = feature_engine or FeatureEngine()
         self.regime = regime_detector or RegimeDetector()
         self.selector = selector or StrategySelector()
+        self.signals = signal_engine or SignalEngine()
         self.critic = critic or CriticAgent()
         self.mode = mode
 
@@ -81,46 +83,16 @@ class AgentOrchestrator:
         volumes: Optional[Sequence[float]] = None,
         as_of: Optional[float] = None,
     ) -> PipelineResult:
-        # 1. Features
         snap = self.features.compute(symbol, prices, as_of=as_of, volumes=volumes)
-
-        # 2. Regime
         regime = self.regime.classify(snap)
-
-        # 3. Selection
         candidates = self.registry.all_versions()
         selection = self.selector.select(candidates, regime, symbol=symbol)
 
-        # 4. Proposal (safe default – does not invent entries)
-        if selection.action == "USE_STRATEGY" and selection.strategy_id:
-            proposal = TradeProposal(
-                id=f"prop_{uuid4().hex[:12]}",
-                symbol=symbol,
-                action="NO_TRADE",
-                strategy_id=selection.strategy_id,
-                strategy_version=selection.strategy_version or "",
-                market_regime=regime.regime,
-                regime_confidence=regime.confidence,
-                trade_confidence=0.0,
-                reasoning_summary=(
-                    f"Selected {selection.strategy_name} for regime {regime.regime}; "
-                    "awaiting concrete entry signal (orchestrator does not invent entries)"
-                ),
-            )
-        else:
-            proposal = TradeProposal(
-                id=f"prop_{uuid4().hex[:12]}",
-                symbol=symbol,
-                action="NO_TRADE",
-                strategy_id="none",
-                strategy_version="none",
-                market_regime=regime.regime,
-                regime_confidence=regime.confidence,
-                trade_confidence=1.0,
-                reasoning_summary=selection.reason or "NO_TRADE",
-            )
+        last_price = float(prices[-1]) if prices else 0.0
+        proposal = self.signals.propose(
+            symbol, snap, regime, selection, last_price=last_price
+        )
 
-        # 5. Critique
         critique = self.critic.review(proposal, features=snap, regime=regime)
 
         return PipelineResult(
@@ -129,7 +101,12 @@ class AgentOrchestrator:
             selection=selection,
             proposal=proposal,
             critique=critique,
-            meta={"mode": self.mode.value, "symbol": symbol},
+            meta={
+                "mode": self.mode.value,
+                "symbol": symbol,
+                "proposal_action": proposal.action,
+                "critique_result": critique.result,
+            },
         )
 
 
