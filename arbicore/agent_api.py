@@ -71,7 +71,6 @@ def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict
 
 
 def build_research_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
-    """Hypotheses / experiments if a ResearchLab is attached later."""
     lab = None
     if loop is not None and hasattr(loop, "lab"):
         lab = getattr(loop, "lab", None)
@@ -82,8 +81,8 @@ def build_research_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict
             "experiments": [],
             "message": "research lab not attached to observation loop",
         }
-    hyps = [h.as_dict() for h in getattr(lab, "hypotheses", lambda: [])()]
-    exps = [e.as_dict() for e in getattr(lab, "experiments", lambda: [])()]
+    hyps = [h.as_dict() for h in getattr(lab, "list_hypotheses", lambda: [])()]
+    exps = [e.as_dict() for e in getattr(lab, "list_experiments", lambda: [])()]
     return {"ok": True, "hypotheses": hyps, "experiments": exps}
 
 
@@ -93,9 +92,7 @@ def build_drift_snapshot(
 ) -> dict[str, Any]:
     from .drift import DriftMonitor
 
-    memory = None
-    if loop is not None:
-        memory = loop.memory
+    memory = getattr(loop, "memory", None) if loop is not None else None
     if memory is None:
         return {
             "ok": True,
@@ -104,18 +101,19 @@ def build_drift_snapshot(
         }
 
     try:
-        experiences = memory.list_experiences(limit=500)
+        experiences = memory.recent_experiences(limit=500)
     except Exception:
         experiences = []
 
     monitor = DriftMonitor()
-    strategy_ids = set()
+    strategy_ids: set[str] = set()
     if strategy_id:
         strategy_ids.add(strategy_id)
     else:
         for e in experiences:
-            if e.strategy_id:
-                strategy_ids.add(e.strategy_id)
+            sid = e.get("strategy_id") if isinstance(e, dict) else getattr(e, "strategy_id", None)
+            if sid:
+                strategy_ids.add(sid)
 
     reports = [monitor.evaluate(sid, experiences).as_dict() for sid in sorted(strategy_ids)]
     return {"ok": True, "reports": reports, "experience_count": len(experiences)}
