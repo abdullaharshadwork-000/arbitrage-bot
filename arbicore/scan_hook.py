@@ -12,14 +12,17 @@ optionally call `notify_agent_prices(symbol, price_history)`.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
-from .agent_loop import AgentObservationLoop, agent_loop_enabled
+from .agent_loop import (
+    AgentObservationLoop,
+    agent_loop_enabled,
+    paper_exec_enabled,
+)
 from .domain import OperatingMode
-from .paper_exec import PaperExecutor, paper_exec_enabled  # type: ignore
+from .paper_exec import PaperExecutor
 from .strategy_registry import StrategyRegistry
 
-# Lazy singleton – created on first use when the flag is on
 _loop: Optional[AgentObservationLoop] = None
 
 
@@ -31,19 +34,20 @@ def get_agent_loop() -> Optional[AgentObservationLoop]:
     if _loop is None:
         registry = StrategyRegistry()
         paper = None
+        enable_paper = False
         try:
-            from .agent_loop import paper_exec_enabled as _pe
-
-            if _pe():
+            if paper_exec_enabled():
                 paper = PaperExecutor(mode=OperatingMode.PAPER)
+                enable_paper = True
         except Exception:
             paper = None
+            enable_paper = False
         _loop = AgentObservationLoop(
             registry=registry,
             paper_executor=paper,
             mode=OperatingMode.PAPER,
             enabled=True,
-            enable_paper_exec=paper is not None,
+            enable_paper_exec=enable_paper,
             seed_demo=True,
         )
     return _loop
@@ -67,12 +71,11 @@ def notify_agent_prices(
         return
 
 
-def agent_snapshot() -> dict:
+def agent_snapshot() -> dict[str, Any]:
     """Read-only snapshot for APIs / debugging."""
-    loop = _loop
-    if loop is None:
+    if _loop is None:
         return {"enabled": agent_loop_enabled(), "attached": False}
-    snap = loop.state.snapshot()
+    snap = _loop.state.snapshot()
     snap["attached"] = True
     return snap
 
