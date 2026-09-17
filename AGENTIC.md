@@ -5,42 +5,32 @@
 ## Pipeline
 
 ```
-Prices → Features → Regime → Select → Signal → Critic
-                                              │
-                                    APPROVE + paper flag
-                                              ▼
-                                      PaperExecutor → Experience → Reflection
+Scan mid prices → notify_agent_mid (optional)
+    → Features → Regime → Select → Signal → Critic
+                              APPROVE + paper flag → PaperExecutor
+                                                   → Experience → Reflection
 ```
 
-## Enable observation (default OFF)
+## Enable (one script, flags still required)
 
 ```bash
+python scripts/enable_agent_api.py   # patches server.py (API + scan hook)
 export ARBICORE_AGENT_LOOP=1
 export ARBICORE_AGENT_PAPER_EXEC=1   # optional paper fills
-python scripts/enable_agent_api.py  # optional GET /api/agent
 python server.py
 ```
 
-## Hook from the existing scanner (optional)
+Then:
 
-After you have a per-symbol price history list:
-
-```python
-from arbicore.scan_hook import notify_agent_prices
-
-notify_agent_prices("BTC/USDT", price_history)  # never raises; no-op if flags off
-```
-
-## API (after enable script)
-
-* `GET /api/agent` – cycles, paper fills, reflections, recent history
-* `GET /api/agent/strategies` – registry (includes seeded demo strategy)
+* Each scan pushes mid prices into the agent loop (no-op if flags off)
+* `GET /api/agent` – status, cycles, paper fills, reflections
+* `GET /api/agent/strategies` – registry (demo strategy seeded)
 
 ## Safety
 
+* `notify_agent_mid` never raises into the scanner
 * Loop / PaperExecutor refuse LIVE mode
-* `notify_agent_prices` swallows all errors
-* Existing arbitrage execution path unchanged
+* Existing arbitrage execution path unchanged until you change Risk / Live gates yourself
 
 ```bash
 pip install -r requirements.txt && python server.py
