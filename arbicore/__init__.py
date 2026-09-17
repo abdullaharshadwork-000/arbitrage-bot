@@ -1,9 +1,6 @@
 """ArbiCore — production support modules for the arbitrage engine.
 
-`arbitrage_bot.py` remains the engine entry point and keeps its public API
-so the Flask dashboard and existing tests keep working.
-
-Agentic foundation (Phases 1–23+) never bypasses the Risk Kernel or LiveModeGuard.
+Agentic foundation (Phases 1–24+) never bypasses the Risk Kernel or LiveModeGuard.
 """
 
 __all__ = [
@@ -24,6 +21,7 @@ __all__ = [
     "money",
     "orders",
     "orchestrator",
+    "paper_exec",
     "pipeline",
     "promotion",
     "rebalance",
