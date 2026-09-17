@@ -22,6 +22,8 @@ touch real money live here, in small testable units:
     features     unified timestamp-safe feature engine (Phase 3)
     regime       market regime detector (Phase 4)
     strategy_registry  versioned strategies with genealogy (Phase 5)
+    selection    strategy selection (Phase 6)
+    critic       adversarial trade critique (Phase 7)
 """
 
 __all__ = [
@@ -29,6 +31,7 @@ __all__ = [
     "auth",
     "books",
     "config",
+    "critic",
     "domain",
     "features",
     "feed",
@@ -42,6 +45,7 @@ __all__ = [
     "regime",
     "safety",
     "risk",
+    "selection",
     "simulator",
     "strategy_registry",
     "streaming",
