@@ -17,10 +17,11 @@ Market prices
     → [existing Execution]   (only if LiveModeGuard allows)
 ```
 
-After a trade (or decision):
+Research / improvement loop:
 
 ```
-Experience → ReflectionAgent → Hypothesis → Experiment → Backtester → PromotionEngine
+Experience → Reflection → Hypothesis → Experiment
+    → Backtester → WalkForward → Stress → Shadow → Promotion (human by default)
 ```
 
 ## Modules added
@@ -37,35 +38,28 @@ Experience → ReflectionAgent → Hypothesis → Experiment → Backtester → 
 | `critic.py` | 7 | CriticAgent |
 | `reflection.py` | 8 | ReflectionAgent (decision quality ≠ outcome) |
 | `research.py` | 9–10 | Hypothesis + Experiment lab |
-| `backtest.py` | 11 | Research-only backtest / evaluation harness |
+| `backtest.py` | 11 | Research-only backtest harness |
+| `validation.py` | 12–13 | Walk-forward + stress checks |
+| `shadow.py` | 14–15 | Shadow portfolio for challengers |
 | `promotion.py` | 16–17 | Champion/Challenger + Promotion (default HUMAN_APPROVAL) |
 | `orchestrator.py` | 20 | Wires observe → select → propose → critique |
 
 ## Hard safety boundaries (unchanged)
 
 * RiskManager is still the final pre-trade gate.
-* Real orders still require:
-  * `mode == live`
-  * `execution_mode == real`
-  * exact acknowledgement string `I ACCEPT REAL LOSSES`
-  * complete credentials
-* Agents never call Binance / ccxt directly.
+* Real orders still require mode=live, execution_mode=real, exact ack string, complete credentials.
+* Agents never call the exchange directly.
 * Agents never raise hard risk limits.
-* Orchestrator currently emits `NO_TRADE` proposals until a concrete signal
-  engine is deliberately wired.
+* Orchestrator currently emits NO_TRADE until a concrete signal engine is wired.
 * Promotion defaults to human approval; auto-promote only reaches LIVE_CANARY.
-* Backtester is research-only and never touches live execution.
+* Backtest / walk-forward / stress / shadow are research-only.
 
 ## What is deliberately NOT done yet
 
-* Walk-forward and stress-test harnesses
-* Shadow & persistent paper portfolio for challengers
-* Live canary capital allocation
-* ML / RL models
-* Dashboard Strategy Lab / Research Lab UI
 * Automatic wiring of the orchestrator into the main scan loop
-
-These come next and must remain behind the same safety gates.
+* Dashboard Strategy Lab / Research Lab UI
+* ML / RL models
+* Live canary capital allocation with real size limits
 
 ## Running the existing bot
 
@@ -75,5 +69,3 @@ Unchanged:
 pip install -r requirements.txt
 python server.py
 ```
-
-All original paper / real / risk behaviour continues to work.
