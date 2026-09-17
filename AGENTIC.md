@@ -1,16 +1,23 @@
 # ArbiCore Agentic Foundation
 
-Agentic / self-improving layers on top of the original arbitrage engine.
-**Nothing here replaces or weakens the existing Risk Kernel, LiveModeGuard, or real-trading gates.**
+Agentic layers on top of the original arbitrage engine.
+**Risk Kernel, LiveModeGuard, and real-trading gates are unchanged and remain highest authority.**
 
 ## Live decision pipeline
 
 ```
 Market prices
-    → FeatureEngine → RegimeDetector → StrategySelector
-    → TradeProposal → CriticAgent
-    → [RiskManager] → [Execution only if LiveModeGuard allows]
+    → FeatureEngine
+    → RegimeDetector
+    → StrategySelector
+    → SignalEngine              (TradeProposal; may be NO_TRADE)
+    → CriticAgent               (APPROVE / WARN / REJECT)
+    → [RiskManager]             (final authority – existing code)
+    → [Execution]               (only if LiveModeGuard allows)
 ```
+
+**Important:** The orchestrator and signal engine never call the exchange.
+Execution still only happens through the existing bot path after Risk + Live gates.
 
 ## Research loop
 
@@ -23,31 +30,14 @@ Experience → Reflection → Hypothesis → Experiment
 
 ```bash
 export ARBICORE_AGENT_LOOP=1   # default off
-```
-
-Runs the orchestrator on price updates. **Never places orders.**
-
-## Read-only agent API (Phase 22)
-
-Helpers: `arbicore/agent_api.py`
-
-Routes (after registration):
-
-* `GET /api/agent` – observation loop snapshot
-* `GET /api/agent/strategies` – strategy registry
-
-### Enable routes in server.py (one-time, safe)
-
-```bash
-python scripts/enable_agent_api.py
-# restart server
+python scripts/enable_agent_api.py   # one-time, optional API routes
 python server.py
 ```
 
-The script is idempotent. It wraps registration in try/except so a failure
-never prevents the main bot from starting. No trading behaviour changes.
+* `GET /api/agent` – observation snapshot (after enable script)
+* `GET /api/agent/strategies` – registry listing
 
-## Module map
+## Module map (Phases 1–23)
 
 | Module | Phase | Role |
 |--------|-------|------|
@@ -59,13 +49,13 @@ never prevents the main bot from starting. No trading behaviour changes.
 | backtest / validation | 11–13 | Evaluation + stress |
 | shadow / promotion / pipeline | 14–18 | Challenger + research pipeline |
 | orchestrator / agent_loop / agent_api | 20–22 | Decision cycle + observation + API |
+| signals_agent | 23 | TradeProposal from features/regime |
 
 ## Safety
 
-* RiskManager remains final pre-trade gate.
-* Real orders need live + real + exact ack + credentials.
-* Agents never call the exchange or raise risk limits.
-* Agent loop and API are observation-only by default.
+* Agents never place orders.
+* Real trading still needs live mode + real execution + exact ack + credentials.
+* Critic and Risk Kernel remain in front of any future execution wiring.
 
 ## Run the original bot
 
