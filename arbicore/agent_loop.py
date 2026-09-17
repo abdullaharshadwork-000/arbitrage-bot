@@ -1,11 +1,11 @@
 """Optional agent observation loop.
 
-Phases 21 + 25.
+Phases 21 + 25 + 26.
 
 When enabled (ARBICORE_AGENT_LOOP=1), runs:
   Features → Regime → Selection → Signal → Critic
-  → optional PaperExecutor (only on Critic APPROVE)
-  → optional ExperienceMemory record
+  → optional PaperExecutor (Critic APPROVE only)
+  → optional ExperienceMemory + ReflectionAgent
 
 NEVER submits live orders. NEVER bypasses LiveModeGuard / RiskManager.
 Default: disabled.
@@ -20,10 +20,12 @@ from decimal import Decimal
 from typing import Any, Optional, Sequence
 from uuid import uuid4
 
+from .bootstrap import seed_demo_strategy
 from .domain import Experience, OperatingMode
 from .memory import ExperienceMemory
 from .orchestrator import AgentOrchestrator, PipelineResult
 from .paper_exec import PaperExecutor, PaperExecResult
+from .reflection import ReflectionAgent, ReflectionResult
 from .strategy_registry import StrategyRegistry
 
 
@@ -32,7 +34,6 @@ def _utc_now() -> datetime:
 
 
 def agent_loop_enabled(environ: Optional[dict] = None) -> bool:
-    """Feature flag. Default off. Set ARBICORE_AGENT_LOOP=1 to enable."""
     env = environ if environ is not None else os.environ
     return str(env.get("ARBICORE_AGENT_LOOP", "0")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -40,7 +41,6 @@ def agent_loop_enabled(environ: Optional[dict] = None) -> bool:
 
 
 def paper_exec_enabled(environ: Optional[dict] = None) -> bool:
-    """Separate flag for paper fills inside the observation loop. Default off."""
     env = environ if environ is not None else os.environ
     return str(env.get("ARBICORE_AGENT_PAPER_EXEC", "0")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -53,8 +53,10 @@ class AgentLoopState:
     paper_exec_enabled: bool = False
     cycles: int = 0
     paper_fills: int = 0
+    reflections: int = 0
     last_result: Optional[PipelineResult] = None
     last_paper: Optional[PaperExecResult] = None
+    last_reflection: Optional[ReflectionResult] = None
     last_error: str = ""
     last_run_at: Optional[datetime] = None
     history: list = field(default_factory=list)
@@ -66,6 +68,7 @@ class AgentLoopState:
             "paper_exec_enabled": self.paper_exec_enabled,
             "cycles": self.cycles,
             "paper_fills": self.paper_fills,
+            "reflections": self.reflections,
             "last_error": self.last_error,
             "last_run_at": self.last_run_at.isoformat() if self.last_run_at else None,
             "last_action": (
@@ -86,12 +89,15 @@ class AgentLoopState:
             "last_paper_accepted": (
                 self.last_paper.accepted if self.last_paper else None
             ),
+            "last_reflection": (
+                self.last_reflection.classification if self.last_reflection else None
+            ),
             "history_len": len(self.history),
         }
 
 
 class AgentObservationLoop:
-    """Observation (+ optional paper execution) cycle."""
+    """Observation (+ optional paper execution + reflection) cycle."""
 
     def __init__(
         self,
@@ -99,16 +105,21 @@ class AgentObservationLoop:
         *,
         memory: Optional[ExperienceMemory] = None,
         paper_executor: Optional[PaperExecutor] = None,
+        reflection_agent: Optional[ReflectionAgent] = None,
         mode: OperatingMode = OperatingMode.PAPER,
         enabled: Optional[bool] = None,
         enable_paper_exec: Optional[bool] = None,
+        seed_demo: bool = True,
     ):
         if mode is OperatingMode.LIVE:
             raise ValueError("AgentObservationLoop cannot run in LIVE mode")
         self.registry = registry or StrategyRegistry()
+        if seed_demo:
+            seed_demo_strategy(self.registry)
         self.memory = memory
         self.orchestrator = AgentOrchestrator(self.registry, mode=mode)
         self.paper = paper_executor
+        self.reflection = reflection_agent or ReflectionAgent()
         self.state = AgentLoopState(
             enabled=agent_loop_enabled() if enabled is None else bool(enabled),
             paper_exec_enabled=(
@@ -140,6 +151,7 @@ class AgentObservationLoop:
             self.state.last_error = ""
             self.state.last_run_at = _utc_now()
             self.state.last_paper = None
+            self.state.last_reflection = None
 
             paper_info: dict[str, Any] = {}
             if (
@@ -160,7 +172,12 @@ class AgentObservationLoop:
                 if paper_result.accepted and paper_result.fill:
                     self.state.paper_fills += 1
                     paper_info["fill_id"] = paper_result.fill.id
-                    self._record_experience(symbol, result, paper_result)
+                    exp = self._record_experience(symbol, result, paper_result)
+                    if exp is not None:
+                        reflection = self.reflection.reflect(exp)
+                        self.state.last_reflection = reflection
+                        self.state.reflections += 1
+                        paper_info["reflection"] = reflection.classification
 
             summary = {
                 "at": self.state.last_run_at.isoformat(),
@@ -200,9 +217,9 @@ class AgentObservationLoop:
         symbol: str,
         result: PipelineResult,
         paper_result: PaperExecResult,
-    ) -> None:
-        if not self.memory or not result.proposal or not paper_result.fill:
-            return
+    ) -> Optional[Experience]:
+        if not result.proposal or not paper_result.fill:
+            return None
         fill = paper_result.fill
         exp = Experience(
             id=f"exp_{uuid4().hex[:12]}",
@@ -227,7 +244,9 @@ class AgentObservationLoop:
             risk_result="paper_adapter",
             feature_snapshot=result.features.features if result.features else {},
         )
-        self.memory.record_experience(exp)
+        if self.memory:
+            self.memory.record_experience(exp)
+        return exp
 
 
 __all__ = [
