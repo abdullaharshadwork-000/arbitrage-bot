@@ -1,4 +1,4 @@
-"""ArbiCore — production support + agentic foundation (Phases 1–26).
+"""ArbiCore — production support + agentic foundation (Phases 1–27).
 
 Never bypasses the Risk Kernel or LiveModeGuard.
 """
@@ -32,6 +32,7 @@ __all__ = [
     "research",
     "risk",
     "safety",
+    "scan_hook",
     "selection",
     "shadow",
     "signals_agent",
