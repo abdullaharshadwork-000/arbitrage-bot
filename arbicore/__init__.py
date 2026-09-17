@@ -19,6 +19,7 @@ touch real money live here, in small testable units:
     domain       foundational typed models for the agentic platform (Phase 1)
     guards       explicit live-mode / real-trading gates (Phase 1)
     memory       experience + rich audit persistence (Phase 2)
+    features     unified timestamp-safe feature engine (Phase 3)
 """
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "books",
     "config",
     "domain",
+    "features",
     "feed",
     "guards",
     "ledger",
