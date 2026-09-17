@@ -14,7 +14,6 @@ The Critic is deliberately conservative. A WARN does not block; a REJECT does.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 from .domain import TradeProposal
@@ -47,7 +46,7 @@ class CriticDecision:
 class CriticAgent:
     """Review a TradeProposal against features, regime, and basic quality rules."""
 
-    def __init(
+    def __init__(
         self,
         *,
         min_reward_risk: float = 1.2,
