@@ -21,6 +21,7 @@ touch real money live here, in small testable units:
     memory       experience + rich audit persistence (Phase 2)
     features     unified timestamp-safe feature engine (Phase 3)
     regime       market regime detector (Phase 4)
+    strategy_registry  versioned strategies with genealogy (Phase 5)
 """
 
 __all__ = [
@@ -42,5 +43,6 @@ __all__ = [
     "safety",
     "risk",
     "simulator",
+    "strategy_registry",
     "streaming",
 ]
