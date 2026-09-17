@@ -11,7 +11,7 @@ Promotion remains a separate, human-gated step.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from .backtest import BacktestResult, Backtester
@@ -54,7 +54,7 @@ class ResearchPipelineReport:
 class ResearchPipeline:
     """Orchestrate research evaluation for one candidate strategy."""
 
-    def __init(
+    def __init__(
         self,
         registry: StrategyRegistry,
         lab: Optional[ResearchLab] = None,
@@ -78,17 +78,11 @@ class ResearchPipeline:
         hypothesis: Optional[Hypothesis] = None,
         experiment: Optional[Experiment] = None,
     ) -> ResearchPipelineReport:
-        # 1. Backtest
         bt = self.backtester.run(strategy, symbol, prices)
-
-        # 2. Walk-forward
         wf = self.walk_forward.run(strategy, symbol, prices)
-
-        # 3. Stress
         fee_stress = self.stress.run_fee_spike(strategy, symbol, prices)
         slip_stress = self.stress.run_slippage_spike(strategy, symbol, prices)
 
-        # 4. Aggregate pass/fail (conservative)
         checks = [
             bt.meta.get("status") != "insufficient_bars",
             wf.passed if wf.total_windows > 0 else False,
@@ -111,7 +105,6 @@ class ResearchPipeline:
         if overall:
             summary += " | " + "; ".join(parts)
 
-        # Optionally move strategy status to VALIDATING / FAILED_BACKTEST
         if overall:
             self.registry.set_status(strategy.id, StrategyStatus.VALIDATING)
         else:
