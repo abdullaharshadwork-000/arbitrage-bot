@@ -1,33 +1,34 @@
-# ArbiCore Agentic Foundation
+# ArbiCore Agentic Foundation (Phases 1–26)
 
-**Risk Kernel, LiveModeGuard, and real-trading gates remain the highest authority.**
+**Risk Kernel, LiveModeGuard, and real-trading gates remain highest authority.**
 
 ## Decision path
 
 ```
-Prices → Features → Regime → Selection → SignalEngine → Critic
+Prices → Features → Regime → Selection → Signal → Critic
                                               │
-                                    APPROVE only (optional)
+                                    APPROVE + paper flag
                                               ▼
                                       PaperExecutor
                                               ▼
-                                      ExperienceMemory
-                                              ▼
-                                      Reflection (later)
+                                      Experience + Reflection
 
-Live exchange: not connected on this path.
+Live exchange: not on this path.
 ```
 
-## Feature flags (all default OFF)
+## Flags (default OFF)
 
 ```bash
-export ARBICORE_AGENT_LOOP=1          # run observation cycles
-export ARBICORE_AGENT_PAPER_EXEC=1    # paper-fill after Critic APPROVE
-python scripts/enable_agent_api.py    # optional GET /api/agent
+export ARBICORE_AGENT_LOOP=1
+export ARBICORE_AGENT_PAPER_EXEC=1
+python scripts/enable_agent_api.py   # optional
 python server.py
 ```
 
-## Modules (Phases 1–25)
+On first loop init, `seed_demo_strategy()` registers an APPROVED
+`momentum_regime_v1` strategy for paper/observation demos only.
+
+## Module map
 
 | Module | Phase | Role |
 |--------|-------|------|
@@ -38,18 +39,16 @@ python server.py
 | reflection / research | 8–10 | Learning |
 | backtest / validation | 11–13 | Evaluation |
 | shadow / promotion / pipeline | 14–18 | Challenger + research |
-| orchestrator / agent_loop / agent_api | 20–22 | Cycle + observation + API |
-| signals_agent | 23 | TradeProposal signals |
-| paper_exec | 24 | Paper fills after APPROVE |
-| agent_loop (extended) | 25 | Paper fill + Experience record |
+| orchestrator / agent_loop / agent_api | 20–22 | Cycle + API |
+| signals_agent / paper_exec | 23–24 | Signals + paper fills |
+| agent_loop + bootstrap | 25–26 | Experience, reflection, demo seed |
 
 ## Safety
 
-* Observation loop and paper exec refuse LIVE mode.
+* Loop and PaperExecutor refuse LIVE mode.
 * No agent path places live orders.
-* Existing bot + Risk Kernel unchanged.
+* Demo strategy is not live authorization.
 
 ```bash
-pip install -r requirements.txt
-python server.py
+pip install -r requirements.txt && python server.py
 ```
