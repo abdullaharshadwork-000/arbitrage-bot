@@ -10,7 +10,7 @@ or pause a strategy. Research / observation only – never places orders.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 from .domain import Experience
 
@@ -56,7 +56,6 @@ class DriftMonitor:
         strategy_id: str,
         experiences: Sequence[Experience],
     ) -> DriftReport:
-        # Only closed / realized experiences with a pnl field if present
         rows = [e for e in experiences if e.strategy_id == strategy_id]
         n = len(rows)
         need = self.baseline_size + self.recent_size
@@ -80,23 +79,11 @@ class DriftMonitor:
         recent = rows[-self.recent_size:]
 
         def _stats(chunk: Sequence[Experience]) -> tuple[float, float]:
-            pnls = []
+            pnls: list[float] = []
             for e in chunk:
                 if e.realized_pnl is not None:
                     pnls.append(float(e.realized_pnl))
-                elif e.actual_entry is not None and e.exit_price is not None:
-                    # rough proxy if size known
-                    try:
-                        size = float(e.position_size or 0)
-                        entry = float(e.actual_entry)
-                        exit_ = float(e.exit_price)
-                        if size and entry:
-                            direction = 1 if (e.final_action or "").upper() == "BUY" else -1
-                            pnls.append(direction * (exit_ - entry) * size)
-                    except Exception:
-                        pass
             if not pnls:
-                # fall back: treat presence of a fill as neutral
                 return 0.0, 0.0
             wins = sum(1 for p in pnls if p > 0)
             return wins / len(pnls), sum(pnls) / len(pnls)
