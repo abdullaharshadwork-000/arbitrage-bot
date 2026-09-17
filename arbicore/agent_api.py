@@ -1,6 +1,6 @@
 """Read-only agent API helpers.
 
-Phases 22 + 27–29.
+Phases 22 + 27–30.
 """
 
 from __future__ import annotations
@@ -11,26 +11,47 @@ from .agent_loop import AgentObservationLoop, agent_loop_enabled, paper_exec_ena
 from .strategy_registry import StrategyRegistry
 
 
+def _resolve_loop(loop: Optional[AgentObservationLoop]) -> Optional[AgentObservationLoop]:
+    if loop is not None:
+        return loop
+    try:
+        from .scan_hook import get_agent_loop
+
+        return get_agent_loop()
+    except Exception:
+        return None
+
+
 def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
+    loop = _resolve_loop(loop)
     if loop is None:
         try:
-            from .scan_hook import get_agent_loop
+            from .scan_hook import agent_snapshot as hook_snap
 
-            loop = get_agent_loop()
+            base = hook_snap()
         except Exception:
-            loop = None
-
-    if loop is None:
+            base = {"enabled": agent_loop_enabled(), "attached": False}
         return {
             "ok": True,
             "agent_loop_enabled": agent_loop_enabled(),
             "paper_exec_enabled": paper_exec_enabled(),
-            "message": "observation loop not attached",
-            "state": {"enabled": False, "cycles": 0},
+            "message": "observation loop not attached or flag off",
+            "state": base,
             "recent": [],
         }
 
     snap = loop.state.snapshot()
+    try:
+        from .scan_hook import agent_snapshot as hook_snap
+
+        extra = hook_snap()
+        if "memory" in extra:
+            snap["memory"] = extra["memory"]
+        if "buffered_symbols" in extra:
+            snap["buffered_symbols"] = extra["buffered_symbols"]
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "agent_loop_enabled": loop.state.enabled,
@@ -42,14 +63,9 @@ def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[st
 
 def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict[str, Any]:
     if registry is None:
-        try:
-            from .scan_hook import get_agent_loop
-
-            loop = get_agent_loop()
-            if loop is not None:
-                registry = loop.registry
-        except Exception:
-            registry = None
+        loop = _resolve_loop(None)
+        if loop is not None:
+            registry = loop.registry
     if registry is None:
         return {"ok": True, "strategies": [], "count": 0}
     versions = registry.all_versions()
@@ -71,9 +87,8 @@ def build_registry_snapshot(registry: Optional[StrategyRegistry] = None) -> dict
 
 
 def build_research_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
-    lab = None
-    if loop is not None and hasattr(loop, "lab"):
-        lab = getattr(loop, "lab", None)
+    loop = _resolve_loop(loop)
+    lab = getattr(loop, "lab", None) if loop is not None else None
     if lab is None:
         return {
             "ok": True,
@@ -92,7 +107,16 @@ def build_drift_snapshot(
 ) -> dict[str, Any]:
     from .drift import DriftMonitor
 
+    loop = _resolve_loop(loop)
     memory = getattr(loop, "memory", None) if loop is not None else None
+    if memory is None:
+        try:
+            from .scan_hook import get_memory
+
+            memory = get_memory()
+        except Exception:
+            memory = None
+
     if memory is None:
         return {
             "ok": True,
@@ -116,7 +140,12 @@ def build_drift_snapshot(
                 strategy_ids.add(sid)
 
     reports = [monitor.evaluate(sid, experiences).as_dict() for sid in sorted(strategy_ids)]
-    return {"ok": True, "reports": reports, "experience_count": len(experiences)}
+    return {
+        "ok": True,
+        "reports": reports,
+        "experience_count": len(experiences),
+        "db": str(getattr(memory, "db_path", "")),
+    }
 
 
 def create_agent_blueprint(
@@ -126,7 +155,7 @@ def create_agent_blueprint(
     try:
         from flask import Blueprint, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exc
+        raise RuntimeError("Flask is required to create the agent blueprint") from exp
 
     bp = Blueprint("arbicore_agent", __name__)
 
