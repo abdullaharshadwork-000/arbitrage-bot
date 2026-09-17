@@ -83,7 +83,7 @@ class StressReport:
 class WalkForwardValidator:
     """Sequential train/test evaluation over a price series."""
 
-    def __init(
+    def __init__(
         self,
         *,
         train_bars: int = 60,
@@ -117,8 +117,7 @@ class WalkForwardValidator:
             test_start = train_end
             test_end = test_start + self.test_bars
 
-            # Evaluate only on the test segment (no peeking into future beyond test_end)
-            test_slice = prices[:test_end]  # features need history; metrics from test region only
+            test_slice = prices[:test_end]
             result = self.backtester.run(strategy, symbol, test_slice)
 
             windows.append(WalkForwardWindow(
@@ -174,7 +173,7 @@ class WalkForwardValidator:
 class StressTester:
     """Apply fee/slippage shocks and measure performance degradation."""
 
-    def __init(
+    def __init__(
         self,
         *,
         max_degradation_pct: float = 50.0,
