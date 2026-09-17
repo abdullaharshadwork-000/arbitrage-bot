@@ -47,7 +47,7 @@ class PromotionDecision:
 class PromotionEngine:
     """Compare champion vs challenger and emit a PromotionDecision."""
 
-    def __init(
+    def __init__(
         self,
         registry: StrategyRegistry,
         *,
@@ -86,7 +86,6 @@ class PromotionEngine:
         c_m = champion_metrics or {}
         h_m = challenger_metrics or {}
 
-        # Require minimum evidence
         if not c_m or not h_m:
             decision = PromotionDecision(
                 id=_new_id(),
@@ -125,9 +124,8 @@ class PromotionEngine:
             reason = "; ".join(reasons)
             requires_human = True
         else:
-            # Passed quantitative gates
             if self.auto_promote:
-                result = "CANARY"   # still staged, never full LIVE jump
+                result = "CANARY"
                 reason = "quantitative gates passed; auto-promote to canary only"
                 requires_human = False
             else:
@@ -157,7 +155,6 @@ class PromotionEngine:
         if decision.result not in ("CANARY", "PROMOTE"):
             return None
         if decision.requires_human and decision.result == "PROMOTE":
-            # Human must call this after explicit approval
             return None
         return self.registry.set_status(
             decision.challenger_id, StrategyStatus.LIVE_CANARY
