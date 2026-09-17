@@ -3,27 +3,10 @@
 `arbitrage_bot.py` remains the engine entry point and keeps its public API
 (PaperWallet, DemoFeed, LiveFeed, find_opportunity, ...) so the Flask
 dashboard and the existing test suite keep working. The hard parts that
-touch real money live here, in small testable units:
+touch real money live here, in small testable units.
 
-    money        Decimal arithmetic and exchange step quantization
-    config       immutable runtime config + credential loading from env
-    books        order-book VWAP and depth analysis
-    feed         bulk quote collection, staleness checks, route ranking
-    orders       order submission with clientOrderId + fill reconciliation
-    ledger       shared per-(exchange, currency) balances
-    simulator    latency- and depth-aware paper fills
-    rebalance    inventory transfers with network fees and confirmation delay
-    risk         kill switches and circuit breakers
-    reconcile    restart-time state recovery against the exchange
-    alerts       outbound notifications for unattended operation
-    domain       foundational typed models for the agentic platform (Phase 1)
-    guards       explicit live-mode / real-trading gates (Phase 1)
-    memory       experience + rich audit persistence (Phase 2)
-    features     unified timestamp-safe feature engine (Phase 3)
-    regime       market regime detector (Phase 4)
-    strategy_registry  versioned strategies with genealogy (Phase 5)
-    selection    strategy selection (Phase 6)
-    critic       adversarial trade critique (Phase 7)
+Agentic foundation (Phases 1–20) lives alongside the original modules and
+never bypasses the Risk Kernel or LiveModeGuard.
 """
 
 __all__ = [
@@ -40,11 +23,15 @@ __all__ = [
     "memory",
     "money",
     "orders",
+    "orchestrator",
+    "promotion",
     "rebalance",
     "reconcile",
+    "reflection",
     "regime",
-    "safety",
+    "research",
     "risk",
+    "safety",
     "selection",
     "simulator",
     "strategy_registry",
