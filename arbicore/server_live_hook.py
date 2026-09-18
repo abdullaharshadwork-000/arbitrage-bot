@@ -50,6 +50,7 @@ def _build_place_fn(engine: Any, client: Any, exchange: str):
     place_buy = getattr(engine, "place_market_buy_quantity", None)
     place_sell = getattr(engine, "place_market_sell", None)
     if callable(place_buy) and callable(place_sell):
+
         def place_fn(symbol: str, side: str, quantity: float):
             side_l = (side or "").lower()
             if side_l == "buy":
@@ -119,7 +120,7 @@ def maybe_process_handoff(
     max_items: int = 1,
     mid_prices: Optional[dict] = None,
 ) -> list:
-    """Drain handoff queue and process SL/TP exits. Never raises."""
+    """Drain handoff queue, trail stops, process SL/TP exits. Never raises."""
     try:
         if not live_exec_enabled():
             return []
@@ -127,6 +128,12 @@ def maybe_process_handoff(
             return []
         results = process_handoff_queue(max_items=max_items)
         if mid_prices:
+            try:
+                from .trailing import TrailingStopManager
+
+                TrailingStopManager().update(mid_prices=dict(mid_prices))
+            except Exception:
+                pass
             results.extend(process_position_exits(dict(mid_prices)))
         return results
     except Exception as exc:
@@ -136,7 +143,14 @@ def maybe_process_handoff(
 
 def snapshot() -> dict:
     try:
-        return live_wire_snapshot()
+        data = live_wire_snapshot()
+        try:
+            from .kill_switch import get_kill_switch
+
+            data["kill_switch"] = get_kill_switch().state.as_dict()
+        except Exception:
+            pass
+        return data
     except Exception as exc:
         return {"error": str(exc)}
 
