@@ -3,8 +3,7 @@
 Phase 19.
 
 Finds past experiences whose feature snapshots are close to the current
-market state. Used as supporting evidence for strategy selection and
-reflection – never as sole authority for placing orders.
+market state. Supporting evidence only – never sole authority for orders.
 """
 
 from __future__ import annotations
@@ -76,7 +75,7 @@ def _euclidean(a: Sequence[float], b: Sequence[float]) -> float:
 class SimilarityEngine:
     """Nearest-neighbor search over experience feature snapshots."""
 
-    def __init(
+    def __init__(
         self,
         *,
         feature_keys: Sequence[str] = DEFAULT_KEYS,
@@ -100,7 +99,7 @@ class SimilarityEngine:
 
         for exp in experiences:
             if isinstance(exp, dict):
-                sid = exp.get("strategy")
+                sid = exp.get("symbol")
                 reg = exp.get("regime")
                 snap = exp.get("feature_snapshot") or {}
                 if isinstance(snap, str):
@@ -160,7 +159,6 @@ class SimilarityEngine:
         scored.sort(key=lambda s: s.distance)
         top = scored[: self.top_k]
 
-        # Expectancy by action among matches with known pnl
         buckets: dict[str, list[float]] = {}
         for m in top:
             if m.final_action and m.realized_pnl is not None:
