@@ -1,143 +1,137 @@
-/* ArbiCore – violet glass overlay (strong overrides) */
+/* ArbiCore – blue glassmorphism (original indigo palette, strong frost) */
 :root {
-  --primary: #c026d3 !important;
-  --primary-dark: #a21caf !important;
-  --primary-light: #e879f9 !important;
-  --accent-lime: #d4ff3f;
-  --success: #34d399 !important;
-  --danger: #fb7185 !important;
-  --warning: #fbbf24 !important;
-  --info: #a78bfa !important;
-  --bg-dark: #160b28 !important;
-  --bg-darker: #0a0514 !important;
-  --bg-card: rgba(42, 22, 72, 0.55) !important;
-  --bg-hover: rgba(88, 28, 135, 0.45) !important;
-  --text-primary: #f5f0ff !important;
-  --text-secondary: #ddd6fe !important;
-  --text-muted: #c4b5fd !important;
-  --border: rgba(255, 255, 255, 0.14) !important;
-  --border-light: rgba(232, 121, 249, 0.35) !important;
-  --glass: rgba(20, 8, 40, 0.42) !important;
-  --glass-card: rgba(48, 24, 80, 0.38) !important;
-  --glass-line: rgba(255, 255, 255, 0.18) !important;
-  --glass-highlight: rgba(255, 255, 255, 0.12) !important;
-  --glass-tint: rgba(192, 38, 211, 0.18) !important;
-  --shadow: 0 24px 80px rgba(76, 29, 149, 0.45), 0 0 40px rgba(192, 38, 211, 0.12) !important;
+  --primary: #6366f1 !important;
+  --primary-dark: #4f46e5 !important;
+  --primary-light: #818cf8 !important;
+  --success: #10b981 !important;
+  --danger: #ef4444 !important;
+  --warning: #f59e0b !important;
+  --info: #3b82f6 !important;
+  --bg-dark: #0b1220 !important;
+  --bg-darker: #050a12 !important;
+  --bg-card: rgba(15, 23, 42, 0.35) !important;
+  --bg-hover: rgba(51, 65, 85, 0.45) !important;
+  --text-primary: #f1f5f9 !important;
+  --text-secondary: #e2e8f0 !important;
+  --text-muted: #94a3b8 !important;
+  --border: rgba(255, 255, 255, 0.22) !important;
+  --border-light: rgba(129, 140, 248, 0.45) !important;
+  --glass: rgba(15, 23, 42, 0.28) !important;
+  --glass-card: rgba(30, 41, 59, 0.25) !important;
+  --glass-line: rgba(255, 255, 255, 0.28) !important;
+  --glass-highlight: rgba(255, 255, 255, 0.18) !important;
+  --glass-tint: rgba(99, 102, 241, 0.12) !important;
+  --shadow: 0 25px 50px rgba(0, 0, 0, 0.45), 0 0 40px rgba(59, 130, 246, 0.15) !important;
 }
 
 html, body {
   background:
-    radial-gradient(ellipse 80% 60% at 70% 40%, rgba(168, 85, 247, 0.32), transparent 55%),
-    radial-gradient(ellipse 50% 40% at 20% 80%, rgba(192, 38, 211, 0.2), transparent 50%),
-    radial-gradient(ellipse 40% 30% at 90% 10%, rgba(99, 102, 241, 0.22), transparent 45%),
-    #0a0514 !important;
+    radial-gradient(ellipse 70% 55% at 75% 35%, rgba(37, 99, 235, 0.45), transparent 55%),
+    radial-gradient(ellipse 50% 40% at 15% 80%, rgba(59, 130, 246, 0.25), transparent 50%),
+    radial-gradient(ellipse 40% 30% at 50% 100%, rgba(99, 102, 241, 0.2), transparent 45%),
+    #050a12 !important;
 }
 
-/* Header + sidebar */
-header, .sidebar, .app-header, .side-nav {
-  background: linear-gradient(165deg, rgba(48, 24, 80, 0.72), rgba(20, 8, 40, 0.55)) !important;
-  backdrop-filter: blur(28px) saturate(160%) !important;
-  -webkit-backdrop-filter: blur(28px) saturate(160%) !important;
-  border-color: rgba(255, 255, 255, 0.14) !important;
-  box-shadow: 0 16px 48px rgba(76, 29, 149, 0.35) !important;
-}
-
-/* Stat cards / panels – main dashboard tiles */
-.stat-card, .card, .panel, .login-card,
+/* Strong frosted glass surfaces */
+header, .sidebar, .app-header, .side-nav,
+.login-card, .card, .stat-card, .panel,
+.table-wrap, .table-container, .recent-trades, .trades-card,
 [class*="stat-"], .metric-card, .summary-card {
-  background: linear-gradient(145deg, rgba(255,255,255,0.1), rgba(192,38,211,0.1)) !important;
-  backdrop-filter: blur(28px) saturate(160%) !important;
-  -webkit-backdrop-filter: blur(28px) saturate(160%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.16) !important;
-  box-shadow: 0 20px 50px rgba(76, 29, 149, 0.35) !important;
-  border-radius: 16px !important;
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.04) 40%,
+    rgba(99, 102, 241, 0.08) 100%
+  ) !important;
+  backdrop-filter: blur(24px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(160%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.28) !important;
+  box-shadow:
+    0 25px 50px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06) !important;
+  border-radius: 18px !important;
+}
+
+.card:hover, .stat-card:hover, .panel:hover {
+  transform: translateY(-2px);
+  border-color: rgba(147, 197, 253, 0.5) !important;
+  box-shadow:
+    0 30px 60px rgba(0, 0, 0, 0.45),
+    0 0 30px rgba(59, 130, 246, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28) !important;
   transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease !important;
 }
-.stat-card:hover, .card:hover, .panel:hover {
-  transform: translateY(-2px);
-  border-color: rgba(232, 121, 249, 0.45) !important;
-  box-shadow: 0 24px 60px rgba(76, 29, 149, 0.45), 0 0 28px rgba(192, 38, 211, 0.18) !important;
-}
 
-/* Tables */
-table, .table, .trades-table, .data-table {
-  background: transparent !important;
-}
-.table-wrap, .table-container, .recent-trades, .trades-card {
-  background: linear-gradient(145deg, rgba(255,255,255,0.07), rgba(192,38,211,0.06)) !important;
-  backdrop-filter: blur(24px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.14) !important;
-  border-radius: 16px !important;
-}
-
-/* Buttons */
-.btn-primary, .btn-login, button.btn.btn-primary,
-button.btn-primary, .btn.btn-primary {
-  background: linear-gradient(135deg, #e879f9, #a21caf 55%, #7c3aed) !important;
-  border: 1px solid rgba(255,255,255,0.22) !important;
+/* Buttons – indigo glass */
+.btn-primary, .btn-login, button.btn.btn-primary, .btn.btn-primary {
+  background: linear-gradient(135deg, rgba(129, 140, 248, 0.9), rgba(79, 70, 229, 0.95)) !important;
+  border: 1px solid rgba(255, 255, 255, 0.3) !important;
   color: #fff !important;
-  box-shadow: 0 8px 28px rgba(192, 38, 211, 0.38) !important;
+  box-shadow: 0 8px 24px rgba(79, 70, 229, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+  backdrop-filter: blur(8px) !important;
 }
 .btn-primary:hover, .btn-login:hover {
-  filter: brightness(1.08);
+  filter: brightness(1.1);
   transform: translateY(-1px);
 }
 
 /* Inputs */
 .form-input, input, select, textarea {
-  background: rgba(20, 8, 40, 0.55) !important;
-  border-color: rgba(255, 255, 255, 0.14) !important;
-  color: #f5f0ff !important;
+  background: rgba(15, 23, 42, 0.4) !important;
+  backdrop-filter: blur(12px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  color: #f1f5f9 !important;
 }
 .form-input:focus, input:focus, select:focus, textarea:focus {
-  border-color: #e879f9 !important;
-  box-shadow: 0 0 0 3px rgba(192, 38, 211, 0.28) !important;
+  border-color: rgba(129, 140, 248, 0.7) !important;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25) !important;
 }
 
-/* Nav active */
+/* Nav */
 .nav-item.active, .sidebar a.active, .side-nav a.active {
-  background: linear-gradient(90deg, rgba(192, 38, 211, 0.35), transparent) !important;
-  border-left: 3px solid #e879f9 !important;
-  color: #f5f0ff !important;
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.35), transparent) !important;
+  border-left: 3px solid #818cf8 !important;
+  color: #f1f5f9 !important;
 }
 
-/* Orbs */
+/* Soft blue glass orbs */
 .glass-orb {
   border-radius: 50% !important;
-  animation: arbiOrbFloat 14s ease-in-out infinite alternate !important;
+  animation: arbiOrbFloat 16s ease-in-out infinite alternate !important;
 }
 .glass-orb:nth-child(1) {
-  top: 8% !important; right: 6% !important; left: auto !important;
-  width: clamp(160px, 22vw, 320px) !important;
-  height: clamp(160px, 22vw, 320px) !important;
-  background: linear-gradient(145deg, #f0abfc 0%, #c026d3 40%, #6b21a8 100%) !important;
-  opacity: 0.5 !important; filter: blur(2px) saturate(140%) !important;
+  top: 10% !important; right: 8% !important; left: auto !important;
+  width: clamp(180px, 24vw, 340px) !important;
+  height: clamp(180px, 24vw, 340px) !important;
+  background: radial-gradient(circle at 30% 30%, rgba(147, 197, 253, 0.7), rgba(37, 99, 235, 0.4) 50%, transparent 70%) !important;
+  opacity: 0.55 !important; filter: blur(4px) !important;
 }
 .glass-orb:nth-child(2) {
-  top: 20% !important; right: 2% !important;
-  width: clamp(120px, 14vw, 220px) !important;
-  background: linear-gradient(160deg, rgba(255,255,255,0.35), #e879f9 30%, #7c3aed 90%) !important;
-  opacity: 0.38 !important; filter: blur(18px) saturate(130%) !important;
-  animation-delay: -4s !important;
+  top: 25% !important; right: 0 !important;
+  width: clamp(120px, 16vw, 240px) !important;
+  background: radial-gradient(circle, rgba(96, 165, 250, 0.5), transparent 70%) !important;
+  opacity: 0.4 !important; filter: blur(20px) !important;
+  animation-delay: -5s !important;
 }
 .glass-orb:nth-child(3) {
-  bottom: -8% !important; left: 18% !important;
-  width: clamp(140px, 18vw, 280px) !important;
-  background: linear-gradient(145deg, #a78bfa, #c026d3 50%, #4c1d95) !important;
-  opacity: 0.32 !important; filter: blur(28px) !important;
-  animation-delay: -9s !important;
+  bottom: -5% !important; left: 15% !important;
+  width: clamp(160px, 20vw, 300px) !important;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.45), transparent 70%) !important;
+  opacity: 0.35 !important; filter: blur(28px) !important;
+  animation-delay: -10s !important;
 }
 .glass-orb:nth-child(4) {
-  bottom: 16% !important; right: 20% !important;
-  width: clamp(50px, 6vw, 90px) !important;
-  background: linear-gradient(145deg, #f5d0fe, #d946ef) !important;
-  opacity: 0.48 !important; filter: blur(8px) !important;
-  animation-delay: -13s !important;
+  bottom: 20% !important; right: 25% !important;
+  width: clamp(60px, 7vw, 100px) !important;
+  background: radial-gradient(circle, rgba(191, 219, 254, 0.6), rgba(99, 102, 241, 0.3)) !important;
+  opacity: 0.5 !important; filter: blur(10px) !important;
+  animation-delay: -14s !important;
 }
 @keyframes arbiOrbFloat {
-  0% { transform: translate3d(-12px, -18px, 0) rotate(-6deg) scale(1); }
-  50% { transform: translate3d(18px, 22px, 0) rotate(8deg) scale(1.04); }
-  100% { transform: translate3d(-12px, -18px, 0) rotate(-6deg) scale(1); }
+  0% { transform: translate3d(-10px, -15px, 0) scale(1); }
+  50% { transform: translate3d(15px, 20px, 0) scale(1.05); }
+  100% { transform: translate3d(-10px, -15px, 0) scale(1); }
 }
 
 .status-dot {
@@ -145,6 +139,13 @@ button.btn-primary, .btn.btn-primary {
   animation: arbiPulse 2.4s ease-in-out infinite;
 }
 @keyframes arbiPulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.65; transform: scale(0.9); }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+
+/* Lab page inherits if linked */
+body.lab-page, .lab-body {
+  background:
+    radial-gradient(ellipse 70% 55% at 75% 35%, rgba(37, 99, 235, 0.4), transparent 55%),
+    #050a12 !important;
 }
