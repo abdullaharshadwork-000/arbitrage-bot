@@ -1,13 +1,13 @@
 """Optional agent observation loop.
 
-Phases 21 + 25 + 26.
-
 When enabled (ARBICORE_AGENT_LOOP=1), runs:
   Features → Regime → Selection → Signal → Critic
   → optional PaperExecutor (Critic APPROVE only)
+  → optional live handoff queue (ARBICORE_AGENT_LIVE_EXEC=1)
   → optional ExperienceMemory + ReflectionAgent
 
-NEVER submits live orders. NEVER bypasses LiveModeGuard / RiskManager.
+Live exchange placement is NOT done here. Approved intents are queued for
+the server live wire (Risk Kernel + LiveModeGuard + canary).
 Default: disabled.
 """
 
@@ -97,7 +97,7 @@ class AgentLoopState:
 
 
 class AgentObservationLoop:
-    """Observation (+ optional paper execution + reflection) cycle."""
+    """Observation (+ optional paper / live-queue + reflection) cycle."""
 
     def __init__(
         self,
@@ -152,6 +152,16 @@ class AgentObservationLoop:
             self.state.last_run_at = _utc_now()
             self.state.last_paper = None
             self.state.last_reflection = None
+
+            # Live path: critic APPROVE → risk → handoff queue (exchange call is server-side)
+            try:
+                from .agent_live_wire import maybe_queue_approved
+                from .live_exec import live_exec_enabled
+
+                if live_exec_enabled() and result.proposal and result.critique:
+                    maybe_queue_approved(result.proposal, result.critique)
+            except Exception:
+                pass
 
             paper_info: dict[str, Any] = {}
             if (
