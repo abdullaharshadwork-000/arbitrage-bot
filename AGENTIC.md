@@ -2,41 +2,35 @@
 
 **Risk Kernel + LiveModeGuard remain highest authority. Agents never call Binance.**
 
-## Operator UI
-
-After enabling the lab blueprint:
-
-* **http://127.0.0.1:5050/lab** — Strategy Lab dashboard
-* **http://127.0.0.1:5050/api/lab** — JSON aggregate
-
-## Enable (Windows PowerShell)
+## Quick fix / start (Windows)
 
 ```powershell
 git pull origin main
-python scripts\enable_agent_api.py
+python scripts\fix_project.py
+# or one-shot:
+.\scripts\start_agent_paper.ps1
+```
+
+`fix_project.py` patches `server.py` for agent + Strategy Lab routes and verifies imports.
+
+## Flags
+
+```powershell
 $env:ARBICORE_AGENT_LOOP = "1"
 $env:ARBICORE_AGENT_PAPER_EXEC = "1"
-$env:ARBICORE_AGENT_HANDOFF = "1"
+# $env:ARBICORE_AGENT_HANDOFF = "1"   # queue only; still no auto live send
 python server.py
 ```
 
-Open `http://127.0.0.1:5050/lab` (use your port if different).
+## Operator UI
 
-## Architecture
-
-```
-Observe → Features → Regime → Select → Signal → Critic
-  → OrderIntent → RiskAdapter → Handoff queue
-  → PaperExecutor (optional)
-  → Experience → Reflection → Patterns → Drift → Scorecard
-  → Canary (operator stages)
-  → ML registry / HeuristicScorer / RL research (offline only)
-```
+* Main dashboard: **Strategy Lab** in sidebar + agent status on Trading terminal
+* **http://127.0.0.1:5050/lab** — Strategy Lab page
+* **http://127.0.0.1:5050/api/lab** — JSON aggregate
 
 ## Safety
 
 * No agent path places exchange orders
 * LIVE only via existing Settings + LiveModeGuard + real ack
 * Handoff only queues ApprovedOrderRequest
-* Canary only tracks allocation fractions
-* ML/RL never wired to live execution
+* Critic may use HeuristicScorer as a research signal only
