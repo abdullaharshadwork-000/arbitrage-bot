@@ -15,6 +15,7 @@ from .ml_registry import ModelRegistry
 _canary = CanaryManager()
 _models = ModelRegistry()
 _LAB_HTML = Path(__file__).resolve().parents[1] / "static" / "agent_lab.html"
+_STATIC = Path(__file__).resolve().parents[1] / "static"
 
 
 def get_canary_manager() -> CanaryManager:
@@ -26,6 +27,16 @@ def get_model_registry() -> ModelRegistry:
 
 
 def build_lab_snapshot() -> dict[str, Any]:
+    def safe(fn, default):
+        try:
+            return fn()
+        except Exception as exc:
+            if isinstance(default, dict) and "error" not in default:
+                out = dict(default)
+                out["error"] = str(exc)
+                return out
+            return default if default is not None else {"error": str(exc)}
+
     from .agent_api import (
         build_agent_snapshot,
         build_drift_snapshot,
@@ -33,23 +44,26 @@ def build_lab_snapshot() -> dict[str, Any]:
         build_registry_snapshot,
         build_scorecard_snapshot,
     )
-    try:
+
+    def _live():
         from .agent_live_wire import live_wire_snapshot
-        live = live_wire_snapshot()
-    except Exception as exc:
-        live = {"error": str(exc)}
+
+        return live_wire_snapshot()
 
     return {
         "ok": True,
-        "agent": build_agent_snapshot(),
-        "strategies": build_registry_snapshot(),
-        "drift": build_drift_snapshot(),
-        "patterns": build_patterns_snapshot(),
-        "scorecard": build_scorecard_snapshot(),
-        "canary": _canary.snapshot(),
-        "handoff": handoff_snapshot(),
-        "models": _models.snapshot(),
-        "live": live,
+        "agent": safe(
+            build_agent_snapshot,
+            {"ok": False, "agent_loop_enabled": False, "paper_exec_enabled": False, "state": {}},
+        ),
+        "strategies": safe(build_registry_snapshot, {"ok": True, "strategies": [], "count": 0}),
+        "drift": safe(build_drift_snapshot, {"reports": []}),
+        "patterns": safe(build_patterns_snapshot, {}),
+        "scorecard": safe(build_scorecard_snapshot, {"scorecard": {}}),
+        "canary": safe(_canary.snapshot, {"deployments": []}),
+        "handoff": safe(handoff_snapshot, {"enabled": False, "queued": 0}),
+        "models": safe(_models.snapshot, {}),
+        "live": safe(_live, {"error": "live wire unavailable"}),
         "safety_note": (
             "Live agent orders require ARBICORE_AGENT_LIVE_EXEC=1, "
             "LiveModeGuard (dashboard live+real+ack), Risk Kernel approval, "
@@ -60,7 +74,7 @@ def build_lab_snapshot() -> dict[str, Any]:
 
 def create_lab_blueprint():
     try:
-        from flask import Blueprint, Response, jsonify, request
+        from flask import Blueprint, Response, jsonify, request, send_from_directory
     except ImportError as exc:
         raise RuntimeError("Flask required") from exc
 
@@ -76,14 +90,22 @@ def create_lab_blueprint():
             mimetype="text/html",
         )
 
+    @bp.route("/agent_lab.js")
+    def lab_js():
+        return send_from_directory(_STATIC, "agent_lab.js", mimetype="application/javascript")
+
     @bp.route("/api/lab", methods=["GET"])
     def api_lab():
-        return jsonify(build_lab_snapshot()), 200
+        try:
+            return jsonify(build_lab_snapshot()), 200
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 200
 
     @bp.route("/api/lab/live", methods=["GET"])
     def api_live():
         try:
             from .agent_live_wire import live_wire_snapshot
+
             return jsonify(live_wire_snapshot()), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
