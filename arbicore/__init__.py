@@ -27,6 +27,7 @@ __all__ = [
     "live_bridge",
     "memory",
     "ml_registry",
+    "ml_scorer",
     "money",
     "orders",
     "orchestrator",
