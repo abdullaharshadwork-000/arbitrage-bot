@@ -3,11 +3,11 @@
 Allows the agentic layer to place REAL exchange orders only when:
 
 1. ARBICORE_AGENT_LIVE_EXEC=1
-2. ApprovedOrderRequest already passed RiskManager.check
-3. LiveModeGuard.can_place_real_orders() is True (mode=live, execution=real,
-   exact real_trading_ack, credentials)
-4. Optional canary fraction scales notional down
-5. A place_fn is provided that uses the EXISTING exchange client / submit_market_order
+2. Kill switch is not active
+3. ApprovedOrderRequest already passed RiskManager.check
+4. LiveModeGuard.can_place_real_orders() is True
+5. Optional canary fraction scales notional down
+6. A place_fn is provided that uses the EXISTING exchange client
 
 Agents never hold API keys. This module never constructs a ccxt client itself.
 """
@@ -23,14 +23,16 @@ from uuid import uuid4
 from .guards import LiveModeGuard
 from .risk_adapter import ApprovedOrderRequest
 
-# place_fn(symbol, side, quantity) -> dict with at least filled_quantity / average_price / order_id
 PlaceFn = Callable[[str, str, float], dict[str, Any]]
 
 
 def live_exec_enabled(environ: Optional[dict] = None) -> bool:
     env = environ if environ is not None else os.environ
     return str(env.get("ARBICORE_AGENT_LIVE_EXEC", "")).strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -86,6 +88,19 @@ class LiveExecutor:
                 request_id=request.id,
                 reject_reason="ARBICORE_AGENT_LIVE_EXEC is not enabled",
             )
+
+        try:
+            from .kill_switch import get_kill_switch
+
+            block = get_kill_switch().block_reason()
+            if block:
+                return LiveExecResult(
+                    False,
+                    request_id=request.id,
+                    reject_reason=block,
+                )
+        except Exception:
+            pass
 
         if self.live_guard is not None:
             decision = self.live_guard.can_place_real_orders()
@@ -159,8 +174,8 @@ class LiveExecutor:
             notional_usdt=notional,
             average_price=avg,
             canary_fraction=frac,
-            raw=dict(raw) if isinstance(raw, dict) else {"value": raw},
+            raw=dict(raw) if isinstance(raw, dict) else {"raw": raw},
         )
 
 
-__all__ = ["live_exec_enabled", "LiveExecResult", "LiveExecutor", "PlaceFn"]
+__all__ = ["LiveExecResult", "LiveExecutor", "live_exec_enabled"]
