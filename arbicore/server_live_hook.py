@@ -103,7 +103,7 @@ def maybe_register_from_engine(
         )
         return True
     except Exception as exc:
-        log.warning("agent live wire registration failed: %s", exp)
+        log.warning("agent live wire registration failed: %s", exc)
         return False
 
 
@@ -123,7 +123,7 @@ def maybe_process_handoff(*, max_items: int = 1) -> list:
 def snapshot() -> dict:
     try:
         return live_wire_snapshot()
-    except Exception as exp:
+    except Exception as exc:
         return {"error": str(exc)}
 
 
