@@ -1,20 +1,15 @@
-# ArbiCore Agentic Platform — Agent Live Orders
+# ArbiCore Agentic Platform
 
-## End-to-end path
+## Live agent path
 
 ```
-Scan mids → Agent loop → Critic APPROVE
-  → RiskManager.check → Handoff queue
-  → maybe_process_handoff → LiveExecutor → RealExecutionEngine place_market_*
-  → AgentPositionBook (open with SL/TP)
-  → on later scans: mid hits SL/TP → exit order (full size, no canary)
+Scan → Agent → Critic APPROVE → RiskManager → Handoff
+  → LiveExecutor (canary) → open position (SQLite)
+  → mid hits SL/TP → full exit → close position
+  → ExperienceMemory (learn) → scorecard / reflection
 ```
 
-## Enable (Windows)
-
-1. **One** `python server.py` only (avoid "Another supervised worker owns this account").
-2. Clear stale lease if needed:
-   `python -c "import sqlite3; c=sqlite3.connect('arbicore.db'); c.execute('DELETE FROM worker_leases'); c.commit()"`
+## Enable (one server only)
 
 ```powershell
 git pull origin main
@@ -27,13 +22,11 @@ $env:ARBICORE_AGENT_CANARY = "0.05"
 python server.py
 ```
 
-Dashboard: **live** + **real** + ack → **Start Engine** once.
+Dashboard: live + real + ack → **Start Engine**.
 
-## Status
+## Lab
 
-* `GET /api/lab/live` — wire, risk, canary, **positions**
-* `GET /lab` — Strategy Lab UI
+* `http://127.0.0.1:5050/lab` — Strategy Lab UI
+* `http://127.0.0.1:5050/api/lab` — JSON (agent, live wire, positions)
 
-## Gates
-
-Critic · RiskManager · LiveModeGuard · LIVE_EXEC flag · Canary (entries) · RealExecutionEngine
+Open positions are stored in `arbicore_agent.db` and restored after restart.
