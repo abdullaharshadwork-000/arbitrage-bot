@@ -1,10 +1,11 @@
-"""Strategy / Research Lab API helpers (read-mostly).
+"""Strategy / Research Lab API helpers.
 
 Phase 21.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from .canary import CanaryManager
@@ -13,6 +14,7 @@ from .ml_registry import ModelRegistry
 
 _canary = CanaryManager()
 _models = ModelRegistry()
+_LAB_HTML = Path(__file__).resolve().parents[1] / "static" / "agent_lab.html"
 
 
 def get_canary_manager() -> CanaryManager:
@@ -51,11 +53,21 @@ def build_lab_snapshot() -> dict[str, Any]:
 
 def create_lab_blueprint():
     try:
-        from flask import Blueprint, jsonify, request
+        from flask import Blueprint, Response, jsonify, request
     except ImportError as exc:
         raise RuntimeError("Flask required") from exc
 
     bp = Blueprint("arbicore_lab", __name__)
+
+    @bp.route("/lab")
+    def lab_page():
+        if _LAB_HTML.is_file():
+            return Response(_LAB_HTML.read_text(encoding="utf-8"), mimetype="text/html")
+        return Response(
+            "<h1>Strategy Lab</h1><p>static/agent_lab.html missing. "
+            "Use GET /api/lab instead.</p>",
+            mimetype="text/html",
+        )
 
     @bp.route("/api/lab", methods=["GET"])
     def api_lab():
