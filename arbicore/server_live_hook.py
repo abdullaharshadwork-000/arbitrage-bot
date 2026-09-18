@@ -38,11 +38,40 @@ def _pick_client(engine: Any) -> tuple[Optional[Any], str]:
     clients = getattr(engine, "clients", None) or {}
     if not isinstance(clients, dict) or not clients:
         return None, ""
-    # Prefer binance when present; otherwise first client
     if "binance" in clients:
         return clients["binance"], "binance"
     name = next(iter(clients))
     return clients[name], str(name)
+
+
+def _build_place_fn(engine: Any, client: Any, exchange: str):
+    place_buy = getattr(engine, "place_market_buy_quantity", None)
+    place_sell = getattr(engine, "place_market_sell", None)
+    if callable(place_buy) and callable(place_sell):
+        def place_fn(symbol: str, side: str, quantity: float):
+            side_l = (side or "").lower()
+            if side_l == "buy":
+                raw = place_buy(exchange, symbol, quantity)
+            elif side_l == "sell":
+                raw = place_sell(exchange, symbol, quantity)
+            else:
+                raise ValueError(f"invalid side {side!r}")
+            if isinstance(raw, dict):
+                return {
+                    "order_id": str(raw.get("id") or raw.get("order_id") or ""),
+                    "filled_quantity": float(
+                        raw.get("filled") or raw.get("amount") or quantity
+                    ),
+                    "average_price": float(
+                        raw.get("average") or raw.get("price") or 0
+                    ),
+                    "status": str(raw.get("status") or ""),
+                    "exchange": exchange,
+                }
+            return {"filled_quantity": float(quantity), "exchange": exchange}
+
+        return place_fn
+    return make_place_fn(client, exchange)
 
 
 def maybe_register_from_engine(
@@ -51,10 +80,7 @@ def maybe_register_from_engine(
     live_guard: Any = None,
     force: bool = False,
 ) -> bool:
-    """Register live wire from RealExecutionEngine if live exec is enabled.
-
-    Returns True when a wire is (already) registered.
-    """
+    """Register live wire from RealExecutionEngine if live exec is enabled."""
     try:
         if not live_exec_enabled() and not force:
             return get_live_executor() is not None
@@ -64,34 +90,7 @@ def maybe_register_from_engine(
         if client is None:
             log.warning("agent live wire: engine has no clients")
             return False
-        place_fn = make_place_fn(client, exchange)
-
-        # Prefer engine methods when available (normalization + REAL_TRADING_ENABLED)
-        place_buy = getattr(engine, "place_market_buy_quantity", None)
-        place_sell = getattr(engine, "place_market_sell", None)
-        if callable(place_buy) and callable(place_sell):
-            def place_fn(symbol: str, side: str, quantity: float):
-                side = (side or "").lower()
-                if side == "buy":
-                    raw = place_buy(exchange, symbol, quantity)
-                elif side == "sell":
-                    raw = place_sell(exchange, symbol, quantity)
-                else:
-                    raise ValueError(f"invalid side {side!r}")
-                if isinstance(raw, dict):
-                    return {
-                        "order_id": str(raw.get("id") or raw.get("order_id") or ""),
-                        "filled_quantity": float(
-                            raw.get("filled") or raw.get("amount") or quantity
-                        ),
-                        "average_price": float(
-                            raw.get("average") or raw.get("price") or 0
-                        ),
-                        "status": str(raw.get("status") or ""),
-                        "exchange": exchange,
-                    }
-                return {"filled_quantity": float(quantity), "exchange": exchange}
-
+        place_fn = _build_place_fn(engine, client, exchange)
         register_live_wire(
             place_fn,
             live_guard=live_guard,
@@ -104,7 +103,7 @@ def maybe_register_from_engine(
         )
         return True
     except Exception as exc:
-        log.warning("agent live wire registration failed: %s", exc)
+        log.warning("agent live wire registration failed: %s", exp)
         return False
 
 
@@ -124,7 +123,7 @@ def maybe_process_handoff(*, max_items: int = 1) -> list:
 def snapshot() -> dict:
     try:
         return live_wire_snapshot()
-    except Exception as exc:
+    except Exception as exp:
         return {"error": str(exc)}
 
 
