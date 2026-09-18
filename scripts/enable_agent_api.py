@@ -14,8 +14,8 @@ SERVER = ROOT / "server.py"
 
 API_IMPORTS = """from arbicore.agent_loop import AgentObservationLoop
 from arbicore.agent_api import create_agent_blueprint
-from arbicore.strategy_registry import StrategyRegistry
 from arbicore.lab_api import create_lab_blueprint
+from arbicore.strategy_registry import StrategyRegistry
 """
 
 SCAN_IMPORT = "from arbicore.scan_hook import notify_agent_mid\n"
@@ -56,8 +56,39 @@ SCAN_NEW = """            state["quotes"] = quotes
 """
 
 
+def _ensure_lab(text: str) -> tuple[str, bool]:
+    """Add lab import + registration if agent is present but lab is not."""
+    if "create_lab_blueprint" in text:
+        return text, False
+    changed = False
+    if "from arbicore.agent_api import create_agent_blueprint" in text:
+        text = text.replace(
+            "from arbicore.agent_api import create_agent_blueprint\n",
+            "from arbicore.agent_api import create_agent_blueprint\n"
+            "from arbicore.lab_api import create_lab_blueprint\n",
+            1,
+        )
+        changed = True
+    needle = "app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))\n"
+    if needle in text and "create_lab_blueprint()" not in text:
+        text = text.replace(
+            needle,
+            needle + "    app.register_blueprint(create_lab_blueprint())\n",
+            1,
+        )
+        changed = True
+    if "agent API not registered" in text:
+        text = text.replace(
+            '"agent API not registered: %s"',
+            '"agent/lab API not registered: %s"',
+            1,
+        )
+        changed = True
+    return text, changed
+
+
 def main():
-    text = SERVER.read_text()
+    text = SERVER.read_text(encoding="utf-8")
     changed = False
 
     anchor_import = (
@@ -78,40 +109,28 @@ def main():
         changed = True
         print("registered agent + lab API blueprints")
     else:
-        if "create_lab_blueprint" not in text:
-            # older patch without lab – add lab registration near agent block
-            if "create_agent_blueprint" in text and "create_lab_blueprint" not in text:
-                text = text.replace(
-                    "from arbicore.agent_api import create_agent_blueprint\n",
-                    "from arbicore.agent_api import create_agent_blueprint\n"
-                    "from arbicore.lab_api import create_lab_blueprint\n",
-                    1,
-                )
-                text = text.replace(
-                    "app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))\n",
-                    "app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))\n"
-                    "    app.register_blueprint(create_lab_blueprint())\n",
-                    1,
-                )
-                changed = True
-                print("added lab blueprint registration")
+        text, lab_changed = _ensure_lab(text)
+        if lab_changed:
+            changed = True
+            print("added lab blueprint registration")
         else:
             print("agent/lab API already registered")
 
     if "notify_agent_mid" not in text:
-        if SCAN_IMPORT not in text:
-            text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
+        if SCAN_IMPORT not in text and "scan_hook import" not in text:
+            if "from arbicore.scan_hook import notify_agent_mid" not in text:
+                text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
         if SCAN_OLD not in text:
-            print("scan_loop anchor not found; abort")
-            return 1
-        text = text.replace(SCAN_OLD, SCAN_NEW, 1)
-        changed = True
-        print("wired notify_agent_mid into scan_loop")
+            print("scan_loop anchor not found; skip scan hook (may already differ)")
+        else:
+            text = text.replace(SCAN_OLD, SCAN_NEW, 1)
+            changed = True
+            print("wired notify_agent_mid into scan_loop")
     else:
         print("scan_loop agent hook already present")
 
     if changed:
-        SERVER.write_text(text)
+        SERVER.write_text(text, encoding="utf-8")
         print("server.py updated – restart the server")
     else:
         print("no changes needed")
