@@ -56,7 +56,7 @@ SCAN_NEW = """            state["quotes"] = quotes
         try:
             for _sym, _mid in (mid_prices or {}).items():
                 notify_agent_mid(_sym, _mid)
-            maybe_process_handoff(max_items=1)
+            maybe_process_handoff(max_items=1, mid_prices=mid_prices)
         except Exception:
             pass
 
@@ -86,6 +86,9 @@ ENGINE_RICH = (
     "                equity=float(getattr(risk_manager, \"equity\", 10000) or 10000),\n"
     "            )\n"
 )
+
+HAND_SIMPLE = "            maybe_process_handoff(max_items=1)\n"
+HAND_RICH = "            maybe_process_handoff(max_items=1, mid_prices=mid_prices)\n"
 
 
 def _ensure_lab(text: str) -> tuple[str, bool]:
@@ -140,12 +143,16 @@ def _ensure_live_hooks(text: str) -> tuple[str, bool]:
         "        try:\n"
         "            for _sym, _mid in (mid_prices or {}).items():\n"
         "                notify_agent_mid(_sym, _mid)\n"
-        "            maybe_process_handoff(max_items=1)\n"
+        "            maybe_process_handoff(max_items=1, mid_prices=mid_prices)\n"
         "        except Exception:\n"
         "            pass\n"
     )
-    if old_notify in text and "maybe_process_handoff(max_items=1)" not in text:
+    if old_notify in text and "maybe_process_handoff" not in text:
         text = text.replace(old_notify, new_notify, 1)
+        changed = True
+
+    if HAND_SIMPLE in text:
+        text = text.replace(HAND_SIMPLE, HAND_RICH, 1)
         changed = True
 
     if ENGINE_SIMPLE in text:
