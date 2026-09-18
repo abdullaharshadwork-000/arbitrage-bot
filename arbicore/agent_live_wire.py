@@ -22,7 +22,6 @@ _last_results: list[dict[str, Any]] = []
 _risk_manager: Any = None
 _live_guard: Optional[LiveModeGuard] = None
 _equity: float = 10_000.0
-# request_id -> SL/TP metadata for fills
 _pending_levels: dict[str, dict[str, Any]] = {}
 
 
@@ -126,7 +125,6 @@ def process_approved_request(request: ApprovedOrderRequest) -> LiveExecResult:
             request_id=request.id,
             reject_reason="live wire not registered (call register_live_wire)",
         )
-    # Exits skip canary reduction by temporarily setting canary to 1.0 for exit_*
     is_exit = str(request.intent_id or "").startswith("exit_")
     if is_exit:
         old_canary = _executor.canary_fraction
@@ -155,13 +153,19 @@ def process_approved_request(request: ApprovedOrderRequest) -> LiveExecResult:
             ),
         )
     elif result.executed and is_exit:
-        # Close matching open position by intent_id exit_<pos_id>
         pos_id = str(request.intent_id or "").replace("exit_", "", 1)
-        book.close(
+        closed = book.close(
             pos_id,
             exit_price=float(result.average_price or 0),
             reason="exit_fill",
         )
+        if closed is not None:
+            try:
+                from .agent_learn import record_closed_position
+
+                record_closed_position(closed)
+            except Exception:
+                pass
 
     return result
 
@@ -208,7 +212,6 @@ def process_handoff_queue(
 
 
 def process_position_exits(mid_prices: dict[str, float]) -> list[dict[str, Any]]:
-    """Check open agent positions against mids; queue/execute SL/TP exits."""
     if not live_exec_enabled() or _executor is None:
         return []
     book = get_position_book()
@@ -217,7 +220,6 @@ def process_position_exits(mid_prices: dict[str, float]) -> list[dict[str, Any]]
     for pos, reason in hits:
         book.mark_exit_pending(pos.id, reason)
         req = book.exit_request(pos)
-        # Store levels empty for exit
         out = process_approved_request(req)
         results.append({"position_id": pos.id, "reason": reason, **out.as_dict()})
     return results
