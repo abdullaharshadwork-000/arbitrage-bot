@@ -1,36 +1,61 @@
 # ArbiCore Agentic Platform
 
-**Risk Kernel + LiveModeGuard remain highest authority. Agents never call Binance.**
+## Agent live orders (REAL money)
 
-## Quick fix / start (Windows)
+Agents **can** place live orders, but only through this gated path:
 
-```powershell
-git pull origin main
-python scripts\fix_project.py
-# or one-shot:
-.\scripts\start_agent_paper.ps1
+```
+TradeProposal → Critic APPROVE → OrderIntent → RiskManager.check
+  → ApprovedOrderRequest → Handoff → LiveExecutor.place_fn
+  → existing submit_market_order (same as main bot)
 ```
 
-`fix_project.py` patches `server.py` for agent + Strategy Lab routes and verifies imports.
+### Required gates (all must pass)
 
-## Flags
+1. Dashboard: **mode = live**, **execution = real**, exact **real trading ack**
+2. Exchange API keys connected (trade only, no withdraw)
+3. Env: `ARBICORE_AGENT_LIVE_EXEC=1` and `ARBICORE_AGENT_HANDOFF=1`
+4. `register_live_wire(place_fn, live_guard=..., canary_fraction=0.05)` called once at startup
+5. Risk Kernel allows the notional
 
-```powershell
-$env:ARBICORE_AGENT_LOOP = "1"
-$env:ARBICORE_AGENT_PAPER_EXEC = "1"
-# $env:ARBICORE_AGENT_HANDOFF = "1"   # queue only; still no auto live send
-python server.py
+Default canary = **5%** of approved notional.
+
+### Example wire (call once after you have a live ccxt client)
+
+```python
+from arbicore.live_place import make_place_fn
+from arbicore.agent_live_wire import register_live_wire
+from arbicore.guards import LiveModeGuard
+from arbicore.config import Settings
+
+place_fn = make_place_fn(client, "binance")
+register_live_wire(
+    place_fn,
+    live_guard=LiveModeGuard(Settings.from_environ()),  # or your settings object
+    canary_fraction=0.05,
+)
 ```
 
-## Operator UI
+Then process queued intents (e.g. from a timer or after each scan):
 
-* Main dashboard: **Strategy Lab** in sidebar + agent status on Trading terminal
-* **http://127.0.0.1:5050/lab** — Strategy Lab page
-* **http://127.0.0.1:5050/api/lab** — JSON aggregate
+```python
+from arbicore.agent_live_wire import process_handoff_queue
+process_handoff_queue(max_items=1)
+```
 
-## Safety
+### Windows start (flags only – still need dashboard live+ack + register_live_wire)
 
-* No agent path places exchange orders
-* LIVE only via existing Settings + LiveModeGuard + real ack
-* Handoff only queues ApprovedOrderRequest
-* Critic may use HeuristicScorer as a research signal only
+```powershell
+.\scripts\start_agent_live.ps1
+```
+
+### Status
+
+* `GET /api/lab/live` – wire registered? flag on? recent results
+* `GET /api/lab` – full lab aggregate including `live`
+
+### Safety
+
+* Agents never hold API keys or construct ccxt clients
+* LiveModeGuard + Risk Kernel cannot be skipped by the agent
+* Without `ARBICORE_AGENT_LIVE_EXEC=1`, live path is off
