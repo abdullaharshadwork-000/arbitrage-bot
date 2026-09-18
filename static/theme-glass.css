@@ -1,4 +1,4 @@
-/* ArbiCore – violet glass overlay (Webflow-tricks inspired) */
+/* ArbiCore – violet glass overlay (strong overrides) */
 :root {
   --primary: #c026d3 !important;
   --primary-dark: #a21caf !important;
@@ -14,7 +14,7 @@
   --bg-hover: rgba(88, 28, 135, 0.45) !important;
   --text-primary: #f5f0ff !important;
   --text-secondary: #ddd6fe !important;
-  --text-muted: #a78bfa !important;
+  --text-muted: #c4b5fd !important;
   --border: rgba(255, 255, 255, 0.14) !important;
   --border-light: rgba(232, 121, 249, 0.35) !important;
   --glass: rgba(20, 8, 40, 0.42) !important;
@@ -27,12 +27,81 @@
 
 html, body {
   background:
-    radial-gradient(ellipse 80% 60% at 70% 40%, rgba(168, 85, 247, 0.28), transparent 55%),
-    radial-gradient(ellipse 50% 40% at 20% 80%, rgba(192, 38, 211, 0.18), transparent 50%),
-    radial-gradient(ellipse 40% 30% at 90% 10%, rgba(99, 102, 241, 0.2), transparent 45%),
+    radial-gradient(ellipse 80% 60% at 70% 40%, rgba(168, 85, 247, 0.32), transparent 55%),
+    radial-gradient(ellipse 50% 40% at 20% 80%, rgba(192, 38, 211, 0.2), transparent 50%),
+    radial-gradient(ellipse 40% 30% at 90% 10%, rgba(99, 102, 241, 0.22), transparent 45%),
     #0a0514 !important;
 }
 
+/* Header + sidebar */
+header, .sidebar, .app-header, .side-nav {
+  background: linear-gradient(165deg, rgba(48, 24, 80, 0.72), rgba(20, 8, 40, 0.55)) !important;
+  backdrop-filter: blur(28px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(160%) !important;
+  border-color: rgba(255, 255, 255, 0.14) !important;
+  box-shadow: 0 16px 48px rgba(76, 29, 149, 0.35) !important;
+}
+
+/* Stat cards / panels – main dashboard tiles */
+.stat-card, .card, .panel, .login-card,
+[class*="stat-"], .metric-card, .summary-card {
+  background: linear-gradient(145deg, rgba(255,255,255,0.1), rgba(192,38,211,0.1)) !important;
+  backdrop-filter: blur(28px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(28px) saturate(160%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  box-shadow: 0 20px 50px rgba(76, 29, 149, 0.35) !important;
+  border-radius: 16px !important;
+  transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease !important;
+}
+.stat-card:hover, .card:hover, .panel:hover {
+  transform: translateY(-2px);
+  border-color: rgba(232, 121, 249, 0.45) !important;
+  box-shadow: 0 24px 60px rgba(76, 29, 149, 0.45), 0 0 28px rgba(192, 38, 211, 0.18) !important;
+}
+
+/* Tables */
+table, .table, .trades-table, .data-table {
+  background: transparent !important;
+}
+.table-wrap, .table-container, .recent-trades, .trades-card {
+  background: linear-gradient(145deg, rgba(255,255,255,0.07), rgba(192,38,211,0.06)) !important;
+  backdrop-filter: blur(24px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 16px !important;
+}
+
+/* Buttons */
+.btn-primary, .btn-login, button.btn.btn-primary,
+button.btn-primary, .btn.btn-primary {
+  background: linear-gradient(135deg, #e879f9, #a21caf 55%, #7c3aed) !important;
+  border: 1px solid rgba(255,255,255,0.22) !important;
+  color: #fff !important;
+  box-shadow: 0 8px 28px rgba(192, 38, 211, 0.38) !important;
+}
+.btn-primary:hover, .btn-login:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+/* Inputs */
+.form-input, input, select, textarea {
+  background: rgba(20, 8, 40, 0.55) !important;
+  border-color: rgba(255, 255, 255, 0.14) !important;
+  color: #f5f0ff !important;
+}
+.form-input:focus, input:focus, select:focus, textarea:focus {
+  border-color: #e879f9 !important;
+  box-shadow: 0 0 0 3px rgba(192, 38, 211, 0.28) !important;
+}
+
+/* Nav active */
+.nav-item.active, .sidebar a.active, .side-nav a.active {
+  background: linear-gradient(90deg, rgba(192, 38, 211, 0.35), transparent) !important;
+  border-left: 3px solid #e879f9 !important;
+  color: #f5f0ff !important;
+}
+
+/* Orbs */
 .glass-orb {
   border-radius: 50% !important;
   animation: arbiOrbFloat 14s ease-in-out infinite alternate !important;
@@ -65,49 +134,10 @@ html, body {
   opacity: 0.48 !important; filter: blur(8px) !important;
   animation-delay: -13s !important;
 }
-
 @keyframes arbiOrbFloat {
   0% { transform: translate3d(-12px, -18px, 0) rotate(-6deg) scale(1); }
   50% { transform: translate3d(18px, 22px, 0) rotate(8deg) scale(1.04); }
   100% { transform: translate3d(-12px, -18px, 0) rotate(-6deg) scale(1); }
-}
-
-.login-card, .card, .stat-card, header, .sidebar, .panel {
-  background: linear-gradient(145deg, rgba(255,255,255,0.09), rgba(192,38,211,0.07)) !important;
-  backdrop-filter: blur(28px) saturate(160%) !important;
-  -webkit-backdrop-filter: blur(28px) saturate(160%) !important;
-  border: 1px solid var(--glass-line) !important;
-  box-shadow: var(--shadow) !important;
-}
-
-.card, .stat-card {
-  transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease !important;
-}
-.card:hover, .stat-card:hover {
-  transform: translateY(-2px);
-  border-color: rgba(232, 121, 249, 0.4) !important;
-  box-shadow: 0 20px 50px rgba(76, 29, 149, 0.4), 0 0 24px rgba(192, 38, 211, 0.15) !important;
-}
-
-.btn-primary, .btn-login, button.btn.btn-primary {
-  background: linear-gradient(135deg, #e879f9, #a21caf 55%, #7c3aed) !important;
-  border: 1px solid rgba(255,255,255,0.22) !important;
-  box-shadow: 0 8px 28px rgba(192, 38, 211, 0.38) !important;
-  transition: transform 0.2s ease, filter 0.2s ease !important;
-}
-.btn-primary:hover, .btn-login:hover, button.btn.btn-primary:hover {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
-}
-
-.form-input:focus, select:focus, textarea:focus {
-  border-color: #e879f9 !important;
-  box-shadow: 0 0 0 3px rgba(192, 38, 211, 0.28) !important;
-}
-
-.nav-item.active, .sidebar a.active {
-  background: linear-gradient(90deg, rgba(192, 38, 211, 0.3), transparent) !important;
-  border-left: 3px solid #e879f9 !important;
 }
 
 .status-dot {
@@ -117,8 +147,4 @@ html, body {
 @keyframes arbiPulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.65; transform: scale(0.9); }
-}
-
-.logo {
-  letter-spacing: -0.02em;
 }
