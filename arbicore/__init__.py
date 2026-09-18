@@ -5,6 +5,7 @@ Never bypasses the Risk Kernel or LiveModeGuard.
 
 __all__ = [
     "agent_api",
+    "agent_live_wire",
     "agent_loop",
     "alerts",
     "auth",
@@ -25,6 +26,8 @@ __all__ = [
     "lab_api",
     "ledger",
     "live_bridge",
+    "live_exec",
+    "live_place",
     "memory",
     "ml_registry",
     "ml_scorer",
@@ -47,6 +50,7 @@ __all__ = [
     "scan_hook",
     "scorecard",
     "selection",
+    "server_live_hook",
     "shadow",
     "signals_agent",
     "similarity",
