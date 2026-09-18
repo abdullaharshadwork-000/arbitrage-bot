@@ -55,7 +55,7 @@
 </head>
 <body>
   <h1>ArbiCore Strategy Lab</h1>
-  <p class="sub">Read-only operator view. Real orders still require Risk Kernel + LiveModeGuard.</p>
+  <p class="sub">Operator view. Live agent orders still require Risk Kernel + LiveModeGuard + LIVE_EXEC flag.</p>
 
   <div class="bar">
     <button type="button" id="refresh">Refresh</button>
@@ -87,6 +87,10 @@
     <div class="card">
       <h2>Handoff queue</h2>
       <div id="handBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Live agent wire</h2>
+      <div id="liveBox">Loading…</div>
     </div>
   </div>
 
@@ -145,6 +149,14 @@
         document.getElementById('handBox').innerHTML =
           row('enabled', hand.enabled ? 'yes' : 'no', hand.enabled ? 'ok' : '') +
           row('queued', hand.queued ?? 0);
+
+        const live = data.live || {};
+        document.getElementById('liveBox').innerHTML =
+          row('LIVE_EXEC flag', live.live_exec_enabled ? 'ON' : 'OFF', live.live_exec_enabled ? 'ok' : 'warn') +
+          row('wire registered', live.wire_registered ? 'yes' : 'no', live.wire_registered ? 'ok' : 'warn') +
+          row('risk context', live.risk_context ? 'yes' : 'no', live.risk_context ? 'ok' : 'warn') +
+          row('canary', live.canary_fraction != null ? (live.canary_fraction * 100).toFixed(1) + '%' : '—') +
+          row('recent fills', Array.isArray(live.recent) ? live.recent.length : 0);
       } catch (e) {
         document.getElementById('raw').textContent = String(e);
       }
