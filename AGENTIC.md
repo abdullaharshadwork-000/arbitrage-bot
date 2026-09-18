@@ -1,61 +1,54 @@
-# ArbiCore Agentic Platform
+# ArbiCore Agentic Platform — Agent Live Orders
 
-## Agent live orders (REAL money)
-
-Agents **can** place live orders, but only through this gated path:
+## End-to-end path
 
 ```
-TradeProposal → Critic APPROVE → OrderIntent → RiskManager.check
-  → ApprovedOrderRequest → Handoff → LiveExecutor.place_fn
-  → existing submit_market_order (same as main bot)
+Scan mids → Agent loop → Critic APPROVE
+  → RiskManager.check → Handoff queue
+  → maybe_process_handoff → LiveExecutor → RealExecutionEngine place_market_*
 ```
 
-### Required gates (all must pass)
-
-1. Dashboard: **mode = live**, **execution = real**, exact **real trading ack**
-2. Exchange API keys connected (trade only, no withdraw)
-3. Env: `ARBICORE_AGENT_LIVE_EXEC=1` and `ARBICORE_AGENT_HANDOFF=1`
-4. `register_live_wire(place_fn, live_guard=..., canary_fraction=0.05)` called once at startup
-5. Risk Kernel allows the notional
-
-Default canary = **5%** of approved notional.
-
-### Example wire (call once after you have a live ccxt client)
-
-```python
-from arbicore.live_place import make_place_fn
-from arbicore.agent_live_wire import register_live_wire
-from arbicore.guards import LiveModeGuard
-from arbicore.config import Settings
-
-place_fn = make_place_fn(client, "binance")
-register_live_wire(
-    place_fn,
-    live_guard=LiveModeGuard(Settings.from_environ()),  # or your settings object
-    canary_fraction=0.05,
-)
-```
-
-Then process queued intents (e.g. from a timer or after each scan):
-
-```python
-from arbicore.agent_live_wire import process_handoff_queue
-process_handoff_queue(max_items=1)
-```
-
-### Windows start (flags only – still need dashboard live+ack + register_live_wire)
+## Enable (Windows)
 
 ```powershell
-.\scripts\start_agent_live.ps1
+git pull origin main
+python scripts\fix_project.py
+# patches server.py for lab + live hooks
+
+$env:ARBICORE_AGENT_LOOP = "1"
+$env:ARBICORE_AGENT_HANDOFF = "1"
+$env:ARBICORE_AGENT_LIVE_EXEC = "1"
+$env:ARBICORE_AGENT_CANARY = "0.05"   # 5% of approved notional
+python server.py
 ```
 
-### Status
+Or: `.\scripts\start_agent_live.ps1`
 
-* `GET /api/lab/live` – wire registered? flag on? recent results
-* `GET /api/lab` – full lab aggregate including `live`
+## Dashboard (required)
 
-### Safety
+1. Mode **live**
+2. Execution **real**
+3. Type the real-trading acknowledgement
+4. Connect exchange API keys (trade only)
+5. Start the bot so `RealExecutionEngine` builds
 
-* Agents never hold API keys or construct ccxt clients
-* LiveModeGuard + Risk Kernel cannot be skipped by the agent
-* Without `ARBICORE_AGENT_LIVE_EXEC=1`, live path is off
+When the real engine starts, the server hook **auto-registers** the place_fn.
+Each scan processes up to 1 queued agent order (canary-sized).
+
+## Status
+
+* `GET /api/lab/live` — flags, wire_registered, risk_context, recent fills
+* `GET /api/lab` — full lab including live section
+
+## Gates (cannot be skipped by the agent)
+
+| Gate | Role |
+|------|------|
+| Critic APPROVE | Proposal quality |
+| RiskManager | Notional / limits |
+| LiveModeGuard | live+real+ack |
+| ARBICORE_AGENT_LIVE_EXEC | Explicit opt-in |
+| Canary fraction | Size reduction |
+| RealExecutionEngine | Same path as main bot |
+
+Without any one of these, no agent live order is sent.
