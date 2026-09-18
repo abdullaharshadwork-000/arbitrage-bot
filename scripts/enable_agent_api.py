@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Idempotent patches for optional agent integration in server.py.
-
-1) Register read-only GET /api/agent routes
-2) Call notify_agent_mid after each scan's mid_prices
+"""Idempotent patches for optional agent + lab integration in server.py.
 
 Safe to run multiple times. Does not enable trading.
-Flags still control runtime:
+Flags:
   ARBICORE_AGENT_LOOP=1
   ARBICORE_AGENT_PAPER_EXEC=1
+  ARBICORE_AGENT_HANDOFF=1
 """
 from pathlib import Path
 
@@ -17,20 +15,21 @@ SERVER = ROOT / "server.py"
 API_IMPORTS = """from arbicore.agent_loop import AgentObservationLoop
 from arbicore.agent_api import create_agent_blueprint
 from arbicore.strategy_registry import StrategyRegistry
+from arbicore.lab_api import create_lab_blueprint
 """
 
 SCAN_IMPORT = "from arbicore.scan_hook import notify_agent_mid\n"
 
 API_BLOCK = """
-# Optional agent observation API (read-only). Disabled unless ARBICORE_AGENT_LOOP=1
-# and never places orders. Failure here must not break the main bot.
+# Optional agent + lab APIs (read-only / operator lab). Never places orders.
 try:
     _agent_registry = StrategyRegistry()
     _agent_loop = AgentObservationLoop(registry=_agent_registry)
     app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))
-except Exception as _agent_exc:  # pragma: no cover - defensive
+    app.register_blueprint(create_lab_blueprint())
+except Exception as _agent_exc:  # pragma: no cover
     import logging as _logging
-    _logging.getLogger("arbicore").warning("agent API not registered: %s", _agent_exc)
+    _logging.getLogger("arbicore").warning("agent/lab API not registered: %s", _agent_exc)
 """
 
 SCAN_OLD = """            state["quotes"] = quotes
@@ -77,12 +76,29 @@ def main():
             return 1
         text = text.replace(app_anchor, app_anchor + API_BLOCK, 1)
         changed = True
-        print("registered agent API blueprint")
+        print("registered agent + lab API blueprints")
     else:
-        print("agent API already registered")
+        if "create_lab_blueprint" not in text:
+            # older patch without lab – add lab registration near agent block
+            if "create_agent_blueprint" in text and "create_lab_blueprint" not in text:
+                text = text.replace(
+                    "from arbicore.agent_api import create_agent_blueprint\n",
+                    "from arbicore.agent_api import create_agent_blueprint\n"
+                    "from arbicore.lab_api import create_lab_blueprint\n",
+                    1,
+                )
+                text = text.replace(
+                    "app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))\n",
+                    "app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))\n"
+                    "    app.register_blueprint(create_lab_blueprint())\n",
+                    1,
+                )
+                changed = True
+                print("added lab blueprint registration")
+        else:
+            print("agent/lab API already registered")
 
     if "notify_agent_mid" not in text:
-        # ensure scan import near performance import
         if SCAN_IMPORT not in text:
             text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
         if SCAN_OLD not in text:
