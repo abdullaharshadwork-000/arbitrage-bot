@@ -2,18 +2,25 @@
 
 **Risk Kernel + LiveModeGuard remain highest authority. Agents never call Binance.**
 
-## Built pipeline
+## Decision path (now fully gated)
 
 ```
-Scan → Features → Regime → Select → Signal → Critic
-         │                                    │
-         │                         APPROVE only
-         │                                    ▼
-         │                         PaperExecutor / OrderIntentBridge
-         │                                    │
-         └────────── ExperienceMemory ────────┤
-                                              ▼
-                    Reflection → Patterns → Similarity → Drift → Scorecard
+TradeProposal
+    → CriticAgent          (APPROVE / WARN / REJECT)
+    → OrderIntentBridge    (intent only if APPROVE + BUY/SELL)
+    → RiskAdapter          (existing RiskManager.check)
+    → ApprovedOrderRequest (still NOT an exchange order)
+
+Only the existing server/execution path may send real orders,
+and only when Settings.real + LiveModeGuard already allow it.
+```
+
+## Observation path
+
+```
+Scan mid → Features → Regime → Select → Signal → Critic
+  → PaperExecutor (optional flag)
+  → ExperienceMemory → Reflection → Patterns → Drift → Scorecard
 ```
 
 ## Enable (Windows PowerShell)
@@ -26,37 +33,15 @@ $env:ARBICORE_AGENT_PAPER_EXEC = "1"
 python server.py
 ```
 
-## API routes
+## API
 
-| Route | Purpose |
-|-------|---------|
-| `/api/agent` | Cycles, paper fills, memory |
-| `/api/agent/strategies` | Registry |
-| `/api/agent/research` | Hypotheses / experiments |
-| `/api/agent/drift` | Performance drift |
-| `/api/agent/patterns` | Pattern discovery |
-| `/api/agent/similarity` | Historical similar states |
-| `/api/agent/scorecard` | Self-improvement scorecard |
+`/api/agent`, `/strategies`, `/research`, `/drift`, `/patterns`, `/similarity`, `/scorecard`
 
-## Modules (spec phases)
+## Remaining (by design)
 
-| Area | Modules |
-|------|---------|
-| Domain / guards | domain, guards |
-| Memory | memory, knowledge |
-| Market intelligence | features, regime, similarity |
-| Strategy | strategy_registry, selection, bootstrap |
-| Decision | signals_agent, critic, orchestrator |
-| Execution (safe) | paper_exec, live_bridge (intent only) |
-| Learning | reflection, research, patterns, drift, scorecard |
-| Validation | backtest, validation, shadow, pipeline, promotion |
-| Integration | agent_loop, scan_hook, agent_api |
-
-## Still deferred (by design)
-
-* Wiring OrderIntent into existing Risk Kernel → real Binance orders
-* Live canary capital stages
+* Consume `ApprovedOrderRequest` inside existing scan/execution (optional flag)
+* Live canary allocation
 * Dashboard Strategy Lab UI
-* Supervised ML / RL (research-only when added)
+* ML / RL research-only
 
-These must not weaken Risk Kernel or LiveModeGuard.
+Never weaken RiskManager limits or LiveModeGuard.
