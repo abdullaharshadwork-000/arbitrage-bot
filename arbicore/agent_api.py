@@ -1,7 +1,4 @@
-"""Read-only agent API helpers.
-
-Phases 22–30 + similarity/patterns routes.
-"""
+"""Read-only agent API helpers."""
 
 from __future__ import annotations
 
@@ -197,6 +194,20 @@ def build_similarity_snapshot(
     return {"ok": True, "report": report.as_dict()}
 
 
+def build_scorecard_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
+    from .scorecard import ImprovementScorecard
+
+    memory = _resolve_memory(loop)
+    if memory is None:
+        return {"ok": True, "message": "no experience memory", "scorecard": None}
+    try:
+        experiences = memory.recent_experiences(limit=500)
+    except Exception:
+        experiences = []
+    card = ImprovementScorecard().evaluate(experiences)
+    return {"ok": True, "scorecard": card.as_dict()}
+
+
 def create_agent_blueprint(
     loop: Optional[AgentObservationLoop] = None,
     registry: Optional[StrategyRegistry] = None,
@@ -234,6 +245,10 @@ def create_agent_blueprint(
         symbol = request.args.get("symbol")
         return jsonify(build_similarity_snapshot(symbol=symbol, loop=loop)), 200
 
+    @bp.route("/api/agent/scorecard", methods=["GET"])
+    def api_agent_scorecard():
+        return jsonify(build_scorecard_snapshot(loop)), 200
+
     return bp
 
 
@@ -244,5 +259,6 @@ __all__ = [
     "build_drift_snapshot",
     "build_patterns_snapshot",
     "build_similarity_snapshot",
+    "build_scorecard_snapshot",
     "create_agent_blueprint",
 ]
