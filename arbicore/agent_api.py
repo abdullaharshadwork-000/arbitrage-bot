@@ -1,11 +1,14 @@
-"""Read-only agent API helpers."""
+"""Read-only agent API helpers + Strategy Lab routes."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from .agent_loop import AgentObservationLoop, agent_loop_enabled, paper_exec_enabled
 from .strategy_registry import StrategyRegistry
+
+_LAB_HTML = Path(__file__).resolve().parents[1] / "static" / "agent_lab.html"
 
 
 def _resolve_loop(loop: Optional[AgentObservationLoop]) -> Optional[AgentObservationLoop]:
@@ -208,14 +211,44 @@ def build_scorecard_snapshot(loop: Optional[AgentObservationLoop] = None) -> dic
     return {"ok": True, "scorecard": card.as_dict()}
 
 
+def build_lab_payload() -> dict[str, Any]:
+    """Full lab aggregate – never raises."""
+    try:
+        from .lab_api import build_lab_snapshot
+
+        return build_lab_snapshot()
+    except Exception as exc:
+        # Minimal fallback so the UI always gets JSON
+        try:
+            from .agent_live_wire import live_wire_snapshot
+
+            live = live_wire_snapshot()
+        except Exception as live_exc:
+            live = {"error": str(live_exc)}
+        return {
+            "ok": True,
+            "agent": build_agent_snapshot(),
+            "strategies": build_registry_snapshot(),
+            "drift": {"ok": True, "reports": []},
+            "patterns": {"ok": True, "report": None},
+            "scorecard": {"ok": True, "scorecard": None},
+            "canary": {"deployments": []},
+            "handoff": {"enabled": False, "queued": 0},
+            "models": {},
+            "live": live,
+            "fallback_error": str(exc),
+            "safety_note": "Lab fallback payload; some sections unavailable.",
+        }
+
+
 def create_agent_blueprint(
     loop: Optional[AgentObservationLoop] = None,
     registry: Optional[StrategyRegistry] = None,
 ):
     try:
-        from flask import Blueprint, jsonify, request
+        from flask import Blueprint, Response, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exc
+        raise RuntimeError("Flask is required to create the agent blueprint") from exp
 
     bp = Blueprint("arbicore_agent", __name__)
 
@@ -249,6 +282,29 @@ def create_agent_blueprint(
     def api_agent_scorecard():
         return jsonify(build_scorecard_snapshot(loop)), 200
 
+    # Strategy Lab – always on this blueprint so /lab works without a second patch
+    @bp.route("/lab")
+    def lab_page():
+        if _LAB_HTML.is_file():
+            return Response(_LAB_HTML.read_text(encoding="utf-8"), mimetype="text/html")
+        return Response(
+            "<h1>Strategy Lab</h1><p>static/agent_lab.html missing.</p>",
+            mimetype="text/html",
+        )
+
+    @bp.route("/api/lab", methods=["GET"])
+    def api_lab():
+        return jsonify(build_lab_payload()), 200
+
+    @bp.route("/api/lab/live", methods=["GET"])
+    def api_lab_live():
+        try:
+            from .agent_live_wire import live_wire_snapshot
+
+            return jsonify(live_wire_snapshot()), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     return bp
 
 
@@ -260,5 +316,6 @@ __all__ = [
     "build_patterns_snapshot",
     "build_similarity_snapshot",
     "build_scorecard_snapshot",
+    "build_lab_payload",
     "create_agent_blueprint",
 ]
