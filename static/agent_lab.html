@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ArbiCore Strategy Lab</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3b82f6;
+      --good: #22c55e;
+      --warn: #eab308;
+      --bad: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg); color: var(--text); padding: 1.25rem;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.25rem; }
+    .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1rem;
+    }
+    .card h2 { font-size: 0.95rem; margin: 0 0 0.75rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .row { display: flex; justify-content: space-between; gap: 0.5rem; padding: 0.35rem 0; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+    .row:last-child { border-bottom: none; }
+    .val { font-weight: 600; }
+    .ok { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    button {
+      background: var(--accent); color: white; border: none; border-radius: 6px;
+      padding: 0.5rem 0.9rem; cursor: pointer; font-weight: 600;
+    }
+    button:hover { filter: brightness(1.1); }
+    pre {
+      background: #0b1017; border-radius: 8px; padding: 0.75rem;
+      overflow: auto; font-size: 0.75rem; max-height: 220px;
+      border: 1px solid var(--border);
+    }
+    .bar { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; align-items: center; }
+    .pill {
+      display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px;
+      font-size: 0.75rem; background: #243044; color: var(--muted);
+    }
+    .pill.on { background: #14532d; color: #bbf7d0; }
+  </style>
+</head>
+<body>
+  <h1>ArbiCore Strategy Lab</h1>
+  <p class="sub">Read-only operator view. Real orders still require Risk Kernel + LiveModeGuard.</p>
+
+  <div class="bar">
+    <button type="button" id="refresh">Refresh</button>
+    <span class="pill" id="loopPill">agent loop: ?</span>
+    <span class="pill" id="paperPill">paper: ?</span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Agent</h2>
+      <div id="agentBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Scorecard</h2>
+      <div id="scoreBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Strategies</h2>
+      <div id="stratBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Canary</h2>
+      <div id="canaryBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Drift</h2>
+      <div id="driftBox">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Handoff queue</h2>
+      <div id="handBox">Loading…</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:1rem">
+    <h2>Raw /api/lab</h2>
+    <pre id="raw">…</pre>
+  </div>
+
+  <script>
+    function row(k, v, cls) {
+      return '<div class="row"><span>' + k + '</span><span class="val ' + (cls||'') + '">' + v + '</span></div>';
+    }
+    async function load() {
+      try {
+        const res = await fetch('/api/lab');
+        const data = await res.json();
+        document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
+
+        const agent = data.agent || {};
+        const st = agent.state || {};
+        document.getElementById('loopPill').textContent = 'agent loop: ' + (agent.agent_loop_enabled ? 'ON' : 'OFF');
+        document.getElementById('loopPill').className = 'pill' + (agent.agent_loop_enabled ? ' on' : '');
+        document.getElementById('paperPill').textContent = 'paper: ' + (agent.paper_exec_enabled ? 'ON' : 'OFF');
+        document.getElementById('paperPill').className = 'pill' + (agent.paper_exec_enabled ? ' on' : '');
+
+        document.getElementById('agentBox').innerHTML =
+          row('cycles', st.cycles ?? st.enabled ?? '—') +
+          row('paper fills', st.paper_fills ?? '—') +
+          row('reflections', st.reflections ?? '—') +
+          row('memory', (st.memory && st.memory.experience_count) != null ? st.memory.experience_count : '—');
+
+        const sc = (data.scorecard && data.scorecard.scorecard) || {};
+        document.getElementById('scoreBox').innerHTML =
+          row('samples', sc.total_experiences ?? 0) +
+          row('early WR', sc.early_win_rate ?? '—') +
+          row('late WR', sc.late_win_rate ?? '—') +
+          row('improving', sc.improving ? 'yes' : 'no', sc.improving ? 'ok' : 'warn') +
+          row('reason', sc.reason || '—');
+
+        const strats = (data.strategies && data.strategies.strategies) || [];
+        document.getElementById('stratBox').innerHTML = strats.length
+          ? strats.map(s => row(s.name + ' v' + s.version, s.status)).join('')
+          : row('count', '0');
+
+        const cans = (data.canary && data.canary.deployments) || [];
+        document.getElementById('canaryBox').innerHTML = cans.length
+          ? cans.map(c => row(c.strategy_id + ' s' + c.stage, c.status + ' @ ' + (c.allocation_fraction * 100).toFixed(0) + '%')).join('')
+          : row('deployments', '0');
+
+        const reports = (data.drift && data.drift.reports) || [];
+        document.getElementById('driftBox').innerHTML = reports.length
+          ? reports.map(r => row(r.strategy_id, r.severity + (r.drifted ? ' DRIFT' : ''), r.drifted ? 'bad' : 'ok')).join('')
+          : row('reports', '0');
+
+        const hand = data.handoff || {};
+        document.getElementById('handBox').innerHTML =
+          row('enabled', hand.enabled ? 'yes' : 'no', hand.enabled ? 'ok' : '') +
+          row('queued', hand.queued ?? 0);
+      } catch (e) {
+        document.getElementById('raw').textContent = String(e);
+      }
+    }
+    document.getElementById('refresh').onclick = load;
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>
