@@ -11,15 +11,17 @@ from .strategy_registry import StrategyRegistry
 _LAB_HTML = Path(__file__).resolve().parents[1] / "static" / "agent_lab.html"
 
 
-def _resolve_loop(loop: Optional[AgentObservationLoop]) -> Optional[AgentObservationLoop]:
-    if loop is not None:
-        return loop
+def _resolve_loop(loop: Optional[AgentObservationLoop] = None) -> Optional[AgentObservationLoop]:
+    """Prefer the scan-worker loop (where cycles actually run)."""
     try:
         from .scan_hook import get_agent_loop
 
-        return get_agent_loop()
+        active = get_agent_loop()
+        if active is not None:
+            return active
     except Exception:
-        return None
+        pass
+    return loop
 
 
 def _resolve_memory(loop: Optional[AgentObservationLoop] = None):
@@ -62,13 +64,15 @@ def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[st
             snap["memory"] = extra["memory"]
         if "buffered_symbols" in extra:
             snap["buffered_symbols"] = extra["buffered_symbols"]
+        if extra.get("attached"):
+            snap["attached"] = True
     except Exception:
         pass
 
     return {
         "ok": True,
-        "agent_loop_enabled": loop.state.enabled,
-        "paper_exec_enabled": loop.state.paper_exec_enabled,
+        "agent_loop_enabled": bool(loop.state.enabled),
+        "paper_exec_enabled": bool(loop.state.paper_exec_enabled or paper_exec_enabled()),
         "state": snap,
         "recent": list(loop.state.history[-20:]),
     }
@@ -245,41 +249,42 @@ def create_agent_blueprint(
     registry: Optional[StrategyRegistry] = None,
 ):
     try:
-        from flask import Blueprint, Response, jsonify, request
+        from flask import Blueprint, Response, jsonify, request, send_from_directory
     except ImportError as exc:
         raise RuntimeError("Flask is required to create the agent blueprint") from exc
 
     bp = Blueprint("arbicore_agent", __name__)
+    static_dir = Path(__file__).resolve().parents[1] / "static"
 
     @bp.route("/api/agent", methods=["GET"])
     def api_agent():
-        return jsonify(build_agent_snapshot(loop)), 200
+        return jsonify(build_agent_snapshot(None)), 200
 
     @bp.route("/api/agent/strategies", methods=["GET"])
     def api_agent_strategies():
-        return jsonify(build_registry_snapshot(registry)), 200
+        return jsonify(build_registry_snapshot(None)), 200
 
     @bp.route("/api/agent/research", methods=["GET"])
     def api_agent_research():
-        return jsonify(build_research_snapshot(loop)), 200
+        return jsonify(build_research_snapshot(None)), 200
 
     @bp.route("/api/agent/drift", methods=["GET"])
     def api_agent_drift():
         sid = request.args.get("strategy_id")
-        return jsonify(build_drift_snapshot(strategy_id=sid, loop=loop)), 200
+        return jsonify(build_drift_snapshot(strategy_id=sid, loop=None)), 200
 
     @bp.route("/api/agent/patterns", methods=["GET"])
     def api_agent_patterns():
-        return jsonify(build_patterns_snapshot(loop)), 200
+        return jsonify(build_patterns_snapshot(None)), 200
 
     @bp.route("/api/agent/similarity", methods=["GET"])
     def api_agent_similarity():
         symbol = request.args.get("symbol")
-        return jsonify(build_similarity_snapshot(symbol=symbol, loop=loop)), 200
+        return jsonify(build_similarity_snapshot(symbol=symbol, loop=None)), 200
 
     @bp.route("/api/agent/scorecard", methods=["GET"])
     def api_agent_scorecard():
-        return jsonify(build_scorecard_snapshot(loop)), 200
+        return jsonify(build_scorecard_snapshot(None)), 200
 
     @bp.route("/lab")
     def lab_page():
@@ -289,6 +294,10 @@ def create_agent_blueprint(
             "<h1>Strategy Lab</h1><p>static/agent_lab.html missing.</p>",
             mimetype="text/html",
         )
+
+    @bp.route("/agent_lab.js")
+    def lab_js():
+        return send_from_directory(static_dir, "agent_lab.js", mimetype="application/javascript")
 
     @bp.route("/api/lab", methods=["GET"])
     def api_lab():
