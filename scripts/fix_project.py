@@ -3,12 +3,6 @@
 
 Run from repo root:
   python scripts/fix_project.py
-
-* Patches server.py for agent + Strategy Lab routes if missing
-* Wires agent/live session into scan loop
-* Applies glass theme routes
-* Verifies arbicore package imports
-* Does NOT enable unrestricted live trading or change risk limits
 """
 from __future__ import annotations
 
@@ -43,6 +37,8 @@ def _run_script(name: str) -> list[str]:
 
 def step_enable() -> list[str]:
     notes: list[str] = []
+    # Critical: Lab routes + session wire on server.py
+    notes.extend(_run_script("apply_server_patches.py"))
     notes.extend(_run_script("enable_agent_api.py"))
     notes.extend(_run_script("patch_agent_session.py"))
     notes.extend(_run_script("enable_glass_theme.py"))
@@ -70,6 +66,7 @@ def step_imports() -> list[str]:
         "agent_live_wire",
         "kill_switch",
         "evidence_loop",
+        "champion",
     ):
         try:
             importlib.import_module(f"arbicore.{mod}")
@@ -82,11 +79,7 @@ def step_imports() -> list[str]:
 def step_agent_snapshots() -> list[str]:
     notes: list[str] = []
     try:
-        from arbicore.agent_api import (
-            build_agent_snapshot,
-            build_scorecard_snapshot,
-            build_registry_snapshot,
-        )
+        from arbicore.agent_api import build_agent_snapshot, build_scorecard_snapshot, build_registry_snapshot
         from arbicore.lab_api import build_lab_snapshot
 
         a = build_agent_snapshot()
@@ -97,8 +90,8 @@ def step_agent_snapshots() -> list[str]:
         notes.append(f"scorecard ok={s.get('ok')}")
         notes.append(f"registry count={r.get('count')}")
         notes.append(f"lab ok={lab.get('ok')}")
-    except Exception as exc:
-        notes.append(f"snapshot FAIL: {type(exc).__name__}: {exc}")
+    except Exception as exp:
+        notes.append(f"snapshot FAIL: {type(exp).__name__}: {exp}")
     return notes
 
 
@@ -106,20 +99,18 @@ def step_server_lab_marker() -> list[str]:
     server = ROOT / "server.py"
     text = server.read_text(encoding="utf-8")
     notes = []
-    notes.append("server create_agent_blueprint=" + str("create_agent_blueprint" in text))
-    notes.append("server create_lab_blueprint=" + str("create_lab_blueprint" in text))
-    notes.append("server notify_agent_mid=" + str("notify_agent_mid" in text))
-    notes.append("server wire_agent_session=" + str("wire_agent_session" in text))
-    notes.append("server theme-glass route=" + str("theme-glass.css" in text))
-    notes.append(
-        "static/agent_lab.html=" + str((ROOT / "static" / "agent_lab.html").is_file())
-    )
-    notes.append(
-        "static/agent_lab.js=" + str((ROOT / "static" / "agent_lab.js").is_file())
-    )
-    notes.append(
-        "static/theme-glass.css=" + str((ROOT / "static" / "theme-glass.css").is_file())
-    )
+    for label, needle in [
+        ("create_agent_blueprint", "create_agent_blueprint"),
+        ("create_lab_blueprint", "create_lab_blueprint"),
+        ("notify_agent_mid", "notify_agent_mid"),
+        ("wire_agent_session", "wire_agent_session"),
+        ("theme-glass route", "theme-glass.css"),
+        ("lab fallback /api/lab", "arbicore_api_lab_fallback"),
+        ("lab fallback /lab", "arbicore_lab_page_fallback"),
+    ]:
+        notes.append(f"server {label}=" + str(needle in text))
+    for rel in ("static/agent_lab.html", "static/agent_lab.js", "static/theme-glass.css"):
+        notes.append(f"{rel}=" + str((ROOT / rel).is_file()))
     return notes
 
 
@@ -135,13 +126,13 @@ def main() -> int:
         for line in fn():
             print(line)
     print("\nDone. Restart ONE server after patches.")
-    print("Windows flags:")
+    print("Windows:")
     print('  $env:ARBICORE_AGENT_LOOP = "1"')
     print('  $env:ARBICORE_AGENT_PAPER_EXEC = "1"')
-    print('  # LIVE only when intentional:')
-    print('  # $env:ARBICORE_AGENT_LIVE_EXEC = "1"')
-    print('  # $env:ARBICORE_AGENT_CANARY = "0.05"')
-    print("Lab: http://127.0.0.1:5050/lab  API: /api/lab  JS: /agent_lab.js")
+    print("  python server.py")
+    print("Lab: http://127.0.0.1:5050/lab")
+    print("API: http://127.0.0.1:5050/api/lab")
+    print("JS:  http://127.0.0.1:5050/agent_lab.js")
     return 0
 
 
