@@ -5,13 +5,12 @@ Phase 21.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from .canary import CanaryManager
 from .execution_handoff import handoff_snapshot
 from .ml_registry import ModelRegistry
 
-# Process-wide lab state (operators can inject richer instances later)
 _canary = CanaryManager()
 _models = ModelRegistry()
 
@@ -54,7 +53,7 @@ def create_lab_blueprint():
     try:
         from flask import Blueprint, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask required") from exp
+        raise RuntimeError("Flask required") from exc
 
     bp = Blueprint("arbicore_lab", __name__)
 
