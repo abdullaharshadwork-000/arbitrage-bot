@@ -62,7 +62,7 @@ def create_lab_blueprint():
     try:
         from flask import Blueprint, Response, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask required") from exp
+        raise RuntimeError("Flask required") from exc
 
     bp = Blueprint("arbicore_lab", __name__)
 
