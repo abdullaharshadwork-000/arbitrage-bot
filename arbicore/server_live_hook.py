@@ -17,6 +17,7 @@ from .agent_live_wire import (
     get_live_executor,
     live_wire_snapshot,
     process_handoff_queue,
+    process_position_exits,
     register_live_wire,
     register_risk_context,
 )
@@ -83,7 +84,6 @@ def maybe_register_from_engine(
     equity: float = 10_000.0,
     force: bool = False,
 ) -> bool:
-    """Register live wire + risk context from RealExecutionEngine."""
     try:
         if risk_manager is not None:
             register_risk_context(
@@ -114,13 +114,21 @@ def maybe_register_from_engine(
         return False
 
 
-def maybe_process_handoff(*, max_items: int = 1) -> list:
+def maybe_process_handoff(
+    *,
+    max_items: int = 1,
+    mid_prices: Optional[dict] = None,
+) -> list:
+    """Drain handoff queue and process SL/TP exits. Never raises."""
     try:
         if not live_exec_enabled():
             return []
         if get_live_executor() is None:
             return []
-        return process_handoff_queue(max_items=max_items)
+        results = process_handoff_queue(max_items=max_items)
+        if mid_prices:
+            results.extend(process_position_exits(dict(mid_prices)))
+        return results
     except Exception as exc:
         log.warning("process_handoff failed: %s", exc)
         return []
