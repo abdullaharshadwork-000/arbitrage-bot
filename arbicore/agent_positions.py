@@ -1,7 +1,7 @@
 """Track agent live fills and propose SL/TP exits.
 
-Does not place orders itself. Exit intents go through the same
-Risk Kernel + LiveExecutor path as entries.
+Persists to arbicore_agent.db so open positions survive restarts.
+Does not place orders itself. Exit intents go through LiveExecutor.
 """
 
 from __future__ import annotations
@@ -19,11 +19,22 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_dt(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return _utc_now()
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return _utc_now()
+
+
 @dataclass
 class AgentPosition:
     id: str
     symbol: str
-    side: str  # long (bought) | short (sold)
+    side: str  # long | short
     quantity: float
     entry_price: float
     stop_loss: Optional[float] = None
@@ -32,7 +43,7 @@ class AgentPosition:
     strategy_version: str = ""
     request_id: str = ""
     order_id: str = ""
-    status: str = "open"  # open | closed | exit_pending
+    status: str = "open"
     opened_at: datetime = field(default_factory=_utc_now)
     closed_at: Optional[datetime] = None
     exit_price: Optional[float] = None
@@ -44,14 +55,71 @@ class AgentPosition:
         data["closed_at"] = self.closed_at.isoformat() if self.closed_at else None
         return data
 
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "AgentPosition":
+        return cls(
+            id=str(row.get("id") or ""),
+            symbol=str(row.get("symbol") or ""),
+            side=str(row.get("side") or "long"),
+            quantity=float(row.get("quantity") or 0),
+            entry_price=float(row.get("entry_price") or 0),
+            stop_loss=row.get("stop_loss"),
+            take_profit=row.get("take_profit"),
+            strategy_id=str(row.get("strategy_id") or ""),
+            strategy_version=str(row.get("strategy_version") or ""),
+            request_id=str(row.get("request_id") or ""),
+            order_id=str(row.get("order_id") or ""),
+            status=str(row.get("status") or "open"),
+            opened_at=_parse_dt(row.get("opened_at")),
+            closed_at=_parse_dt(row["closed_at"]) if row.get("closed_at") else None,
+            exit_price=row.get("exit_price"),
+            exit_reason=str(row.get("exit_reason") or ""),
+        )
+
 
 class AgentPositionBook:
-    """In-memory book of agent-managed positions."""
-
-    def __init__(self, max_closed: int = 200):
+    def __init__(self, max_closed: int = 200, *, persist: bool = True):
         self.open: dict[str, AgentPosition] = {}
         self.closed: list[AgentPosition] = []
         self.max_closed = max_closed
+        self.persist = persist
+        if persist:
+            self._restore()
+
+    def _store(self):
+        if not self.persist:
+            return None
+        try:
+            from .agent_store import get_agent_store
+
+            return get_agent_store()
+        except Exception:
+            return None
+
+    def _save(self, pos: AgentPosition) -> None:
+        store = self._store()
+        if store is None:
+            return
+        try:
+            store.upsert_position(pos.as_dict())
+        except Exception:
+            pass
+
+    def _restore(self) -> None:
+        store = self._store()
+        if store is None:
+            return
+        try:
+            for row in store.load_open():
+                pos = AgentPosition.from_row(row)
+                if pos.id:
+                    self.open[pos.id] = pos
+            for row in store.load_closed(limit=self.max_closed):
+                pos = AgentPosition.from_row(row)
+                if pos.id:
+                    self.closed.append(pos)
+        except Exception:
+            pass
 
     def open_from_fill(
         self,
@@ -79,6 +147,7 @@ class AgentPositionBook:
             order_id=result.order_id,
         )
         self.open[pos.id] = pos
+        self._save(pos)
         return pos
 
     def mark_exit_pending(self, pos_id: str, reason: str) -> Optional[AgentPosition]:
@@ -87,6 +156,7 @@ class AgentPositionBook:
             return None
         pos.status = "exit_pending"
         pos.exit_reason = reason
+        self._save(pos)
         return pos
 
     def close(
@@ -106,10 +176,10 @@ class AgentPositionBook:
         self.closed.append(pos)
         if len(self.closed) > self.max_closed:
             self.closed = self.closed[-self.max_closed :]
+        self._save(pos)
         return pos
 
     def check_exits(self, mid_prices: dict[str, float]) -> list[tuple[AgentPosition, str]]:
-        """Return (position, reason) for open positions that hit SL or TP."""
         hits: list[tuple[AgentPosition, str]] = []
         for pos in list(self.open.values()):
             if pos.status != "open":
@@ -130,7 +200,6 @@ class AgentPositionBook:
         return hits
 
     def exit_request(self, pos: AgentPosition) -> ApprovedOrderRequest:
-        """Build a market exit request (opposite side)."""
         exit_side = "sell" if pos.side == "long" else "buy"
         notional = pos.quantity * (pos.entry_price or 0)
         return ApprovedOrderRequest(
@@ -159,10 +228,13 @@ class AgentPositionBook:
         }
 
 
-_book = AgentPositionBook()
+_book: Optional[AgentPositionBook] = None
 
 
 def get_position_book() -> AgentPositionBook:
+    global _book
+    if _book is None:
+        _book = AgentPositionBook(persist=True)
     return _book
 
 
