@@ -1,51 +1,33 @@
-# Development complete (code program)
+# Development complete
 
-This document closes the **implementation** phase of the agentic ArbiCore transformation.
+**Status: implementation program closed.**
 
-## Delivered
+Further progress is **operations** (run paper → Lab metrics → optional canary), not new architecture phases.
 
-* Modular `arbicore/` agent stack (observe → critique → risk → paper/live → learn)
-* Strategy Lab (`/lab`, `/api/lab`, external JS for CSP)
-* Live agent path (gated): handoff → canary → place → positions → trail → experience
-* Kill switch, reconcile hooks, promotion gate, champion comparison, evidence/soak tools
-* Session wire so scan loop registers agent + live context
-* Safety boundaries documented (`SAFETY_BOUNDARIES.md`)
-* Operator evidence process (`OPERATOR_RUNBOOK.md`)
+## Last code additions
 
-## Not delivered (by design or by nature)
+* `scripts/apply_server_patches.py` — Lab routes + session wire on `server.py`
+* `arbicore/shadow_book.py` — shadow trades without exchange orders
+* `arbicore/walk_forward.py` — walk-forward window helper
+* Lab API includes shadow snapshot
 
-| Item | Why |
-|------|-----|
-| Unrestricted always-on LIVE | Violates core safety principle |
-| Multi-month production proof | Requires calendar time running the bot |
-| Guaranteed profitable strategies | Markets; not a coding deliverable |
-
-## Operator activate checklist
+## Activate
 
 ```powershell
 git pull origin main
 Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
 python scripts\fix_project.py
+# expect: apply_server_patches, lab fallback, snapshots ok
 
 $env:ARBICORE_AGENT_LOOP = "1"
 $env:ARBICORE_AGENT_PAPER_EXEC = "1"
 python server.py
 ```
 
-Verify: `/agent_lab.js`, `/api/lab`, `/lab` (hard refresh). Start engine → cycles increase.
+Verify: `/api/lab` → JSON · `/agent_lab.js` → script · `/lab` → Ctrl+F5
 
-Controlled LIVE (optional):
+## Will not be coded
 
-```powershell
-$env:ARBICORE_AGENT_HANDOFF = "1"
-$env:ARBICORE_AGENT_LIVE_EXEC = "1"
-$env:ARBICORE_AGENT_CANARY = "0.05"
-```
-
-Dashboard: live + real + ack → Start Engine. One worker only.
-
-## Further work is operations
-
-Paper soak → Lab metrics → testnet → 5% canary → promotion gate → evidence history.
-
-No further architecture phases are required to begin that process.
+* Unrestricted always-on LIVE
+* Guaranteed profits
+* Multi-month production proof without running the bot
