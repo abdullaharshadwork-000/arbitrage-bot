@@ -1,6 +1,6 @@
 """Read-only agent API helpers.
 
-Phases 22–30 + similarity/patterns/knowledge routes.
+Phases 22–30 + similarity/patterns routes.
 """
 
 from __future__ import annotations
@@ -177,7 +177,6 @@ def build_similarity_snapshot(
     except Exception:
         experiences = []
 
-    # Use latest feature snapshot from history if available
     features: dict[str, Any] = {}
     loop = _resolve_loop(loop)
     if loop and loop.state.last_result and loop.state.last_result.features:
@@ -205,7 +204,7 @@ def create_agent_blueprint(
     try:
         from flask import Blueprint, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exp
+        raise RuntimeError("Flask is required to create the agent blueprint") from exc
 
     bp = Blueprint("arbicore_agent", __name__)
 
