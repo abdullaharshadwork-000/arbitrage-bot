@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Idempotent patches for optional agent + lab integration in server.py.
+"""Idempotent patches for optional agent + lab + live wire integration in server.py.
 
-Safe to run multiple times. Does not enable trading.
+Safe to run multiple times. Does not enable trading by itself.
 Flags:
   ARBICORE_AGENT_LOOP=1
   ARBICORE_AGENT_PAPER_EXEC=1
   ARBICORE_AGENT_HANDOFF=1
+  ARBICORE_AGENT_LIVE_EXEC=1
+  ARBICORE_AGENT_CANARY=0.05
 """
 from pathlib import Path
 
@@ -16,12 +18,17 @@ API_IMPORTS = """from arbicore.agent_loop import AgentObservationLoop
 from arbicore.agent_api import create_agent_blueprint
 from arbicore.lab_api import create_lab_blueprint
 from arbicore.strategy_registry import StrategyRegistry
+from arbicore.server_live_hook import maybe_process_handoff, maybe_register_from_engine
 """
 
 SCAN_IMPORT = "from arbicore.scan_hook import notify_agent_mid\n"
+LIVE_IMPORT = (
+    "from arbicore.server_live_hook import maybe_process_handoff, "
+    "maybe_register_from_engine\n"
+)
 
 API_BLOCK = """
-# Optional agent + lab APIs (read-only / operator lab). Never places orders.
+# Optional agent + lab APIs (read-only / operator lab). Never places orders alone.
 try:
     _agent_registry = StrategyRegistry()
     _agent_loop = AgentObservationLoop(registry=_agent_registry)
@@ -49,15 +56,24 @@ SCAN_NEW = """            state["quotes"] = quotes
         try:
             for _sym, _mid in (mid_prices or {}).items():
                 notify_agent_mid(_sym, _mid)
+            maybe_process_handoff(max_items=1)
         except Exception:
             pass
 
         found = []
 """
 
+ENGINE_OLD = "        real_engine = bot.RealExecutionEngine(exchanges, credential_map)\n"
+ENGINE_NEW = (
+    "        real_engine = bot.RealExecutionEngine(exchanges, credential_map)\n"
+    "        try:\n"
+    "            maybe_register_from_engine(real_engine)\n"
+    "        except Exception:\n"
+    "            pass\n"
+)
+
 
 def _ensure_lab(text: str) -> tuple[str, bool]:
-    """Add lab import + registration if agent is present but lab is not."""
     if "create_lab_blueprint" in text:
         return text, False
     changed = False
@@ -77,13 +93,51 @@ def _ensure_lab(text: str) -> tuple[str, bool]:
             1,
         )
         changed = True
-    if "agent API not registered" in text:
-        text = text.replace(
-            '"agent API not registered: %s"',
-            '"agent/lab API not registered: %s"',
-            1,
-        )
+    return text, changed
+
+
+def _ensure_live_hooks(text: str) -> tuple[str, bool]:
+    changed = False
+    if "maybe_process_handoff" not in text:
+        if "from arbicore.scan_hook import notify_agent_mid" in text:
+            text = text.replace(
+                "from arbicore.scan_hook import notify_agent_mid\n",
+                "from arbicore.scan_hook import notify_agent_mid\n" + LIVE_IMPORT,
+                1,
+            )
+            changed = True
+        elif "from arbicore.agent_api import create_agent_blueprint" in text:
+            text = text.replace(
+                "from arbicore.agent_api import create_agent_blueprint\n",
+                "from arbicore.agent_api import create_agent_blueprint\n" + LIVE_IMPORT,
+                1,
+            )
+            changed = True
+
+    # Process handoff after agent mid notify
+    old_notify = (
+        "        try:\n"
+        "            for _sym, _mid in (mid_prices or {}).items():\n"
+        "                notify_agent_mid(_sym, _mid)\n"
+        "        except Exception:\n"
+        "            pass\n"
+    )
+    new_notify = (
+        "        try:\n"
+        "            for _sym, _mid in (mid_prices or {}).items():\n"
+        "                notify_agent_mid(_sym, _mid)\n"
+        "            maybe_process_handoff(max_items=1)\n"
+        "        except Exception:\n"
+        "            pass\n"
+    )
+    if old_notify in text and "maybe_process_handoff(max_items=1)" not in text:
+        text = text.replace(old_notify, new_notify, 1)
         changed = True
+
+    if ENGINE_OLD in text and "maybe_register_from_engine(real_engine)" not in text:
+        text = text.replace(ENGINE_OLD, ENGINE_NEW, 1)
+        changed = True
+
     return text, changed
 
 
@@ -117,17 +171,23 @@ def main():
             print("agent/lab API already registered")
 
     if "notify_agent_mid" not in text:
-        if SCAN_IMPORT not in text and "scan_hook import" not in text:
-            if "from arbicore.scan_hook import notify_agent_mid" not in text:
-                text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
+        if "from arbicore.scan_hook import notify_agent_mid" not in text:
+            text = text.replace(anchor_import, anchor_import + SCAN_IMPORT, 1)
         if SCAN_OLD not in text:
-            print("scan_loop anchor not found; skip scan hook (may already differ)")
+            print("scan_loop anchor not found; skip scan hook")
         else:
             text = text.replace(SCAN_OLD, SCAN_NEW, 1)
             changed = True
-            print("wired notify_agent_mid into scan_loop")
+            print("wired notify_agent_mid + handoff into scan_loop")
     else:
         print("scan_loop agent hook already present")
+
+    text, live_changed = _ensure_live_hooks(text)
+    if live_changed:
+        changed = True
+        print("wired agent live handoff + engine registration hooks")
+    else:
+        print("live hooks already present or not applicable")
 
     if changed:
         SERVER.write_text(text, encoding="utf-8")
