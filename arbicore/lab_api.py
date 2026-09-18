@@ -1,6 +1,6 @@
 """Strategy / Research Lab API helpers.
 
-Phase 21 + live wire status.
+Phase 21 + live wire + shadow status.
 """
 
 from __future__ import annotations
@@ -50,6 +50,11 @@ def build_lab_snapshot() -> dict[str, Any]:
 
         return live_wire_snapshot()
 
+    def _shadow():
+        from .shadow_book import get_shadow_book
+
+        return get_shadow_book().snapshot()
+
     return {
         "ok": True,
         "agent": safe(
@@ -64,6 +69,7 @@ def build_lab_snapshot() -> dict[str, Any]:
         "handoff": safe(handoff_snapshot, {"enabled": False, "queued": 0}),
         "models": safe(_models.snapshot, {}),
         "live": safe(_live, {"error": "live wire unavailable"}),
+        "shadow": safe(_shadow, {"count": 0, "sum_pnl": 0.0, "recent": []}),
         "safety_note": (
             "Live agent orders require ARBICORE_AGENT_LIVE_EXEC=1, "
             "LiveModeGuard (dashboard live+real+ack), Risk Kernel approval, "
@@ -107,6 +113,15 @@ def create_lab_blueprint():
             from .agent_live_wire import live_wire_snapshot
 
             return jsonify(live_wire_snapshot()), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @bp.route("/api/lab/shadow", methods=["GET"])
+    def api_shadow():
+        try:
+            from .shadow_book import get_shadow_book
+
+            return jsonify(get_shadow_book().snapshot()), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
