@@ -37,6 +37,7 @@ __all__ = [
     "risk",
     "safety",
     "scan_hook",
+    "scorecard",
     "selection",
     "shadow",
     "signals_agent",
