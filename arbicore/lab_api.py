@@ -1,6 +1,6 @@
 """Strategy / Research Lab API helpers.
 
-Phase 21.
+Phase 21 + live wire status.
 """
 
 from __future__ import annotations
@@ -33,6 +33,11 @@ def build_lab_snapshot() -> dict[str, Any]:
         build_registry_snapshot,
         build_scorecard_snapshot,
     )
+    try:
+        from .agent_live_wire import live_wire_snapshot
+        live = live_wire_snapshot()
+    except Exception as exc:
+        live = {"error": str(exc)}
 
     return {
         "ok": True,
@@ -44,9 +49,11 @@ def build_lab_snapshot() -> dict[str, Any]:
         "canary": _canary.snapshot(),
         "handoff": handoff_snapshot(),
         "models": _models.snapshot(),
+        "live": live,
         "safety_note": (
-            "Lab is observational. Real orders require existing "
-            "Risk Kernel + LiveModeGuard + operator ack."
+            "Live agent orders require ARBICORE_AGENT_LIVE_EXEC=1, "
+            "LiveModeGuard (dashboard live+real+ack), Risk Kernel approval, "
+            "and register_live_wire(place_fn)."
         ),
     }
 
@@ -55,7 +62,7 @@ def create_lab_blueprint():
     try:
         from flask import Blueprint, Response, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask required") from exc
+        raise RuntimeError("Flask required") from exp
 
     bp = Blueprint("arbicore_lab", __name__)
 
@@ -72,6 +79,14 @@ def create_lab_blueprint():
     @bp.route("/api/lab", methods=["GET"])
     def api_lab():
         return jsonify(build_lab_snapshot()), 200
+
+    @bp.route("/api/lab/live", methods=["GET"])
+    def api_live():
+        try:
+            from .agent_live_wire import live_wire_snapshot
+            return jsonify(live_wire_snapshot()), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @bp.route("/api/lab/canary", methods=["GET"])
     def api_canary_list():
