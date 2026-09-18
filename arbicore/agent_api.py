@@ -218,7 +218,6 @@ def build_lab_payload() -> dict[str, Any]:
 
         return build_lab_snapshot()
     except Exception as exc:
-        # Minimal fallback so the UI always gets JSON
         try:
             from .agent_live_wire import live_wire_snapshot
 
@@ -248,7 +247,7 @@ def create_agent_blueprint(
     try:
         from flask import Blueprint, Response, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exp
+        raise RuntimeError("Flask is required to create the agent blueprint") from exc
 
     bp = Blueprint("arbicore_agent", __name__)
 
@@ -282,7 +281,6 @@ def create_agent_blueprint(
     def api_agent_scorecard():
         return jsonify(build_scorecard_snapshot(loop)), 200
 
-    # Strategy Lab – always on this blueprint so /lab works without a second patch
     @bp.route("/lab")
     def lab_page():
         if _LAB_HTML.is_file():
