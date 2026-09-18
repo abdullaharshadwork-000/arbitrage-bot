@@ -55,8 +55,10 @@ from arbicore.exchange_signals import capabilities as signal_capabilities
 from arbicore.market import MarketOverview
 from arbicore.performance import summarize as summarize_performance, scope_sql as performance_scope_sql
 from arbicore.scan_hook import notify_agent_mid
+from arbicore.server_live_hook import maybe_process_handoff, maybe_register_from_engine
 from arbicore.agent_loop import AgentObservationLoop
 from arbicore.agent_api import create_agent_blueprint
+from arbicore.lab_api import create_lab_blueprint
 from arbicore.strategy_registry import StrategyRegistry
 
 market_overview = MarketOverview(bot.EXCHANGES_MASTER, bot.DEMO_START_PRICES)
@@ -69,6 +71,7 @@ try:
     _agent_registry = StrategyRegistry()
     _agent_loop = AgentObservationLoop(registry=_agent_registry)
     app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))
+    app.register_blueprint(create_lab_blueprint())
 except Exception as _agent_exc:  # pragma: no cover - defensive
     import logging as _logging
     _logging.getLogger("arbicore").warning("agent API not registered: %s", _agent_exc)
@@ -2689,6 +2692,7 @@ def scan_loop():
         try:
             for _sym, _mid in (mid_prices or {}).items():
                 notify_agent_mid(_sym, _mid)
+            maybe_process_handoff(max_items=1, mid_prices=mid_prices)
         except Exception:
             pass
 
