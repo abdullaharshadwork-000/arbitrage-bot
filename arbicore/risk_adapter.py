@@ -86,18 +86,18 @@ class RiskAdapter:
         self.mode = mode
 
     def evaluate(self, intent: OrderIntent) -> RiskAdapterResult:
-        # LIVE intents require live guard to be explicitly enabled
+        # LIVE intents require LiveModeGuard.can_place_real_orders()
         if self.mode is OperatingMode.LIVE or intent.mode == "live":
-            if self.live_guard is not None and not self.live_guard.is_live_enabled():
-                return RiskAdapterResult(
-                    False,
-                    reject_reason="LIVE not enabled by LiveModeGuard",
-                )
-            # Even if guard is missing, refuse silent LIVE
-            if self.live_guard is None and intent.mode == "live":
+            if self.live_guard is None:
                 return RiskAdapterResult(
                     False,
                     reject_reason="LIVE intent requires LiveModeGuard",
+                )
+            guard = self.live_guard.can_place_real_orders()
+            if not guard.allowed:
+                return RiskAdapterResult(
+                    False,
+                    reject_reason=f"LiveModeGuard: {guard.reason}",
                 )
 
         risk_frac = float(intent.requested_risk_fraction or 0)
