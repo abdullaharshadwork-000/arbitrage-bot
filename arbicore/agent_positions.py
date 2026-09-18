@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
-from .domain import OperatingMode
 from .live_exec import LiveExecResult
 from .risk_adapter import ApprovedOrderRequest
 
@@ -119,15 +118,14 @@ class AgentPositionBook:
             if mid is None or mid <= 0:
                 continue
             if pos.side == "long":
-                if pos.stop_loss and mid <= pos.stop_loss:
+                if pos.stop_loss is not None and mid <= pos.stop_loss:
                     hits.append((pos, "stop_loss"))
-                elif pos.take_profit and mid >= pos.take_profit:
-                    hits.append((pos, "take_profit")
-)
-            else:  # short
-                if pos.stop_loss and mid >= pos.stop_loss:
+                elif pos.take_profit is not None and mid >= pos.take_profit:
+                    hits.append((pos, "take_profit"))
+            else:
+                if pos.stop_loss is not None and mid >= pos.stop_loss:
                     hits.append((pos, "stop_loss"))
-                elif pos.take_profit and mid <= pos.take_profit:
+                elif pos.take_profit is not None and mid <= pos.take_profit:
                     hits.append((pos, "take_profit"))
         return hits
 
