@@ -1,10 +1,8 @@
 """End-to-end decision pipeline for agent proposals.
 
-Critic → OrderIntentBridge → RiskAdapter
+Critic → OrderIntentBridge → RiskAdapter → optional Handoff queue
 
-Never calls Binance. Produces either an ApprovedOrderRequest or a rejection.
-Downstream existing execution may consume ApprovedOrderRequest only when
-Settings.real and LiveModeGuard already allow it.
+Never calls Binance.
 """
 
 from __future__ import annotations
@@ -14,10 +12,11 @@ from typing import Any, Optional
 
 from .critic import CriticAgent, CriticDecision
 from .domain import OperatingMode, TradeProposal
+from .execution_handoff import handoff
+from .guards import LiveModeGuard
 from .live_bridge import BridgeResult, OrderIntentBridge
 from .risk import RiskManager
 from .risk_adapter import RiskAdapter, RiskAdapterResult
-from .guards import LiveModeGuard
 
 
 @dataclass(frozen=True)
@@ -26,6 +25,7 @@ class DecisionPipelineResult:
     critique: CriticDecision
     bridge: BridgeResult
     risk: Optional[RiskAdapterResult] = None
+    handoff_entry: Optional[dict[str, Any]] = None
 
     @property
     def approved(self) -> bool:
@@ -44,13 +44,12 @@ class DecisionPipelineResult:
             },
             "bridge": self.bridge.as_dict(),
             "risk": self.risk.as_dict() if self.risk else None,
+            "handoff": self.handoff_entry,
             "approved": self.approved,
         }
 
 
 class DecisionPipeline:
-    """Wire Critic + Bridge + RiskAdapter."""
-
     def __init__(
         self,
         risk_manager: RiskManager,
@@ -82,13 +81,17 @@ class DecisionPipeline:
         critique = self.critic.review(proposal, features=features, regime=regime)
         bridge = self.bridge.build(proposal, critique)
         risk_result = None
+        handoff_entry = None
         if bridge.accepted and bridge.intent is not None:
             risk_result = self.risk_adapter.evaluate(bridge.intent)
+            if risk_result.allowed and risk_result.request is not None:
+                handoff_entry = handoff(risk_result.request)
         return DecisionPipelineResult(
             proposal=proposal,
             critique=critique,
             bridge=bridge,
             risk=risk_result,
+            handoff_entry=handoff_entry,
         )
 
 
