@@ -1,14 +1,13 @@
 """Critic Agent – adversarial review of a TradeProposal.
 
-Phase 7 foundation.
+Phase 7 + research scorer integration.
 
 Purpose:
 * Search for reasons the proposed trade may be wrong.
 * Return APPROVE / WARN / REJECT with structured objections.
+* Optionally consult HeuristicScorer (research signal only).
 * Never executes trades.
 * Never weakens the Risk Kernel.
-
-The Critic is deliberately conservative. A WARN does not block; a REJECT does.
 """
 
 from __future__ import annotations
@@ -52,10 +51,14 @@ class CriticAgent:
         min_reward_risk: float = 1.2,
         min_trade_confidence: float = 0.45,
         max_spread_pct: float = 0.40,
+        use_heuristic_scorer: bool = True,
+        scorer_weak_threshold: float = 0.35,
     ):
         self.min_reward_risk = float(min_reward_risk)
         self.min_trade_confidence = float(min_trade_confidence)
         self.max_spread_pct = float(max_spread_pct)
+        self.use_heuristic_scorer = bool(use_heuristic_scorer)
+        self.scorer_weak_threshold = float(scorer_weak_threshold)
 
     def review(
         self,
@@ -67,8 +70,8 @@ class CriticAgent:
     ) -> CriticDecision:
         objections: list[CriticObjection] = []
         modifications: list[str] = []
+        scorer_meta: dict[str, Any] = {}
 
-        # NO_TRADE / HOLD proposals are always approved (nothing to risk)
         if proposal.action in ("NO_TRADE", "HOLD"):
             return CriticDecision(
                 result="APPROVE",
@@ -76,7 +79,6 @@ class CriticAgent:
                 reason="no position change requested",
             )
 
-        # Confidence floor
         if proposal.trade_confidence < self.min_trade_confidence:
             objections.append(CriticObjection(
                 code="low_trade_confidence",
@@ -87,7 +89,6 @@ class CriticAgent:
                 ),
             ))
 
-        # Reward / risk
         if proposal.expected_reward_risk is not None:
             if proposal.expected_reward_risk < self.min_reward_risk:
                 objections.append(CriticObjection(
@@ -100,7 +101,6 @@ class CriticAgent:
                 ))
                 modifications.append("increase target or tighten stop")
 
-        # Stop / target sanity for directional trades
         if proposal.action in ("BUY", "SELL") and proposal.entry_price is not None:
             if proposal.stop_loss is None:
                 objections.append(CriticObjection(
@@ -115,7 +115,6 @@ class CriticAgent:
                     message="directional trade has no take_profit",
                 ))
 
-        # Regime conflict
         if regime is not None:
             if regime.regime in ("UNCERTAIN", "WARMING_UP") and regime.confidence < 0.5:
                 objections.append(CriticObjection(
@@ -133,9 +132,18 @@ class CriticAgent:
                     ),
                 ))
 
-        # Feature-based checks
+        feat_map: dict[str, Any] = {}
         if features is not None:
-            vol = features.get("realized_vol", 0.0)
+            feat_map = dict(getattr(features, "features", None) or {})
+            if not feat_map and hasattr(features, "get"):
+                # FeatureSnapshot may expose get()
+                try:
+                    for key in ("realized_vol", "rel_volume_5", "momentum_10", "rsi_14", "atr_pct"):
+                        feat_map[key] = features.get(key, 0.0)
+                except Exception:
+                    pass
+
+            vol = float(feat_map.get("realized_vol") or features.get("realized_vol", 0.0) or 0.0)
             if vol > 0.03:
                 objections.append(CriticObjection(
                     code="elevated_volatility",
@@ -144,7 +152,7 @@ class CriticAgent:
                 ))
                 modifications.append("consider reduced size")
 
-            rel_vol = features.get("rel_volume_5", 1.0)
+            rel_vol = float(feat_map.get("rel_volume_5") or features.get("rel_volume_5", 1.0) or 1.0)
             if rel_vol < 0.5 and proposal.action in ("BUY", "SELL"):
                 objections.append(CriticObjection(
                     code="weak_volume",
@@ -152,7 +160,26 @@ class CriticAgent:
                     message=f"relative volume {rel_vol:.2f} is weak",
                 ))
 
-        # Conflicting signals declared by the proposer
+        # Research heuristic scorer – never sole authority; only adds objections
+        if self.use_heuristic_scorer and proposal.action in ("BUY", "SELL"):
+            try:
+                from .ml_scorer import HeuristicScorer
+
+                score = HeuristicScorer().score(feat_map, action=proposal.action)
+                scorer_meta = score.as_dict()
+                if score.score <= self.scorer_weak_threshold:
+                    objections.append(CriticObjection(
+                        code="weak_heuristic_score",
+                        severity="medium",
+                        message=(
+                            f"heuristic score {score.score:.2f} ({score.label}); "
+                            f"{', '.join(score.reasons) or 'no reasons'}"
+                        ),
+                    ))
+                    modifications.append("wait for stronger feature alignment")
+            except Exception as exc:
+                scorer_meta = {"error": str(exc)}
+
         if proposal.conflicting_signals:
             objections.append(CriticObjection(
                 code="proposer_conflicts",
@@ -168,7 +195,6 @@ class CriticAgent:
                     message=str(sig),
                 ))
 
-        # Aggregate decision
         high = sum(1 for o in objections if o.severity == "high")
         medium = sum(1 for o in objections if o.severity == "medium")
 
@@ -199,6 +225,7 @@ class CriticAgent:
                 "high_count": high,
                 "medium_count": medium,
                 "low_count": len(objections) - high - medium,
+                "heuristic_scorer": scorer_meta,
             },
         )
 
