@@ -297,7 +297,7 @@ let currentUser = null;
         refreshInFlight = true;
         try {
           await Promise.all([refreshState(), refreshHistory()]);
-          await Promise.all([refreshUserStats(), refreshCredentialStatus(), refreshAccountSecurity(), refreshOperationalInsights(), currentUser.role === "admin" ? refreshAdmin() : Promise.resolve()]);
+          await Promise.all([refreshUserStats(), refreshCredentialStatus(), refreshAccountSecurity(), refreshOperationalInsights(), refreshAgentStatus(), currentUser.role === "admin" ? refreshAdmin() : Promise.resolve()]);
         } finally {
           refreshInFlight = false;
         }
@@ -333,8 +333,31 @@ let currentUser = null;
         }
       }
 
-      async function refreshOperationalInsights() {
+      
+        async function refreshAgentStatus() {
+          try {
+            const agent = await api("/api/agent", { cache: "no-store", signal: AbortSignal.timeout(8000) });
+            const enabled = !!(agent && agent.agent_loop_enabled);
+            const st = (agent && agent.state) || {};
+            const mem = st.memory || {};
+            if ($("statusAgentLoop")) {
+              $("statusAgentLoop").textContent = enabled ? "On" : "Off";
+              $("statusAgentLoop").className = enabled ? "text-success" : "text-muted";
+            }
+            if ($("statusAgentCycles")) $("statusAgentCycles").textContent = String(st.cycles ?? 0);
+            if ($("statusAgentMemory")) $("statusAgentMemory").textContent = String(mem.experience_count ?? 0);
+            if ($("statusAgentPaper")) $("statusAgentPaper").textContent = String(st.paper_fills ?? 0);
+          } catch (error) {
+            if ($("statusAgentLoop")) {
+              $("statusAgentLoop").textContent = "Unavailable";
+              $("statusAgentLoop").className = "text-muted";
+            }
+          }
+        }
+
+        async function refreshOperationalInsights() {
         try {
+          refreshAgentStatus();
           const [qualityResult, inventoryResult, intelligenceResult] = await Promise.all([
             api("/api/execution-quality"), api("/api/inventory-plan"),
             api("/api/intelligence"),

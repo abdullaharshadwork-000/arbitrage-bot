@@ -54,10 +54,24 @@ from arbicore import exposure
 from arbicore.exchange_signals import capabilities as signal_capabilities
 from arbicore.market import MarketOverview
 from arbicore.performance import summarize as summarize_performance, scope_sql as performance_scope_sql
+from arbicore.scan_hook import notify_agent_mid
+from arbicore.agent_loop import AgentObservationLoop
+from arbicore.agent_api import create_agent_blueprint
+from arbicore.strategy_registry import StrategyRegistry
 
 market_overview = MarketOverview(bot.EXCHANGES_MASTER, bot.DEMO_START_PRICES)
 
 app = Flask(__name__, static_folder=None)
+
+# Optional agent observation API (read-only). Disabled unless ARBICORE_AGENT_LOOP=1
+# and never places orders. Failure here must not break the main bot.
+try:
+    _agent_registry = StrategyRegistry()
+    _agent_loop = AgentObservationLoop(registry=_agent_registry)
+    app.register_blueprint(create_agent_blueprint(_agent_loop, _agent_registry))
+except Exception as _agent_exc:  # pragma: no cover - defensive
+    import logging as _logging
+    _logging.getLogger("arbicore").warning("agent API not registered: %s", _agent_exc)
 # Overridable so a test run - or a second instance - never writes into the
 # operator's real trade history.
 DB_FILE = Path(os.environ.get("ARBICORE_DB") or Path(__file__).with_name("arbicore.db"))
@@ -2670,6 +2684,13 @@ def scan_loop():
             state["mid_prices"] = mid_prices
             state["feed_health"] = feed_health(quotes)
             state["intelligence"] = market_intelligence.snapshot()
+
+        # Optional agent observation (no-op unless ARBICORE_AGENT_LOOP=1; never raises)
+        try:
+            for _sym, _mid in (mid_prices or {}).items():
+                notify_agent_mid(_sym, _mid)
+        except Exception:
+            pass
 
         found = []
         halt_error = None
