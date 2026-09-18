@@ -1,6 +1,6 @@
 """Read-only agent API helpers.
 
-Phases 22 + 27–30.
+Phases 22–30 + similarity/patterns/knowledge routes.
 """
 
 from __future__ import annotations
@@ -20,6 +20,19 @@ def _resolve_loop(loop: Optional[AgentObservationLoop]) -> Optional[AgentObserva
         return get_agent_loop()
     except Exception:
         return None
+
+
+def _resolve_memory(loop: Optional[AgentObservationLoop] = None):
+    loop = _resolve_loop(loop)
+    memory = getattr(loop, "memory", None) if loop is not None else None
+    if memory is None:
+        try:
+            from .scan_hook import get_memory
+
+            memory = get_memory()
+        except Exception:
+            memory = None
+    return memory
 
 
 def build_agent_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
@@ -94,7 +107,7 @@ def build_research_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict
             "ok": True,
             "hypotheses": [],
             "experiments": [],
-            "message": "research lab not attached to observation loop",
+            "message": "research lab not attached",
         }
     hyps = [h.as_dict() for h in getattr(lab, "list_hypotheses", lambda: [])()]
     exps = [e.as_dict() for e in getattr(lab, "list_experiments", lambda: [])()]
@@ -107,22 +120,9 @@ def build_drift_snapshot(
 ) -> dict[str, Any]:
     from .drift import DriftMonitor
 
-    loop = _resolve_loop(loop)
-    memory = getattr(loop, "memory", None) if loop is not None else None
+    memory = _resolve_memory(loop)
     if memory is None:
-        try:
-            from .scan_hook import get_memory
-
-            memory = get_memory()
-        except Exception:
-            memory = None
-
-    if memory is None:
-        return {
-            "ok": True,
-            "reports": [],
-            "message": "no experience memory attached",
-        }
+        return {"ok": True, "reports": [], "message": "no experience memory"}
 
     try:
         experiences = memory.recent_experiences(limit=500)
@@ -148,6 +148,56 @@ def build_drift_snapshot(
     }
 
 
+def build_patterns_snapshot(loop: Optional[AgentObservationLoop] = None) -> dict[str, Any]:
+    from .patterns import PatternDiscovery
+
+    memory = _resolve_memory(loop)
+    if memory is None:
+        return {"ok": True, "message": "no experience memory", "report": None}
+    try:
+        experiences = memory.recent_experiences(limit=500)
+    except Exception:
+        experiences = []
+    report = PatternDiscovery().analyze(experiences)
+    return {"ok": True, "report": report.as_dict()}
+
+
+def build_similarity_snapshot(
+    *,
+    symbol: Optional[str] = None,
+    loop: Optional[AgentObservationLoop] = None,
+) -> dict[str, Any]:
+    from .similarity import SimilarityEngine
+
+    memory = _resolve_memory(loop)
+    if memory is None:
+        return {"ok": True, "message": "no experience memory", "report": None}
+    try:
+        experiences = memory.recent_experiences(limit=500)
+    except Exception:
+        experiences = []
+
+    # Use latest feature snapshot from history if available
+    features: dict[str, Any] = {}
+    loop = _resolve_loop(loop)
+    if loop and loop.state.last_result and loop.state.last_result.features:
+        features = dict(loop.state.last_result.features.features or {})
+    if not features and experiences:
+        snap = experiences[0].get("feature_snapshot") if isinstance(experiences[0], dict) else {}
+        if isinstance(snap, str):
+            try:
+                import json
+
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        features = snap if isinstance(snap, dict) else {}
+
+    engine = SimilarityEngine()
+    report = engine.query(features, experiences, symbol=symbol)
+    return {"ok": True, "report": report.as_dict()}
+
+
 def create_agent_blueprint(
     loop: Optional[AgentObservationLoop] = None,
     registry: Optional[StrategyRegistry] = None,
@@ -155,7 +205,7 @@ def create_agent_blueprint(
     try:
         from flask import Blueprint, jsonify, request
     except ImportError as exc:
-        raise RuntimeError("Flask is required to create the agent blueprint") from exc
+        raise RuntimeError("Flask is required to create the agent blueprint") from exp
 
     bp = Blueprint("arbicore_agent", __name__)
 
@@ -176,6 +226,15 @@ def create_agent_blueprint(
         sid = request.args.get("strategy_id")
         return jsonify(build_drift_snapshot(strategy_id=sid, loop=loop)), 200
 
+    @bp.route("/api/agent/patterns", methods=["GET"])
+    def api_agent_patterns():
+        return jsonify(build_patterns_snapshot(loop)), 200
+
+    @bp.route("/api/agent/similarity", methods=["GET"])
+    def api_agent_similarity():
+        symbol = request.args.get("symbol")
+        return jsonify(build_similarity_snapshot(symbol=symbol, loop=loop)), 200
+
     return bp
 
 
@@ -184,5 +243,7 @@ __all__ = [
     "build_registry_snapshot",
     "build_research_snapshot",
     "build_drift_snapshot",
+    "build_patterns_snapshot",
+    "build_similarity_snapshot",
     "create_agent_blueprint",
 ]
