@@ -67,9 +67,24 @@ ENGINE_OLD = "        real_engine = bot.RealExecutionEngine(exchanges, credentia
 ENGINE_NEW = (
     "        real_engine = bot.RealExecutionEngine(exchanges, credential_map)\n"
     "        try:\n"
-    "            maybe_register_from_engine(real_engine)\n"
+    "            maybe_register_from_engine(\n"
+    "                real_engine,\n"
+    "                risk_manager=risk_manager,\n"
+    "                equity=float(getattr(risk_manager, \"equity\", 10000) or 10000),\n"
+    "            )\n"
     "        except Exception:\n"
     "            pass\n"
+)
+
+ENGINE_SIMPLE = (
+    "            maybe_register_from_engine(real_engine)\n"
+)
+ENGINE_RICH = (
+    "            maybe_register_from_engine(\n"
+    "                real_engine,\n"
+    "                risk_manager=risk_manager,\n"
+    "                equity=float(getattr(risk_manager, \"equity\", 10000) or 10000),\n"
+    "            )\n"
 )
 
 
@@ -114,7 +129,6 @@ def _ensure_live_hooks(text: str) -> tuple[str, bool]:
             )
             changed = True
 
-    # Process handoff after agent mid notify
     old_notify = (
         "        try:\n"
         "            for _sym, _mid in (mid_prices or {}).items():\n"
@@ -134,7 +148,10 @@ def _ensure_live_hooks(text: str) -> tuple[str, bool]:
         text = text.replace(old_notify, new_notify, 1)
         changed = True
 
-    if ENGINE_OLD in text and "maybe_register_from_engine(real_engine)" not in text:
+    if ENGINE_SIMPLE in text:
+        text = text.replace(ENGINE_SIMPLE, ENGINE_RICH, 1)
+        changed = True
+    elif ENGINE_OLD in text and "maybe_register_from_engine" not in text:
         text = text.replace(ENGINE_OLD, ENGINE_NEW, 1)
         changed = True
 
