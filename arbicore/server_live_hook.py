@@ -18,6 +18,7 @@ from .agent_live_wire import (
     live_wire_snapshot,
     process_handoff_queue,
     register_live_wire,
+    register_risk_context,
 )
 from .live_exec import live_exec_enabled
 from .live_place import make_place_fn
@@ -78,10 +79,16 @@ def maybe_register_from_engine(
     engine: Any,
     *,
     live_guard: Any = None,
+    risk_manager: Any = None,
+    equity: float = 10_000.0,
     force: bool = False,
 ) -> bool:
-    """Register live wire from RealExecutionEngine if live exec is enabled."""
+    """Register live wire + risk context from RealExecutionEngine."""
     try:
+        if risk_manager is not None:
+            register_risk_context(
+                risk_manager, equity=equity, live_guard=live_guard
+            )
         if not live_exec_enabled() and not force:
             return get_live_executor() is not None
         if get_live_executor() is not None and not force:
@@ -108,7 +115,6 @@ def maybe_register_from_engine(
 
 
 def maybe_process_handoff(*, max_items: int = 1) -> list:
-    """Drain handoff queue when live exec is on. Never raises."""
     try:
         if not live_exec_enabled():
             return []
