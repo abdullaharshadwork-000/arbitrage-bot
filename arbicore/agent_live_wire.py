@@ -1,17 +1,14 @@
 """Wire agent ApprovedOrderRequest → live exchange via existing clients.
 
-Operator path:
-1. Dashboard live + real + ack
-2. ARBICORE_AGENT_LIVE_EXEC=1 + HANDOFF=1
-3. register_live_wire / maybe_register_from_engine
-4. register_risk_context (or server auto)
-5. Critic APPROVE → queue → process_handoff_queue
+Also tracks open agent positions and can submit SL/TP exits through the
+same LiveExecutor (still gated by LIVE_EXEC + wire registration).
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
+from .agent_positions import get_position_book
 from .critic import CriticDecision
 from .domain import OperatingMode, TradeProposal
 from .execution_handoff import HandoffQueue, handoff, handoff_enabled, _default_queue
@@ -25,6 +22,8 @@ _last_results: list[dict[str, Any]] = []
 _risk_manager: Any = None
 _live_guard: Optional[LiveModeGuard] = None
 _equity: float = 10_000.0
+# request_id -> SL/TP metadata for fills
+_pending_levels: dict[str, dict[str, Any]] = {}
 
 
 def register_live_wire(
@@ -105,10 +104,17 @@ def maybe_queue_approved(
             "risk": risk.as_dict() if hasattr(risk, "as_dict") else None,
         }
 
-    entry = handoff(risk.request)
+    req = risk.request
+    _pending_levels[req.id] = {
+        "stop_loss": req.stop_loss,
+        "take_profit": req.take_profit,
+        "strategy_id": req.strategy_id,
+        "strategy_version": req.strategy_version,
+    }
+    entry = handoff(req)
     return {
         "queued": True,
-        "request": risk.request.as_dict(),
+        "request": req.as_dict(),
         "handoff": entry,
     }
 
@@ -120,10 +126,43 @@ def process_approved_request(request: ApprovedOrderRequest) -> LiveExecResult:
             request_id=request.id,
             reject_reason="live wire not registered (call register_live_wire)",
         )
-    result = _executor.execute(request)
+    # Exits skip canary reduction by temporarily setting canary to 1.0 for exit_*
+    is_exit = str(request.intent_id or "").startswith("exit_")
+    if is_exit:
+        old_canary = _executor.canary_fraction
+        _executor.canary_fraction = 1.0
+        try:
+            result = _executor.execute(request)
+        finally:
+            _executor.canary_fraction = old_canary
+    else:
+        result = _executor.execute(request)
+
     _last_results.append(result.as_dict())
     if len(_last_results) > 100:
         del _last_results[:-100]
+
+    book = get_position_book()
+    if result.executed and not is_exit:
+        meta = _pending_levels.pop(request.id, {}) or {}
+        book.open_from_fill(
+            result,
+            stop_loss=meta.get("stop_loss", request.stop_loss),
+            take_profit=meta.get("take_profit", request.take_profit),
+            strategy_id=str(meta.get("strategy_id") or request.strategy_id or ""),
+            strategy_version=str(
+                meta.get("strategy_version") or request.strategy_version or ""
+            ),
+        )
+    elif result.executed and is_exit:
+        # Close matching open position by intent_id exit_<pos_id>
+        pos_id = str(request.intent_id or "").replace("exit_", "", 1)
+        book.close(
+            pos_id,
+            exit_price=float(result.average_price or 0),
+            reason="exit_fill",
+        )
+
     return result
 
 
@@ -168,6 +207,22 @@ def process_handoff_queue(
     return results
 
 
+def process_position_exits(mid_prices: dict[str, float]) -> list[dict[str, Any]]:
+    """Check open agent positions against mids; queue/execute SL/TP exits."""
+    if not live_exec_enabled() or _executor is None:
+        return []
+    book = get_position_book()
+    hits = book.check_exits(mid_prices or {})
+    results: list[dict[str, Any]] = []
+    for pos, reason in hits:
+        book.mark_exit_pending(pos.id, reason)
+        req = book.exit_request(pos)
+        # Store levels empty for exit
+        out = process_approved_request(req)
+        results.append({"position_id": pos.id, "reason": reason, **out.as_dict()})
+    return results
+
+
 def live_wire_snapshot() -> dict[str, Any]:
     return {
         "live_exec_enabled": live_exec_enabled(),
@@ -177,6 +232,7 @@ def live_wire_snapshot() -> dict[str, Any]:
         "equity": _equity,
         "canary_fraction": getattr(_executor, "canary_fraction", None),
         "recent": list(_last_results[-10:]),
+        "positions": get_position_book().snapshot(),
     }
 
 
@@ -187,5 +243,6 @@ __all__ = [
     "maybe_queue_approved",
     "process_approved_request",
     "process_handoff_queue",
+    "process_position_exits",
     "live_wire_snapshot",
 ]
